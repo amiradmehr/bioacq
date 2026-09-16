@@ -320,7 +320,7 @@ QString DeviceWorker::describeError (int code, int boardId)
         case BrainFlowExitCodes::SET_PORT_ERROR:
             if (cyton)
                 hint = "Cannot open the serial port. Check the dongle is plugged in and that no "
-                       "other program (OpenBCI GUI, stream_gui.py, a serial monitor) has it open.";
+                       "other program (OpenBCI GUI, a serial monitor) has it open.";
             else if (emotibit)
                 hint = emotibitNetworkHint () + "\n" + verbose;
             else
@@ -334,8 +334,8 @@ QString DeviceWorker::describeError (int code, int boardId)
                 // macOS lets several processes open the same cu.* device, so a
                 // busy dongle shows up here (missing welcome bytes), not as
                 // UNABLE_TO_OPEN_PORT.
-                hint = "Close any other program using the dongle (OpenBCI GUI, stream_gui.py, a "
-                       "serial monitor), then: switch the board to PC, check its battery, set the "
+                hint = "Close any other program using the dongle (OpenBCI GUI, a serial "
+                       "monitor), then: switch the board to PC, check its battery, set the "
                        "dongle switch to GPIO6, and power-cycle board + dongle.";
             else if (emotibit)
                 hint = emotibitNetworkHint ();

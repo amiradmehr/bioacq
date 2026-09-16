@@ -231,7 +231,8 @@ private:
     QString compactRateText () const;
     // Lanes strip format from the geometry and a fixed value template per
     // lane: 3 kicker with units + glyph + letter + value, 2 kicker without
-    // units, 1 glyph + value, 0 values only. Fills the kickers and columns.
+    // units, 1 glyph + value, 0 kicker + values, -1 values only (no kickers,
+    // tighter columns). Fills the kickers and columns.
     int laneStripLayout (std::vector<QString> *kicks, std::vector<StripColumn> *cols) const;
     double laneKeyWidth () const;
     void paintLaneKey (QPainter &p, double x, double cy);

@@ -49,17 +49,22 @@ inline const QColor actionPressed {0x8A, 0x90, 0x88};
 inline const QColor onAction {0x08, 0x09, 0x0A};
 
 // ---- plot ink ---------------------------------------------------------------
-inline const QColor traceX {0xBF, 0xA0, 0x5A};  // solid
-inline const QColor traceY {0x6F, 0xA8, 0xA8};  // dashed 7 4
-inline const QColor traceZ {0xD9, 0xD5, 0xC7};  // dotted 2 4
-inline const QColor traceHero {0xBF, 0xA0, 0x5A};
-inline const QColor traceTemp {0xBF, 0xA0, 0x5A};
-// PPG ink follows the LED colour, as the design's PPG GREEN panel does with
-// #7FBF7F; infrared has no colour, so it takes the design's teal trace ink.
-inline const QColor tracePpgGreen {0x7F, 0xBF, 0x7F};
-inline const QColor tracePpgRed {0xC0, 0x7A, 0x6E};
-inline const QColor tracePpgIr {0x6F, 0xA8, 0xA8};
-inline const QColor traceHeartRate {0xD9, 0xD5, 0xC7};
+// Brighter than the design's muted ink (#BFA05A / #6FA8A8 / #D9D5C7), which
+// was hard to read as thin lines on the near-black recess.
+inline const QColor traceX {0xF0, 0xC3, 0x5A};  // solid
+inline const QColor traceY {0x62, 0xD2, 0xD9};  // dashed 7 4
+inline const QColor traceZ {0xED, 0xE8, 0xDA};  // dotted 2 4
+inline const QColor traceHero {0xF0, 0xC3, 0x5A};
+inline const QColor traceTemp {0xFF, 0xA9, 0x5E};
+// PPG ink follows the LED colour; infrared has no colour, so it takes violet.
+inline const QColor tracePpgGreen {0x6E, 0xE2, 0x8F};
+inline const QColor tracePpgRed {0xFF, 0x7A, 0x6B};
+inline const QColor tracePpgIr {0xC4, 0xA7, 0xFF};
+inline const QColor traceHeartRate {0xFF, 0x8F, 0xAB};
+// Trace thickness in logical px, rounded to whole device px (1.5 -> 2 px at
+// DPR 1, 3 px on Retina); drawn as offset passes of a 1 device-px cosmetic
+// pen, see PlotWidget::paintRecess.
+inline constexpr double traceWidth = 1.5;
 inline const QColor zeroLine {0x30, 0x31, 0x30};
 
 // ---- geometry ---------------------------------------------------------------
