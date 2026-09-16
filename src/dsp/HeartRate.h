@@ -15,10 +15,13 @@
 //
 // BeatDetector, one per PPG channel:
 //  1. Band-pass 0.5-4 Hz: one RBJ high-pass and one RBJ low-pass biquad
-//     (Q = 1/sqrt(2)) designed at the nominal sample rate; after 4 s the rate
-//     is re-measured from the timestamps and the filters are redesigned if it
-//     is more than 15 % off. (A second high-pass stage rings: at 30-45 bpm its
-//     rebound in the long diastole reached half a beat's height.)
+//     (Q = 1/sqrt(2)) designed at the nominal sample rate. The rate is
+//     re-measured over the first kRateCheckSec of every uninterrupted stretch
+//     (intervals longer than 3 nominal periods do not count) and the filters
+//     are redesigned if it is more than kRateTolerance off, clamped to
+//     kMinRateFactor-kMaxRateFactor x nominal. (A second high-pass stage rings:
+//     at 30-45 bpm its rebound in the long diastole reached half a beat's
+//     height.)
 //  2. Inverted: reflectance counts DROP at systole (more blood absorbs more
 //     light), so a systolic pulse is a MAXIMUM of -bandpass(counts).
 //  3. Blocks of interest after Elgendi et al. (2013): z = clipped square of
@@ -32,6 +35,9 @@
 //     kGateMemorySec (rejects band-pass ringing and small wiggles), and lies
 //     at least 60 / (1.05 x kMaxBpm) s after the previous beat (refractory
 //     period); a larger peak inside the refractory period replaces it.
+//
+// A gap of more than kDropoutSec in the timestamps (a dropout) restarts the
+// filters, averages and the rate measurement; the beats are kept.
 //
 // estimate(): inter-beat intervals (IBIs) of the beats inside the last
 // kWindowSec. IBIs outside 30-200 bpm (5 % slack) are outliers. The median of
@@ -68,6 +74,11 @@ inline constexpr double kBeta = 0.02;           // threshold offset, x mean of z
 inline constexpr double kAmplitudeGate = 0.35;
 inline constexpr double kGateMemorySec = 3.0;
 inline constexpr double kSettleSec = 1.5; // filters settling: no beats yet
+inline constexpr double kDropoutSec = 1.0; // a longer gap restarts the filters
+inline constexpr double kRateCheckSec = 4.0;
+inline constexpr double kRateTolerance = 0.15;
+inline constexpr double kMinRateFactor = 0.6; // redesign range, x nominal rate
+inline constexpr double kMaxRateFactor = 1.6;
 // While there is no valid HR the tracker still publishes its status (NaN HR,
 // quality) this often, so the UI can show the quality it is getting.
 inline constexpr double kStatusIntervalSec = 1.0;
@@ -136,11 +147,15 @@ private:
     void restart (double t);
     void candidate (double tp, double yp);
 
+    double nominalFs_ = 25.0;
     double fs_ = 25.0;
     FilterChain bp_;
     std::uint64_t count_ = 0;
-    double firstT_ = 0.0;
     double lastT_ = -std::numeric_limits<double>::infinity ();
+    // rate measurement over the current uninterrupted stretch
+    double rateT0_ = 0.0;
+    double rateSum_ = 0.0;
+    std::uint64_t rateIntervals_ = 0;
     bool rateChecked_ = false;
     double settleUntil_ = 0.0;
     double absMean_ = 0.0;

@@ -443,6 +443,41 @@ void heartRateChecks (Checker &check)
             fmt ("heart rate: noise-only (4 x 30 s) -> %.0f HR values, flat -> %.0f HR values (status only)",
                 double (noiseValid), double (f.validCount ())));
     }
+    // A PPG dropout during the rate check must not redesign the filters for a
+    // wrong rate (it used to blank the HR for the rest of the session); a
+    // stream that really runs at 21 Hz still gets a 21 Hz design.
+    {
+        auto run = [] (double fs, double gapFrom, double gapTo, double &validShare, double &bpm) {
+            HeartRate::BeatDetector d (25.0);
+            int evals = 0, valid = 0;
+            bpm = std::numeric_limits<double>::quiet_NaN ();
+            for (int i = 0; i < static_cast<int> (30.0 * fs); ++i)
+            {
+                const double t = i / fs;
+                if (t >= gapFrom && t < gapTo)
+                    continue;
+                const double x = HeartRate::syntheticPpg (t, 72.0, 120000.0, 800.0);
+                d.process (&t, &x, 1);
+                if (t >= 20.0 && i % 5 == 0)
+                {
+                    const HeartRate::Estimate e = d.estimate (t);
+                    ++evals;
+                    valid += e.valid ? 1 : 0;
+                    bpm = e.bpm;
+                }
+            }
+            validShare = evals > 0 ? static_cast<double> (valid) / evals : 0.0;
+            return d.designRate ();
+        };
+        double gapValid = 0.0, gapBpm = 0.0, slowValid = 0.0, slowBpm = 0.0;
+        const double gapRate = run (25.0, 1.0, 3.0, gapValid, gapBpm);
+        const double slowRate = run (21.0, -1.0, -1.0, slowValid, slowBpm);
+        check (std::fabs (gapRate - 25.0) < 1e-9 && gapValid == 1.0 && std::fabs (gapBpm - 72.0) <= 1.0 &&
+                std::fabs (slowRate - 21.0) < 0.5 && slowValid == 1.0,
+            fmt ("heart rate: a 2 s PPG dropout at t = 1 s keeps the 25 Hz design and a valid %.2f bpm after 20 s; a "
+                 "21 Hz stream is redesigned to %.2f Hz (%.0f %% valid)",
+                gapBpm, slowRate, 100.0 * slowValid));
+    }
     {
         const PpgChannelSim ch[3] = {{0.0, 1.0, 0.3}, {72.0, 0.08, 0.3}, {72.0, 0.5, 0.3}};
         const HrSimResult r = simulateHeartRate (ch, 20.0, 7);

@@ -102,12 +102,11 @@ BeatDetector::BeatDetector (double nominalFs)
 
 void BeatDetector::reset (double nominalFs)
 {
-    fs_ = nominalFs > 0.0 ? nominalFs : 25.0;
+    nominalFs_ = nominalFs > 0.0 ? nominalFs : 25.0;
+    fs_ = nominalFs_;
     design ();
     count_ = 0;
-    firstT_ = 0.0;
     lastT_ = -std::numeric_limits<double>::infinity ();
-    rateChecked_ = false;
     restart (0.0);
     absMean_ = 0.0;
     zMean_ = 0.0;
@@ -146,6 +145,10 @@ void BeatDetector::restart (double t)
     inBlock_ = false;
     blockLen_ = 0;
     settleUntil_ = t + kSettleSec;
+    rateT0_ = t;
+    rateSum_ = 0.0;
+    rateIntervals_ = 0;
+    rateChecked_ = false;
 }
 
 void BeatDetector::process (const double *t, const double *x, std::size_t n)
@@ -157,27 +160,33 @@ void BeatDetector::process (const double *t, const double *x, std::size_t n)
             continue;
         if (count_ == 0)
         {
-            firstT_ = ti;
             absMean_ = std::fabs (xi);
             restart (ti);
         }
-        else if (ti - lastT_ > 1.0)
-            restart (ti); // dropout: restart the filters and averages, keep the beats
+        else if (ti - lastT_ > kDropoutSec)
+            restart (ti); // dropout: restart the filters, averages and rate check; keep the beats
+        else if (ti - lastT_ <= 3.0 / nominalFs_)
+        {
+            rateSum_ += ti - lastT_; // a shorter gap is left out of the rate, not counted as samples
+            ++rateIntervals_;
+        }
         ++count_;
         lastT_ = ti;
         absMean_ += 0.01 * (std::fabs (xi) - absMean_);
 
-        // The filters are designed at the nominal rate; redesign once if the
-        // timestamps say the stream runs more than 15 % off it.
-        if (!rateChecked_ && ti - firstT_ >= 4.0 && count_ > 20)
+        // The filters are designed at the nominal rate; redesign if the
+        // timestamps of this uninterrupted stretch say the stream runs more
+        // than kRateTolerance off it (within a plausible range of nominal).
+        if (!rateChecked_ && ti - rateT0_ >= kRateCheckSec && rateIntervals_ >= 20 && rateSum_ > 0.0)
         {
             rateChecked_ = true;
-            const double measured = static_cast<double> (count_ - 1) / (ti - firstT_);
-            if (std::fabs (measured - fs_) > 0.15 * fs_)
+            const double measured = std::clamp (static_cast<double> (rateIntervals_) / rateSum_,
+                kMinRateFactor * nominalFs_, kMaxRateFactor * nominalFs_);
+            if (std::fabs (measured - fs_) > kRateTolerance * fs_)
             {
                 fs_ = measured;
                 design ();
-                restart (ti);
+                restart (ti); // checks the new design again after kRateCheckSec
             }
         }
 
