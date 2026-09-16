@@ -14,7 +14,7 @@ This folder is the `bioacq` repository (GitHub `amiradmehr/bioacq`, private). `b
 - `third_party/brainflow/`: the local BrainFlow patch, BrainFlow's licence and the build instructions.
 - `prototype/stream_gui.py` is the original PySide6 + pyqtgraph prototype, now superseded. The user rejected Python for real-time streaming UIs as too slow, so new work goes into the C++/Qt code.
 - `design/Biosignal streaming GUI system.zip` is the Claude Design export that serves as the visual spec (`Instrument Screen.dc.html`, `Component Sheet.dc.html`, `Biosignal GUI.dc.html`). The `src/ui/Theme.h` tokens and the pixel sizes in `src/ui/Widgets.cpp` / `src/ui/PlotWidget.cpp` mirror it. Read it without extracting: `unzip -p "design/Biosignal streaming GUI system.zip" "Instrument Screen.dc.html"`. Its `_ds/` folder is the author's website design system and only supplies the font families. The instrument colours are inline hex in the `.dc.html` files.
-- Branches: `main` holds the source; `mac` / `windows` hold double-clickable builds.
+- Branches: `main` holds the source, docs and CI and never build output (`dist/` is gitignored). `mac` / `windows` are `main` plus the packaged build committed under `dist/` (`BioAcq.app`; the `BioAcq` folder with `BioAcq.exe`), refreshed from `main` and never merged back. `feat/platform` (Windows port, packaging, CI) and `feat/features` (channels, heart rate, one Connect button) are merged into `main`; new work goes on `feat/*` branches merged with merge commits.
 - The folder lives in Google Drive under a path with spaces, and one folder name starts with a space (`" demo Columbia"`), so quote every path. The git database is kept outside Drive at `~/.local/git/bioacq.git` (the `.git` here is a gitdir file pointing to it).
 
 ## Build and run
@@ -28,8 +28,8 @@ scripts/run.sh [args]      # build if needed, then exec the binary with args
 ```
 
 - The build tree is kept outside Google Drive on purpose, at `~/.local/build/bioacq` (override with `BIOACQ_BUILD_DIR`; `STREAM_GUI_BUILD_DIR` is still accepted as a fallback). The binary and `compile_commands.json` are there. clangd won't find `compile_commands.json` on its own.
-- `build.sh` only runs the CMake configure step when there's no cache, so `BRAINFLOW_ROOT` / `QT_PREFIX` overrides need `--clean`. The default recording folder is `BIOACQ_RECORD_DIR`: `recordings/` at the repo root, inside Drive and gitignored. It's a CMake cache variable baked in through `src/app/BuildConfig.h.in`, and `--record-dir` overrides it at runtime.
-- Dependencies: Homebrew Qt 6 (`/opt/homebrew/opt/qt`), CMake ≥ 3.21, Ninja, and BrainFlow 5.23.0 installed in `~/.local/brainflow` (patched, see below).
+- `build.sh` only runs the CMake configure step when there's no cache, so `BRAINFLOW_ROOT` / `QT_PREFIX` overrides need `--clean`. The default recording folder is `defaultRecordDir ()` (`src/platform/AppPaths.cpp`): in development builds `BIOACQ_RECORD_DIR`, i.e. `recordings/` at the repo root (inside Drive, gitignored; a CMake cache variable baked in through `src/app/BuildConfig.h.in`) if it's writable; in packaged builds and otherwise `Documents/BioAcq Recordings`. `--record-dir` overrides it at runtime.
+- Dependencies: Homebrew Qt 6 (`/opt/homebrew/opt/qt`, including Qt Serial Port), CMake ≥ 3.21, Ninja, and BrainFlow 5.23.0 installed in `~/.local/brainflow` (patched, see below).
 - `CMakeLists.txt` lists every source and header explicitly in `add_executable`, so new files must be added there (Windows-only files go in the `if(WIN32)` `target_sources`). AUTOMOC is on, and the fonts are compiled in with `qt_add_resources`. BrainFlow is found directly under `BRAINFLOW_ROOT` (`inc/`, `lib/`), not through its `brainflowConfig.cmake`, which hard-codes the install prefix.
 - Packaged builds: `-DBIOACQ_PACKAGED=ON` (records into `Documents/BioAcq Recordings`; on macOS builds `BioAcq.app`, target output name `BioAcq`). `scripts/package_macos.sh` builds, deploys, signs and verifies `dist/macos/BioAcq.app` + `dist/BioAcq-macos-arm64.zip`; `scripts\package_windows.ps1` produces `dist\windows\BioAcq\BioAcq.exe` + `dist\BioAcq-windows-x64.zip`. `dist/` is gitignored on `main`. Use a separate `BIOACQ_BUILD_DIR` for packaging.
 
@@ -44,7 +44,7 @@ scripts/run.sh --selftest 2>&1 | grep -E "FAIL|RESULT"   # only failures + the s
 
 - Output: each check prints `[ OK ]` or `[FAIL]`, and the run ends with `RESULT: PASS (n/n checks passed)`. A single check can't be run on its own.
 - Stages:
-  1. Unit checks: ring, decimation, retimer, biquads (ECG high-pass 0.5 Hz, notch, low-pass 40 Hz), heart rate (synthetic PPG at 60/72/120/180 bpm, inverted-count alignment, noise / flat, source selection), board-row mapping (incl. PPG order), `Readouts` rules (2 s rail window clearing, saturation wording, heart-rate readout), CPU meter.
+  1. Unit checks: ring, decimation, retimer, biquads (ECG high-pass 0.5 Hz, notch, low-pass 40 Hz), heart rate (synthetic PPG at 60/72/120/180 bpm, inverted-count alignment, noise / flat, source selection), board-row mapping (incl. PPG order), `Readouts` rules (2 s rail window clearing, saturation wording, heart-rate readout), CPU meter, serial port enumeration (dongles first, BrainFlow port names, under 250 ms because the GUI rescans at 1 Hz) and the default recording folders.
   2. Cancel while `prepare_session` is still blocking.
   3. EmotiBit discovery against a loopback fake device.
   4. Synthetic streaming, ECG filters, heart rate through the worker (a third session with `testPpgBpm`), recording and the drop counter.
@@ -64,9 +64,9 @@ QT_QPA_PLATFORM=offscreen scripts/run.sh --screenshot /path/out.png --state live
 - The command also prints process CPU over t = 2–4 s. `live` costs roughly 10–20 % of one core at 1280×800 and 1600×1000 (it varies run to run), so a jump well past that points to a rendering regression.
 - The `propagateSizeHints()` warning under offscreen is harmless.
 
-The interactive GUI and `run.sh --probe [s]` (add `--no-cyton` / `--no-emotibit` to probe one device) use the real devices: the Cyton dongle at `/dev/cu.usbserial-DP04W4GA` and the EmotiBit at `192.168.1.12`, reached by unicast. Keep in mind:
+The interactive GUI and `run.sh --probe [s]` (add `--no-cyton` / `--no-emotibit` to probe one device) use the real devices: the Cyton dongle, auto-detected (on this Mac `/dev/cu.usbserial-DP04W4GA`; `--list-ports` shows it without opening it), and the EmotiBit at `192.168.1.12`, reached by unicast. Keep in mind:
 - Only one program can own each device, so close the OpenBCI GUI and EmotiBit Oscilloscope first.
-- Broadcast discovery fails when the Mac and the EmotiBit land on different subnets of the same WiFi, which happens in this lab.
+- Broadcast discovery fails when the computer and the EmotiBit land on different subnets of the same WiFi, which happens in this lab.
 - For anything that doesn't need the hardware, use `--synthetic`, `--selftest` or `--screenshot`.
 
 ## Architecture
@@ -102,11 +102,12 @@ Recordings are BrainFlow file streamers added to the running session:
 
 **Defined in more than one place (keep in sync).**
 - `DeviceConfig` is built in `MainWindow::connectDeviceWith` (GUI) and in `makeConfig` in `Headless.cpp` (selftest and probe). Change both, or the selftest stops testing what the GUI actually does.
-- The Cyton port, EmotiBit IP and discovery-timeout defaults are in `main.cpp` (`Args` and the `usage ()` text), in `LaunchOptions` in `MainWindow.h`, and in `ProbeOptions` in `Headless.h`. The Cyton port default is empty, meaning auto-detect: `findCytonDongle ()` (`SerialPorts.h`) in `main.cpp` for the GUI and in `runProbe`.
+- The Cyton port, EmotiBit IP and discovery-timeout defaults are in `main.cpp` (`Args` and the `usage ()` text), in `LaunchOptions` in `MainWindow.h`, and in `ProbeOptions` in `Headless.h`. The Cyton port default is empty, meaning auto-detect: `MainWindow::cytonPortFor` for the GUI (at every connect, and at 1 Hz for the idle detail line) and `findCytonDongle ()` in `runProbe`, both through `SerialPorts.h`.
+- The default recording folder is `defaultRecordDir ()` (`AppPaths.h`) in `main.cpp` `Args` (and so `LaunchOptions` / `ProbeOptions`), the `usage ()` text and the `MainWindow` constructor's fallback; the fallback folder is `fallbackRecordDir ()` in `DeviceWorker.cpp`.
 - Readout thresholds and formatting live in `Readouts.h` (header-only, no widgets), including the 2 s rail window, the saturation wording and the heart-rate readout. `unitChecks` in `Headless.cpp` asserts them, and the README's "Using the GUI" section restates them.
 - The heart-rate constants and algorithm (`HeartRate.h`) are restated in the README's "Heart rate" section. The `HeartRateRing` channel layout (`SignalSpec.h`) is written by `DeviceWorker::pollLoop` and read by `MainWindow::updateHeartRate` and the selftest.
 - The ECG filter corners (0.5 / 60 / 40 Hz) are `kEcg*` in `MainWindow.cpp`; the hero chips, the rail toggle labels, stage 4 of the selftest and the README repeat them. The QSettings keys for them are `ecg/*` (renamed when the defaults and the high-pass corner changed); rename again if their meaning changes.
-- Cyton port availability is isolated in `MainWindow::cytonPortFor` (marked `INTEGRATE: SerialPorts::findCytonDongle`); `refreshPorts` lists the same `/dev/cu.usbserial-*` candidates.
+- Cyton port choice: `cytonPortFor` (connect, idle detail line) and `refreshPorts` (the drop-down: USB serial ports, dongles first) share `pickCytonDongle` in `MainWindow.cpp`, so Auto and the list agree. Auto means the last port that connected (`cyton/port`) if it is a detected dongle, else the first dongle; an override (`cyton/portOverride`, or `--port`) is used as typed.
 
 **Rendering performance.** `PlotWidget` (kinds `Hero`, `Scalar`, `Lanes`, `Vital`; every panel is one or more lanes, and the rules below hold per lane and trace) depends on four performance choices:
 - Cosmetic 1-device-px pens, which stay on Qt's fast line path. Wider pens go through the stroker, measured at about 100 % of a core against about 20 %.
@@ -118,12 +119,13 @@ Re-measure with `--screenshot` before trading any of these for looks.
 
 ## Platforms (macOS, Windows)
 
-- Keep platform `#ifdef`s in `src/platform/`. Plain UDP code uses `netsock::` from `Sockets.h` (POSIX sockets / Winsock with `WSAStartup`, `closesocket`, `ioctlsocket`, `WSAPoll`); `Readouts.h` keeps calling `getrusage`, which Windows gets from `compat/win32/sys/resource.h` (on the include path of Windows builds only). `M_PI` comes from `_USE_MATH_DEFINES`, set with `NOMINMAX` and `WIN32_LEAN_AND_MEAN` for the whole target on Windows.
+- Keep platform `#ifdef`s in `src/platform/`. The few elsewhere are deliberate and small: the broadcast-address lookup in `EmotiBitDiscovery.cpp`, the drive-letter `:` check and `networkPermissionHint ()` in `DeviceWorker.cpp`, and the selftest's port-name checks. Plain UDP code uses `netsock::` from `Sockets.h` (POSIX sockets / Winsock with `WSAStartup`, `closesocket`, `ioctlsocket`, `WSAPoll`); `Readouts.h` keeps calling `getrusage`, which Windows gets from `compat/win32/sys/resource.h` (on the include path of Windows builds only). `M_PI` comes from `_USE_MATH_DEFINES`, set with `NOMINMAX` and `WIN32_LEAN_AND_MEAN` for the whole target on Windows.
 - MSVC builds with `/utf-8` (the sources contain UTF-8 literals) and `/permissive-`. Don't include `<windows.h>` from headers that UI code includes.
-- Serial ports: `listSerialPorts ()` / `findCytonDongle ()` (Qt SerialPort, FTDI 0403:6015) and `serialPortExists ()`. Port strings are BrainFlow's: `COM3` on Windows, `/dev/cu.*` on macOS. `--list-ports` prints them.
+- Serial ports: `listSerialPorts ()` / `findCytonDongle ()` (Qt SerialPort, FTDI 0403:6015) and `serialPortExists ()`. Port strings are BrainFlow's: `COM3` on Windows, `/dev/cu.*` on macOS; compare them with `sameSerialPort ()` (case-insensitive on Windows). `--list-ports` prints them. Enumeration reads the OS device registry and never opens a port, so it is safe while the lab's dongle is in use; it runs on the GUI thread at 1 Hz while the Cyton is idle, which the selftest's timing check guards.
+- OS-specific user-facing text (Local Network permission on macOS, the firewall on Windows) goes through `networkPermissionHint ()` in `DeviceWorker.cpp`. Shortcut hints use `QKeySequence::NativeText` (`⌘K` / `Ctrl+K`), never literal glyphs.
 - `BioAcq.exe` is a GUI-subsystem program (`WIN32_EXECUTABLE`): `attachParentConsole ()` in `main ()` makes the CLI modes print to the calling console. cmd / PowerShell don't wait for it; use `scripts\run_cli_windows.ps1` (or `start /wait`) for exit codes. `raiseTimerResolution ()` sets 1 ms timers (otherwise the 10 / 15 ms polls stretch to 15.6 ms).
 - On Windows, BrainFlow must be built with `-DMSVC_RUNTIME=dynamic` (`build_brainflow.ps1` does), or linking its static C++ binding next to Qt fails on the runtime mismatch.
-- CI: `windows.yml` builds BrainFlow (cached), runs `package_windows.ps1`, then `--selftest` and `--screenshot --state live --size 1600x1000` on the packaged folder with Qt removed from `PATH`. Check a run with `gh run list --workflow windows.yml` / `gh run view <id> --log-failed`; artifacts `BioAcq-windows-x64` and `bioacq-windows-screenshot`.
+- CI: `windows.yml` (pushes to `main`, `windows`, `feat/**`, and manual) builds BrainFlow (cached), runs `package_windows.ps1`, then `--selftest`, `--screenshot --state live --size 1600x1000` (offscreen) and `--screenshot --state idle --size 1280x800` through the native `windows` platform plugin, all on the packaged folder with Qt removed from `PATH`. Check a run with `gh run list --workflow windows.yml` / `gh run view <id> --log-failed`; artifacts `BioAcq-windows-x64` and `bioacq-windows-screenshot`.
 
 ## Local BrainFlow patch
 
