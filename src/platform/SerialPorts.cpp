@@ -69,19 +69,32 @@ QString findCytonDongle ()
     return QString ();
 }
 
+QString matchPortName (const QString &port, const QVector<SerialPortEntry> &ports)
+{
+    QString name = port.trimmed ();
+    if (name.startsWith (QLatin1String ("\\\\.\\")))
+        name = name.mid (4);
+    if (name.isEmpty ())
+        return QString ();
+    for (const SerialPortEntry &e : ports)
+        if (e.portName.compare (name, Qt::CaseInsensitive) == 0)
+            return e.portName;
+    return QString ();
+}
+
+QString existingSerialPort (const QString &port)
+{
+#ifdef Q_OS_WIN
+    return matchPortName (port, listSerialPorts ());
+#else
+    const QString p = port.trimmed ();
+    return !p.isEmpty () && QFileInfo::exists (p) ? p : QString ();
+#endif
+}
+
 bool serialPortExists (const QString &port)
 {
-    const QString p = port.trimmed ();
-    if (p.isEmpty ())
-        return false;
-#ifdef Q_OS_WIN
-    const QString name = p.startsWith (QLatin1String ("\\\\.\\")) ? p.mid (4) : p;
-    const QList<QSerialPortInfo> infos = QSerialPortInfo::availablePorts ();
-    return std::any_of (infos.begin (), infos.end (),
-        [&name] (const QSerialPortInfo &info) { return info.portName ().compare (name, Qt::CaseInsensitive) == 0; });
-#else
-    return QFileInfo::exists (p);
-#endif
+    return !existingSerialPort (port).isEmpty ();
 }
 
 bool sameSerialPort (const QString &a, const QString &b)

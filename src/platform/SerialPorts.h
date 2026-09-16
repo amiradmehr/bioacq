@@ -35,8 +35,20 @@ QString brainflowSerialPort (const SerialPortEntry &entry);
 // PID 0x6015, or a description naming "FT231X" / "OpenBCI"), empty if none.
 QString findCytonDongle ();
 
-// True if the port (a BrainFlow serial_port value: "COM3", "\\.\COM3" or a
-// device path) currently exists.
+// The port as BrainFlow must receive it if it currently exists, else "".
+// Takes a BrainFlow serial_port value as typed ("COM3", "com3", "\\.\COM3"
+// or a device path). On Windows it returns the OS spelling of the matching
+// port: BrainFlow adds the \\.\ prefix that COM10 and up need only to names
+// starting with an upper-case "COM", so "com12" must become "COM12".
+// Elsewhere the device path as given.
+QString existingSerialPort (const QString &port);
+
+// Windows matching rules on a given list (pure; the selftest runs it on every
+// platform): an optional \\.\ prefix is ignored and the port name compared
+// case-insensitively. Returns the entry's portName, or "".
+QString matchPortName (const QString &port, const QVector<SerialPortEntry> &ports);
+
+// True if existingSerialPort (port) is not empty.
 bool serialPortExists (const QString &port);
 
 // True if both name the same port ("COM3" and "com3" on Windows; device

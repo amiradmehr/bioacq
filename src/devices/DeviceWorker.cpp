@@ -502,12 +502,14 @@ void DeviceWorker::run (DeviceConfig cfg, std::vector<SignalChannel> chans)
     {
         if (!cfg.params.serial_port.empty ())
         {
-            if (!serialPortExists (QString::fromStdString (cfg.params.serial_port)))
+            const QString port = existingSerialPort (QString::fromStdString (cfg.params.serial_port));
+            if (port.isEmpty ())
             {
                 failKind_.store (FailNotFound);
                 throw std::runtime_error ("serial port " + cfg.params.serial_port +
                     " does not exist (dongle unplugged? press the rescan button)");
             }
+            cfg.params.serial_port = port.toStdString (); // the OS spelling: BrainFlow's COM10+ prefix needs "COM"
         }
         else if (cfg.boardId == static_cast<int> (BoardIds::CYTON_BOARD))
         {

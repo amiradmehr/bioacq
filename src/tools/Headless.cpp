@@ -946,6 +946,32 @@ void unitChecks (Checker &check)
                 .arg (worstMs, 0, 'f', 1)
                 .arg (firstMs, 0, 'f', 1)
                 .toStdString ());
+        // A typed port reaches BrainFlow in the OS spelling: BrainFlow's Windows
+        // serial code adds the \\.\ prefix COM10 and up need only to names
+        // starting with an upper-case "COM" ("com12" failed to open).
+        {
+            QVector<SerialPortEntry> fake (2);
+            fake[0].portName = QStringLiteral ("COM3");
+            fake[1].portName = QStringLiteral ("COM12");
+            bool listed = true;
+            for (const SerialPortEntry &e : ports)
+            {
+                const QString p = brainflowSerialPort (e);
+#ifdef _WIN32
+                listed = listed && existingSerialPort (p.toLower ()) == p;
+#else
+                listed = listed && existingSerialPort (p) == p;
+#endif
+            }
+            check (matchPortName (QStringLiteral ("com12"), fake) == QStringLiteral ("COM12") &&
+                    matchPortName (QStringLiteral ("\\\\.\\com12"), fake) == QStringLiteral ("COM12") &&
+                    matchPortName (QStringLiteral (" COM3 "), fake) == QStringLiteral ("COM3") &&
+                    matchPortName (QStringLiteral ("COM1"), fake).isEmpty () &&
+                    matchPortName (QStringLiteral ("\\\\.\\"), fake).isEmpty () && listed &&
+                    existingSerialPort (missing).isEmpty (),
+                "serial ports: a typed port is passed on in the OS spelling ('com12' / '\\\\.\\com12' -> 'COM12'), "
+                "every listed port maps to itself, a missing one to ''");
+        }
         const QString rec = defaultRecordDir (), fb = fallbackRecordDir ();
         check (!rec.isEmpty () && QFileInfo (rec).isAbsolute () && QFileInfo (fb).isAbsolute (),
             QStringLiteral ("default recording folder %1, fallback %2 (both absolute)").arg (rec, fb).toStdString ());

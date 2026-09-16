@@ -1184,14 +1184,15 @@ void MainWindow::disconnectAll ()
 }
 
 // The Cyton dongle's serial port for a connect, as BrainFlow takes it ("COM3",
-// "/dev/cu.usbserial-..."): the override if that port exists; otherwise
+// "/dev/cu.usbserial-..."): the override if that port exists, in the OS
+// spelling ("com12" -> "COM12" on Windows, see existingSerialPort); otherwise
 // (auto) the last port that connected if it is a detected OpenBCI dongle, else
 // the first dongle found (SerialPorts: FTDI 0403:6015). "" = no dongle.
 // Enumeration only reads the OS device registry; no port is opened.
 QString MainWindow::cytonPortFor (const QString &override) const
 {
     if (!override.isEmpty ())
-        return serialPortExists (override) ? override : QString ();
+        return existingSerialPort (override);
     return pickCytonDongle (listSerialPorts (), opts_.cytonPort);
 }
 
