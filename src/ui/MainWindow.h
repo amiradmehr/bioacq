@@ -199,6 +199,7 @@ private:
     void refreshChrome (double now);
     QString metaText (const Slot &s) const;
     void refreshPorts (bool announce = true); // announce: "Found N USB serial port(s)"
+    void openWifiSetup ();                    // EmotiBitWifiDialog (only while the EmotiBit is idle)
     QString portOverride () const;            // the rail's port choice, "" = auto-detect
     QString cytonPortFor (const QString &override) const;
     void applyFilterSettings ();
@@ -235,6 +236,7 @@ private:
     QLabel *railNote_ = nullptr;
     // rail: EmotiBit
     QLineEdit *ipEdit_ = nullptr;
+    QPushButton *wifiBtn_ = nullptr; // "wi-fi setup" link
     QSpinBox *timeoutSpin_ = nullptr;
     QString lastEmotibitIp_; // the last EmotiBit that answered (blank field: tried first)
     QWidget *discoverWrap_ = nullptr;

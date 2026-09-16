@@ -39,24 +39,44 @@ std::vector<std::string> splitNonEmpty (const std::string &s, char delim)
 namespace
 {
 
-void addUnique (std::vector<std::string> &out, const struct in_addr &bcast)
+// An IPv4 interface address (host byte order) and its on-link prefix length.
+struct Ipv4Interface
 {
+    std::uint32_t address = 0;
+    int prefix = 0;
+};
+
+std::uint32_t prefixMask (int prefix)
+{
+    return prefix <= 0 ? 0u : (prefix >= 32 ? 0xFFFFFFFFu : (0xFFFFFFFFu << (32 - prefix)));
+}
+
+std::string dotted (std::uint32_t hostOrder)
+{
+    struct in_addr a;
+    a.s_addr = htonl (hostOrder);
     char buf[INET_ADDRSTRLEN] = {0};
-    if (!inet_ntop (AF_INET, &bcast, buf, sizeof (buf)))
-        return;
-    const std::string s = buf;
-    if (s != "0.0.0.0" && std::find (out.begin (), out.end (), s) == out.end ())
+    return inet_ntop (AF_INET, &a, buf, sizeof (buf)) ? std::string (buf) : std::string ();
+}
+
+void addUnique (std::vector<std::string> &out, const std::string &s)
+{
+    if (!s.empty () && s != "0.0.0.0" && std::find (out.begin (), out.end (), s) == out.end ())
         out.push_back (s);
 }
+
+// Every IPv4 interface that is up, minus loopback and host (/32) routes.
+std::vector<Ipv4Interface> ipv4Interfaces ();
 
 } // namespace
 
 #ifdef _WIN32
-std::vector<std::string> ipv4BroadcastAddresses ()
+namespace
 {
-    // Same rule as below: address | ~netmask of every IPv4 interface that is up,
-    // minus loopback and host (/32) routes.
-    std::vector<std::string> out;
+
+std::vector<Ipv4Interface> ipv4Interfaces ()
+{
+    std::vector<Ipv4Interface> out;
     ULONG size = 16384;
     std::vector<unsigned char> buf;
     ULONG rc = ERROR_BUFFER_OVERFLOW;
@@ -78,47 +98,94 @@ std::vector<std::string> ipv4BroadcastAddresses ()
             const struct sockaddr *sa = ua->Address.lpSockaddr;
             if (!sa || sa->sa_family != AF_INET || ua->OnLinkPrefixLength >= 32)
                 continue;
-            const std::uint32_t mask =
-                ua->OnLinkPrefixLength == 0 ? 0u : (0xFFFFFFFFu << (32 - ua->OnLinkPrefixLength));
-            struct in_addr bcast;
-            bcast.s_addr = reinterpret_cast<const struct sockaddr_in *> (sa)->sin_addr.s_addr | htonl (~mask);
-            addUnique (out, bcast);
+            out.push_back ({ntohl (reinterpret_cast<const struct sockaddr_in *> (sa)->sin_addr.s_addr),
+                static_cast<int> (ua->OnLinkPrefixLength)});
         }
     }
     return out;
 }
+
+} // namespace
 #else
-std::vector<std::string> ipv4BroadcastAddresses ()
+namespace
 {
-    std::vector<std::string> out;
+
+std::vector<Ipv4Interface> ipv4Interfaces ()
+{
+    std::vector<Ipv4Interface> out;
     struct ifaddrs *ifap = nullptr;
     if (getifaddrs (&ifap) != 0)
         return out;
     for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next)
     {
-        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET || !ifa->ifa_netmask)
             continue;
         const unsigned flags = ifa->ifa_flags;
         if (!(flags & IFF_UP) || (flags & IFF_LOOPBACK))
             continue;
-        // Like BrainFlow (address | ~netmask for every IPv4 interface), minus
-        // loopback and host (/32) routes, which cannot reach an EmotiBit.
-        struct in_addr bcast;
-        if ((flags & IFF_BROADCAST) && ifa->ifa_broadaddr &&
-            ifa->ifa_broadaddr->sa_family == AF_INET)
-            bcast = reinterpret_cast<struct sockaddr_in *> (ifa->ifa_broadaddr)->sin_addr;
-        else if (ifa->ifa_netmask &&
-            reinterpret_cast<struct sockaddr_in *> (ifa->ifa_netmask)->sin_addr.s_addr != 0xFFFFFFFFu)
-            bcast.s_addr = reinterpret_cast<struct sockaddr_in *> (ifa->ifa_addr)->sin_addr.s_addr |
-                ~reinterpret_cast<struct sockaddr_in *> (ifa->ifa_netmask)->sin_addr.s_addr;
-        else
+        const std::uint32_t mask = ntohl (reinterpret_cast<struct sockaddr_in *> (ifa->ifa_netmask)->sin_addr.s_addr);
+        int prefix = 0;
+        while (prefix < 32 && (mask & (0x80000000u >> prefix)))
+            ++prefix;
+        if (prefix >= 32) // host route: cannot reach an EmotiBit
             continue;
-        addUnique (out, bcast);
+        out.push_back ({ntohl (reinterpret_cast<struct sockaddr_in *> (ifa->ifa_addr)->sin_addr.s_addr), prefix});
     }
     freeifaddrs (ifap);
     return out;
 }
+
+} // namespace
 #endif
+
+std::vector<std::string> ipv4BroadcastAddresses ()
+{
+    // Like BrainFlow (address | ~netmask for every IPv4 interface), minus
+    // loopback and host (/32) routes, which cannot reach an EmotiBit.
+    std::vector<std::string> out;
+    for (const Ipv4Interface &i : ipv4Interfaces ())
+        addUnique (out, dotted (i.address | ~prefixMask (i.prefix)));
+    return out;
+}
+
+std::vector<std::string> subnetHosts (const std::string &address, int prefix, int maxHosts)
+{
+    std::vector<std::string> out;
+    struct in_addr a;
+    if (prefix < 1 || prefix > 30 || inet_pton (AF_INET, address.c_str (), &a) != 1)
+        return out;
+    const std::uint32_t hosts = (1u << (32 - prefix)) - 2u;
+    if (maxHosts < 0 || hosts > static_cast<std::uint32_t> (maxHosts))
+        return out;
+    const std::uint32_t self = ntohl (a.s_addr);
+    const std::uint32_t net = self & prefixMask (prefix);
+    out.reserve (hosts);
+    for (std::uint32_t h = 1; h <= hosts; ++h)
+        if (net + h != self)
+            out.push_back (dotted (net + h));
+    return out;
+}
+
+std::vector<std::string> ipv4ScanHosts (std::vector<std::string> *subnets)
+{
+    const std::vector<Ipv4Interface> ifs = ipv4Interfaces ();
+    std::vector<std::string> own;
+    for (const Ipv4Interface &i : ifs)
+        own.push_back (dotted (i.address));
+    std::vector<std::string> out;
+    for (const Ipv4Interface &i : ifs)
+    {
+        const std::vector<std::string> hosts = subnetHosts (dotted (i.address), i.prefix);
+        if (hosts.empty ())
+            continue;
+        if (subnets)
+            addUnique (*subnets, dotted (i.address & prefixMask (i.prefix)) + "/" + std::to_string (i.prefix));
+        for (const std::string &h : hosts)
+            if (std::find (own.begin (), own.end (), h) == own.end ())
+                addUnique (out, h);
+    }
+    return out;
+}
 
 std::string socketErrorText (int code)
 {
