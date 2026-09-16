@@ -12,8 +12,9 @@
     the dynamic runtime (/MD) instead, because its static C++ binding is linked
     into BioAcq.exe together with Qt, which uses /MD.
 
-    Run from a "x64 Native Tools" / Developer PowerShell (cl.exe on PATH) to
-    build with Ninja; otherwise the Visual Studio 2022 generator is used.
+    Uses the Visual Studio 2022 generator, like BrainFlow's own Windows CI: some
+    board sources include ATL headers that only compile with the character-set
+    defines (_MBCS) that generator adds, so Ninja + cl.exe fails on them.
 
 .EXAMPLE
     scripts\build_brainflow.ps1                       # installs to %USERPROFILE%\brainflow
@@ -23,7 +24,8 @@ param(
     [string]$Prefix = (Join-Path $env:USERPROFILE 'brainflow'),
     [string]$SourceDir = '',
     [string]$BuildDir = '',
-    [string]$Repo = 'https://github.com/brainflow-dev/brainflow.git'
+    [string]$Repo = 'https://github.com/brainflow-dev/brainflow.git',
+    [string]$Generator = 'Visual Studio 17 2022'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,16 +76,11 @@ $common = @(
     '-DBRAINFLOW_COPY_TO_PACKAGE_DIRS=OFF',
     '-DCMAKE_POLICY_VERSION_MINIMUM=3.5'
 )
-$haveCl = [bool](Get-Command cl.exe -ErrorAction SilentlyContinue)
-$haveNinja = [bool](Get-Command ninja -ErrorAction SilentlyContinue)
-if ($haveCl -and $haveNinja) {
-    $generator = @('-G', 'Ninja')
-} else {
-    $generator = @('-G', 'Visual Studio 17 2022', '-A', 'x64')
-}
+$generatorArgs = @('-G', $Generator)
+if ($Generator -like 'Visual Studio*') { $generatorArgs += @('-A', 'x64') }
 
-Write-Host "==> configuring ($BuildDir, $($generator[1]))"
-Invoke-Checked cmake (@('-S', $SourceDir, '-B', $BuildDir) + $generator + $common)
+Write-Host "==> configuring ($BuildDir, $Generator)"
+Invoke-Checked cmake (@('-S', $SourceDir, '-B', $BuildDir) + $generatorArgs + $common)
 Write-Host '==> building'
 Invoke-Checked cmake @('--build', $BuildDir, '--config', 'Release', '--parallel')
 Write-Host "==> installing to $Prefix"
