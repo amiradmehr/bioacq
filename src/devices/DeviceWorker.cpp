@@ -362,21 +362,39 @@ QString DeviceWorker::describeError (int code, int boardId)
     return out;
 }
 
+namespace
+{
+
+// What the OS needs to allow before UDP to the EmotiBit gets through.
+QString networkPermissionHint ()
+{
+#ifdef _WIN32
+    return QStringLiteral (
+        "Windows Defender Firewall allows BioAcq on this network (accept the firewall prompt, or allow it "
+        "under Windows Security > Firewall & network protection > Allow an app through firewall)");
+#else
+    return QStringLiteral (
+        "macOS allows Local Network access for the app that launched this program (System Settings > "
+        "Privacy & Security > Local Network)");
+#endif
+}
+
+} // namespace
+
 QString DeviceWorker::emotibitNetworkHint ()
 {
     return QStringLiteral (
-        "Check: the EmotiBit is on and has joined the WiFi; EmotiBit Oscilloscope (and any other "
-        "program streaming from it) is CLOSED, because only one host can own the stream; the IP "
-        "address is right (EmotiBit serial boot log or EmotiBit Oscilloscope); macOS allows Local "
-        "Network access for the app that launched this program (System Settings > Privacy & "
-        "Security > Local Network).");
+               "Check: the EmotiBit is on and has joined the WiFi; EmotiBit Oscilloscope (and any other "
+               "program streaming from it) is CLOSED, because only one host can own the stream; the IP "
+               "address is right (EmotiBit serial boot log or EmotiBit Oscilloscope); ") +
+        networkPermissionHint () + QStringLiteral (".");
 }
 
 QString DeviceWorker::emotibitSubnetHint ()
 {
     return QStringLiteral (
-        "Broadcast discovery only works when this Mac and the EmotiBit are on the same subnet. "
-        "Being on the same WiFi network (SSID) is not enough: the Mac can end up on e.g. "
+        "Broadcast discovery only works when this computer and the EmotiBit are on the same subnet. "
+        "Being on the same WiFi network (SSID) is not enough: the computer can end up on e.g. "
         "172.31.x.x while the EmotiBit is on 192.168.1.x. Enter the EmotiBit's IP address "
         "(printed in its serial boot log, or shown in EmotiBit Oscilloscope) and connect again; "
         "a typed IP is reached by unicast across subnets.");
@@ -397,10 +415,9 @@ QString DeviceWorker::discoveryFailureText (
     }
     if (!r.anySendOk)
         return QStringLiteral ("could not send the EmotiBit discovery packet to %1 (%2).\n"
-                               "If macOS denied Local Network access to the app that launched this "
-                               "program, allow it in System Settings > Privacy & Security > Local "
-                               "Network. Otherwise check that WiFi is on and the IP address is right.")
-            .arg (where, QString::fromLocal8Bit (emotibit::socketErrorText (r.lastSendErrno).c_str ()));
+                               "Check that %3, that WiFi is on and that the IP address is right.")
+            .arg (where, QString::fromLocal8Bit (emotibit::socketErrorText (r.lastSendErrno).c_str ()),
+                networkPermissionHint ());
     if (typedIp.empty ())
         return QStringLiteral ("no EmotiBit answered the broadcast discovery (sent to %1) within %2 s.\n")
                    .arg (where.isEmpty () ? QStringLiteral ("no interface") : where, secs) +
