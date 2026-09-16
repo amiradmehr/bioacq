@@ -9,7 +9,8 @@ compile_commands.json
 recordings/
 
 # Packaged builds (only committed on the mac / windows branches)
-dist/
+dist/*
+!dist/windows/
 
 # OS / editor / tooling
 .DS_Store
