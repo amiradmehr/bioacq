@@ -1,5 +1,6 @@
 #include "Headless.h"
 
+#include "AppPaths.h"
 #include "Biquad.h"
 #include "Decimate.h"
 #include "DeviceWorker.h"
@@ -808,6 +809,52 @@ void unitChecks (Checker &check)
                 "heart-rate readout: '72' + GREEN + 'QUALITY 95 %'; stale -> '—' NO DATA (also while acquiring); "
                 "no pulse / irregular / acquiring -> '—' with the reason; not streaming -> '—'");
         }
+    }
+    // Serial ports (SerialPorts.h). Enumeration only reads the OS device
+    // registry and never opens a port; the GUI's Cyton auto-detect repeats it
+    // at 1 Hz while the Cyton is idle, on the GUI thread, so it must stay cheap.
+    {
+        auto t0 = SteadyClock::now ();
+        const QVector<SerialPortEntry> ports = listSerialPorts ();
+        const double firstMs = 1000.0 * since (t0);
+        double worstMs = 0.0;
+        for (int i = 0; i < 3; ++i)
+        {
+            t0 = SteadyClock::now ();
+            (void) listSerialPorts ();
+            worstMs = std::max (worstMs, 1000.0 * since (t0));
+        }
+        const bool donglesFirst = std::is_partitioned (
+            ports.begin (), ports.end (), [] (const SerialPortEntry &e) { return e.cytonDongle; });
+        int dongles = 0;
+        bool names = true;
+        for (const SerialPortEntry &e : ports)
+        {
+            const QString p = brainflowSerialPort (e);
+#ifdef _WIN32
+            names = names && !p.isEmpty () && !p.startsWith (QLatin1String ("\\\\.\\"));
+#else
+            names = names && p.startsWith (QLatin1String ("/dev/"));
+#endif
+            dongles += e.cytonDongle ? 1 : 0;
+        }
+#ifdef _WIN32
+        const QString missing = QStringLiteral ("COM250");
+#else
+        const QString missing = QStringLiteral ("/dev/cu.bioacq-selftest-missing");
+#endif
+        check (donglesFirst && names && !serialPortExists (QString ()) && !serialPortExists (missing) &&
+                worstMs < 250.0,
+            QStringLiteral ("serial ports: %1 listed, %2 OpenBCI dongle(s) first, BrainFlow port names; a missing "
+                            "port does not exist; enumeration %3 ms (first call %4 ms)")
+                .arg (ports.size ())
+                .arg (dongles)
+                .arg (worstMs, 0, 'f', 1)
+                .arg (firstMs, 0, 'f', 1)
+                .toStdString ());
+        const QString rec = defaultRecordDir (), fb = fallbackRecordDir ();
+        check (!rec.isEmpty () && QFileInfo (rec).isAbsolute () && QFileInfo (fb).isAbsolute (),
+            QStringLiteral ("default recording folder %1, fallback %2 (both absolute)").arg (rec, fb).toStdString ());
     }
 }
 
