@@ -29,3 +29,8 @@ int runSelftest (double seconds);
 // Never crashes when a device is absent. Returns 0 if every connected device
 // delivered data on all its signals, 1 if nothing connected, 2 otherwise.
 int runProbe (const ProbeOptions &options);
+
+// --emotibit-wifi-list: the WiFi networks saved on the EmotiBit, read over its
+// USB serial port (port empty = the likeliest candidate). Restarts the
+// EmotiBit; prints SSIDs only. Returns 0 on success.
+int runEmotibitWifiList (const QString &port);

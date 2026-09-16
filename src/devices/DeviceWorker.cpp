@@ -49,10 +49,15 @@ std::string homeFallbackDir ()
 
 QString joinTargets (const std::vector<std::string> &targets)
 {
+    // at most 4 addresses: a subnet scan adds up to 253 per interface
+    const std::size_t shown = std::min<std::size_t> (targets.size (), 4);
     QStringList l;
-    for (const std::string &t : targets)
-        l << QString::fromStdString (t);
-    return l.join (QStringLiteral (", "));
+    for (std::size_t i = 0; i < shown; ++i)
+        l << QString::fromStdString (targets[i]);
+    QString s = l.join (QStringLiteral (", "));
+    if (targets.size () > shown)
+        s += QStringLiteral (" and %1 more").arg (targets.size () - shown);
+    return s;
 }
 
 } // namespace
@@ -437,8 +442,26 @@ QString DeviceWorker::discoveryFailureText (
 bool DeviceWorker::discoverEmotibit (DeviceConfig &cfg)
 {
     const std::string typed = cfg.params.ip_address;
-    const std::vector<std::string> targets =
-        typed.empty () ? emotibit::ipv4BroadcastAddresses () : std::vector<std::string> {typed};
+    // A search of this computer's networks: every interface's broadcast
+    // address plus a unicast scan of its small subnets (/24 or narrower),
+    // because some hotspots (an iPhone's) drop broadcasts.
+    QString searchText;
+    auto networkTargets = [&cfg, &searchText] {
+        if (!cfg.testBroadcastTargets.empty ())
+        {
+            searchText = joinTargets (cfg.testBroadcastTargets);
+            return cfg.testBroadcastTargets;
+        }
+        std::vector<std::string> t = emotibit::ipv4BroadcastAddresses ();
+        searchText = t.empty () ? QStringLiteral ("no interface") : joinTargets (t);
+        std::vector<std::string> subnets;
+        const std::vector<std::string> hosts = emotibit::ipv4ScanHosts (&subnets);
+        if (!hosts.empty ())
+            searchText += QStringLiteral (" + a scan of ") + joinTargets (subnets);
+        t.insert (t.end (), hosts.begin (), hosts.end ());
+        return t;
+    };
+    const std::vector<std::string> targets = typed.empty () ? networkTargets () : std::vector<std::string> {typed};
     const double timeout = cfg.discoveryTimeoutSec > 0.0
         ? cfg.discoveryTimeoutSec
         : std::max (2.0, static_cast<double> (cfg.params.timeout));
@@ -447,7 +470,7 @@ bool DeviceWorker::discoverEmotibit (DeviceConfig &cfg)
     const double firstTimeout = fallback ? std::min (timeout, kUnicastTrySeconds) : timeout;
     emit progress (typed.empty ()
             ? QStringLiteral ("discovering EmotiBit: broadcast to %1 (same subnet only, up to %2 s)…")
-                  .arg (targets.empty () ? QStringLiteral ("no interface") : joinTargets (targets), secs)
+                  .arg (searchText, secs)
             : QStringLiteral ("looking for the EmotiBit at %1 (up to %2 s)…")
                   .arg (QString::fromStdString (typed), QString::number (firstTimeout, 'g', 3)));
 
@@ -459,11 +482,9 @@ bool DeviceWorker::discoverEmotibit (DeviceConfig &cfg)
     {
         // The typed / remembered IP did not answer: the EmotiBit may have a
         // new address, on this subnet or on another network both joined.
-        const std::vector<std::string> bc = cfg.testBroadcastTargets.empty () ? emotibit::ipv4BroadcastAddresses ()
-                                                                              : cfg.testBroadcastTargets;
+        const std::vector<std::string> bc = networkTargets ();
         emit progress (QStringLiteral ("no answer at %1; broadcast discovery on %2 (same subnet only, up to %3 s)…")
-                           .arg (QString::fromStdString (typed),
-                               bc.empty () ? QStringLiteral ("no interface") : joinTargets (bc), secs));
+                           .arg (QString::fromStdString (typed), searchText, secs));
         setPhase (PhaseDiscovering); // restarts the elapsed / timeout readout
         probes_.store (0);
         r = emotibit::discover (bc, cfg.discoveryPort, timeout, cfg.params.serial_number,
