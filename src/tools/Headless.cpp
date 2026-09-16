@@ -712,7 +712,7 @@ void unitChecks (Checker &check)
             }
             std::vector<double> tb;
             std::vector<std::vector<double>> vb;
-            bool near = false, wasOn = false;
+            bool onRail = false, wasOn = false;
             double clearedAt = std::numeric_limits<double>::quiet_NaN ();
             for (double now = 0.25; now <= 8.0; now += 0.25)
             {
@@ -725,12 +725,12 @@ void unitChecks (Checker &check)
                     part.append (&tb[k], vals, 1);
                 }
                 const double peak = Readouts::ringPeakAbs (part, 0, now, Readouts::kRailWindowSec, tb, vb);
-                near = Readouts::nearRail (Readouts::railHeadroom (peak), near);
-                wasOn = wasOn || (near && now < recovery);
-                if (!near && wasOn && !std::isfinite (clearedAt))
+                onRail = Readouts::nearRail (Readouts::railHeadroom (peak), onRail);
+                wasOn = wasOn || (onRail && now < recovery);
+                if (!onRail && wasOn && !std::isfinite (clearedAt))
                     clearedAt = now;
             }
-            check (wasOn && std::isfinite (clearedAt) && clearedAt - recovery <= Readouts::kRailWindowSec + 0.25 && !near,
+            check (wasOn && std::isfinite (clearedAt) && clearedAt - recovery <= Readouts::kRailWindowSec + 0.25 && !onRail,
                 fmt ("near-rail on the last 2 s of raw ECG: warning cleared %.2f s after the input recovered", clearedAt - recovery));
         }
         {
