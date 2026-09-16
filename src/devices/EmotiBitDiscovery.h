@@ -42,6 +42,21 @@ struct DiscoveryResult
 // and not loopback -- BrainFlow's own list, minus 127.255.255.255 and /32s.
 std::vector<std::string> ipv4BroadcastAddresses ();
 
+// Largest subnet scanned host by host (a /24).
+constexpr int kMaxScanHosts = 254;
+
+// Host addresses of address/prefix without the network and broadcast
+// addresses and the address itself; empty when the subnet has more than
+// maxHosts hosts or the prefix is outside 1-30. Pure (for the selftest).
+std::vector<std::string> subnetHosts (const std::string &address, int prefix, int maxHosts = kMaxScanHosts);
+
+// Every host of the small subnets (at most kMaxScanHosts hosts) of the
+// interfaces that are up, minus this computer's own addresses. HELLO_EMOTIBIT
+// sent to each by unicast finds an EmotiBit on networks that drop broadcasts
+// (iPhone hotspots, some routers). *subnets receives "a.b.c.0/p" for each
+// scanned subnet.
+std::vector<std::string> ipv4ScanHosts (std::vector<std::string> *subnets = nullptr);
+
 // Text for DiscoveryResult::lastSendErrno (strerror / FormatMessage).
 std::string socketErrorText (int code);
 

@@ -98,6 +98,8 @@ add_executable(bioacq
     src/devices/DeviceWorker.h
     src/devices/EmotiBitDiscovery.cpp
     src/devices/EmotiBitDiscovery.h
+    src/devices/EmotiBitWifiSetup.cpp
+    src/devices/EmotiBitWifiSetup.h
     src/devices/Retimer.h
     src/devices/SignalSpec.cpp
     src/devices/SignalSpec.h
@@ -108,6 +110,8 @@ add_executable(bioacq
     src/platform/SerialPorts.cpp
     src/platform/SerialPorts.h
     src/platform/Sockets.h
+    src/ui/EmotiBitWifiDialog.cpp
+    src/ui/EmotiBitWifiDialog.h
     src/ui/MainWindow.cpp
     src/ui/MainWindow.h
     src/ui/PlotWidget.cpp
