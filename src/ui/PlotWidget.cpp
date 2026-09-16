@@ -23,7 +23,8 @@ namespace
 // wider than 1 device pixel leaves Qt raster's cosmetic fast path for the
 // stroker: measured at 100 % of one core (offscreen 1600x1000, both slots
 // synthetic, 1 s window, every segment sparse) versus ~18 % with cosmetic
-// pens. So every trace is drawn with a cosmetic 1 device-px pen; exact
+// pens. So every trace is drawn with a cosmetic 1 device-px pen, repeated at
+// 1 device-px offsets for Theme::traceWidth (still the fast path); exact
 // (non-decimated) segments keep the design's dash pattern (cosmetic dashes
 // are still on the fast path), min/max-decimated ones are solid and aliased.
 // kDesignPenWhenSparse re-enables the true width for segments with at most
@@ -1103,18 +1104,22 @@ int PlotWidget::laneStripLayout (std::vector<QString> *kicks, std::vector<StripC
     const double sepW = 21.0;
     const double groupW = (inner - sepW * (nL - 1)) / std::max (1, nL);
     const QFontMetricsF fk (fKicker_), fl (fLetter_), fv (fLegendValue_);
-    auto layout = [&] (bool withUnits, bool glyph, bool letter, std::vector<QString> *k, std::vector<StripColumn> *c) {
+    // kicker = false (narrowest): the lane names leave the strip too (each lane
+    // still labels itself in the plot) and the value columns close up
+    auto layout = [&] (bool withUnits, bool glyph, bool letter, bool kicker, std::vector<QString> *k,
+                      std::vector<StripColumn> *c) {
         bool fits = true;
+        const double colGap = kicker ? 8.0 : 4.0;
         for (int li = 0; li < nL; ++li)
         {
             const Lane &L = lanes_[static_cast<std::size_t> (li)];
-            QString kick = L.spec.label;
-            if (withUnits && !L.spec.units.isEmpty ())
+            QString kick = kicker ? L.spec.label : QString ();
+            if (kicker && withUnits && !L.spec.units.isEmpty ())
                 kick += QStringLiteral (" ") + L.spec.units;
             const double x0 = left + li * (groupW + sepW);
             const int nT = L.spec.traces.size ();
-            const double cx0 = x0 + fk.horizontalAdvance (kick) + 10.0;
-            const double colW = (x0 + groupW - cx0 - 8.0 * (nT - 1)) / std::max (1, nT);
+            const double cx0 = kicker ? x0 + fk.horizontalAdvance (kick) + 10.0 : x0;
+            const double colW = (x0 + groupW - cx0 - colGap * (nT - 1)) / std::max (1, nT);
             const double vw = fv.horizontalAdvance (stripValueTemplate (L.decimals));
             for (int i = 0; i < nT; ++i)
             {
@@ -1125,22 +1130,24 @@ int PlotWidget::laneStripLayout (std::vector<QString> *kicks, std::vector<StripC
                     need += 4.0 + fl.horizontalAdvance (L.spec.traces[i].name);
                 fits = fits && colW >= need;
                 if (c)
-                    c->push_back ({cx0 + i * (colW + 8.0), colW});
+                    c->push_back ({cx0 + i * (colW + colGap), colW});
             }
             if (k)
                 k->push_back (kick);
         }
         return fits;
     };
-    int mode = 0;
-    if (layout (true, true, true, nullptr, nullptr))
+    int mode = -1;
+    if (layout (true, true, true, true, nullptr, nullptr))
         mode = 3;
-    else if (layout (false, true, true, nullptr, nullptr))
+    else if (layout (false, true, true, true, nullptr, nullptr))
         mode = 2;
-    else if (layout (false, true, false, nullptr, nullptr))
+    else if (layout (false, true, false, true, nullptr, nullptr))
         mode = 1;
+    else if (layout (false, false, false, true, nullptr, nullptr))
+        mode = 0;
     if (kicks || cols)
-        layout (mode == 3, mode >= 1, mode >= 2, kicks, cols);
+        layout (mode == 3, mode >= 1, mode >= 2, mode >= 0, kicks, cols);
     return mode;
 }
 
@@ -1411,6 +1418,11 @@ void PlotWidget::paintRecess (QPainter &p)
     const qreal dpr = devicePixelRatioF ();
     const bool hero = kind_ == Kind::Hero;
     const double designW = hero ? 1.4 : 1.3;
+    // Thickness on the fast path: the 1 device-px polyline once per offset,
+    // 1 device px apart (2 px: + right, + down; 3 px: a plus sign).
+    const int thick = std::clamp (static_cast<int> (std::lround (Theme::traceWidth * dpr)), 1, 3);
+    const int passes = thick == 1 ? 1 : (thick == 2 ? 3 : 5);
+    static const QPointF kOffsets[] = {{0.0, 0.0}, {1.0, 0.0}, {0.0, 1.0}, {-1.0, 0.0}, {0.0, -1.0}};
 
     p.save ();
     for (const Lane &L : lanes_)
@@ -1435,8 +1447,8 @@ void PlotWidget::paintRecess (QPainter &p)
                 fastDash.setDashPattern ({2.0 * dpr, 4.0 * dpr});
                 design.setDashPattern ({2.0 / designW, 4.0 / designW});
             }
-            const QPen dot = [&T] {
-                QPen d = cosmeticPen (T.color, 3.0);
+            const QPen dot = [&T, thick] {
+                QPen d = cosmeticPen (T.color, thick + 2.0);
                 d.setCapStyle (Qt::RoundCap);
                 return d;
             }();
@@ -1475,8 +1487,16 @@ void PlotWidget::paintRecess (QPainter &p)
                 {
                     p.setRenderHint (QPainter::Antialiasing, true);
                     p.setPen (design);
+                    p.drawPolyline (poly);
+                    continue;
                 }
-                p.drawPolyline (poly);
+                for (int k = 0; k < passes; ++k)
+                {
+                    const QPointF d = kOffsets[k] / dpr;
+                    p.translate (d);
+                    p.drawPolyline (poly);
+                    p.translate (-d);
+                }
             }
         }
     }
