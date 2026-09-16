@@ -91,12 +91,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path $png)) { throw "no screenshot at $png" }
 
+      # Same render through the native "windows" platform plugin, i.e. the
+      # plugin a double-click uses (the GUI starts without connecting; only
+      # --screenshot connects the synthetic board).
+      - name: Screenshot (native windows platform)
+        run: |
+          Remove-Item Env:QT_PLUGIN_PATH, Env:QML2_IMPORT_PATH, Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -and -not $_.StartsWith($env:QT_ROOT_DIR) }) -join ';'
+          $png = Join-Path $PWD 'ci-out\bioacq-windows-native.png'
+          scripts\run_cli_windows.ps1 -Exe dist\windows\BioAcq\BioAcq.exe -TimeoutSec 120 `
+            -Arguments '--screenshot', $png, '--state', 'idle', '--size', '1280x800'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path $png)) { throw "no screenshot at $png" }
+
       - name: Upload screenshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bioacq-windows-screenshot
-          path: ci-out/bioacq-windows-live.png
+          path: ci-out/*.png
           if-no-files-found: warn
           retention-days: 14
 

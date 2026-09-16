@@ -7,7 +7,8 @@
       dist\windows\BioAcq\BioAcq.exe     double-click to start the GUI (no console window)
       dist\BioAcq-windows-x64.zip        the same folder, zipped
 
-    The folder holds the Qt runtime (windeployqt, release, no translations),
+    The folder holds the Qt runtime (windeployqt, release, no translations, only
+    the platform and style plugins the app uses),
     the offscreen platform plugin (for --screenshot without a display), the
     BrainFlow core DLLs and the MSVC runtime DLLs (app-local, so no VC++
     redistributable install is needed).
@@ -79,6 +80,8 @@ $ErrorActionPreference = $prevEap
 $deployArgs = @('--release', '--no-translations', '--no-compiler-runtime', '--no-opengl-sw', '--no-system-d3d-compiler')
 if ($help -match '--no-system-dxc-compiler') { $deployArgs += '--no-system-dxc-compiler' }
 if ($help -match '--no-quick-import') { $deployArgs += '--no-quick-import' }
+# The app draws everything with QPainter and uses no TLS, image formats, SVG icons or touch input.
+if ($help -match '--skip-plugin-types') { $deployArgs += @('--skip-plugin-types', 'generic,iconengines,imageformats,networkinformation,tls') }
 Invoke-Checked $windeployqt ($deployArgs + @((Join-Path $AppDir 'BioAcq.exe')))
 
 # offscreen platform plugin: --selftest / --screenshot with QT_QPA_PLATFORM=offscreen
