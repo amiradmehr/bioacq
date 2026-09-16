@@ -528,13 +528,25 @@ void PlotWidget::computeDisplayRange (Lane &L)
     {
         // Near-rail view: the raw value on a fixed +-full-scale range. The
         // rails sit near the recess top / bottom as in the design's artboard
-        // (22 / 300 and 278 / 300 of the recess), 0 in the middle.
+        // (22 / 300 and 278 / 300 of the recess), 0 in the middle, but never
+        // through the labels: below the top Y label and FS label, above the
+        // bottom Y label (a recess shorter than the artboard's 300 px moved
+        // them onto the rails).
         L.dLo = -fullScale_;
         L.dHi = fullScale_;
         L.dStep = fullScale_;
+        const QFontMetricsF fa (fAxis_);
         const double h = plotRect_.height ();
-        L.yTop = plotRect_.top () + h * 22.0 / 300.0;
-        L.yBot = plotRect_.top () + h * 278.0 / 300.0;
+        const double top = plotRect_.top ();
+        const double labelsBottom = std::max (top + 5.0 + fa.height (), L.mapTop + fa.height () / 2.0);
+        const double labelsTop = L.mapBottom - fa.height () / 2.0;
+        L.yTop = std::max (top + h * 22.0 / 300.0, labelsBottom + 3.0);
+        L.yBot = std::min (top + h * 278.0 / 300.0, labelsTop - 3.0);
+        if (L.yBot - L.yTop < 8.0)
+        {
+            L.yTop = L.mapTop;
+            L.yBot = L.mapBottom;
+        }
         return;
     }
     L.yTop = L.mapTop;
