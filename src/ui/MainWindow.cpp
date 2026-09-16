@@ -2398,6 +2398,12 @@ void MainWindow::onRateTimer ()
     updateHeadroom (now);
     for (Slot *s : {&cyton_, &emotibit_})
         updateStreamHealth (*s, now);
+    // The PPG row keeps one rate form: when one header is too narrow for
+    // "24.9 / 25 Hz", all three show "24.9 Hz".
+    const bool fullPpgRates =
+        ppgGreenPlot_->fullRateFits () && ppgRedPlot_->fullRateFits () && ppgIrPlot_->fullRateFits ();
+    for (PlotWidget *p : {ppgGreenPlot_, ppgRedPlot_, ppgIrPlot_})
+        p->setRateCompact (!fullPpgRates);
     updateHeartRate (now);
     for (Slot *s : {&cyton_, &emotibit_})
         updateSlotUi (*s);

@@ -230,6 +230,19 @@ void PlotWidget::setRate (const QString &text, const QColor &color)
     updateHeader ();
 }
 
+void PlotWidget::setRateCompact (bool on)
+{
+    if (on == rateCompact_)
+        return;
+    rateCompact_ = on;
+    updateHeader ();
+}
+
+bool PlotWidget::fullRateFits () const
+{
+    return kind_ == Kind::Hero || rateText_.isEmpty () || panelHeaderFit (true).rate == 2;
+}
+
 void PlotWidget::setTone (Tone t)
 {
     if (t == tone_)
@@ -920,6 +933,66 @@ void PlotWidget::paintHeroHeader (QPainter &p)
     }
 }
 
+// "24.9 / 25 Hz" -> "24.9 Hz"
+QString PlotWidget::compactRateText () const
+{
+    const int slash = rateText_.indexOf (QStringLiteral (" / "));
+    const int unit = rateText_.lastIndexOf (QLatin1Char (' '));
+    return slash > 0 && unit > slash ? rateText_.left (slash) + rateText_.mid (unit) : rateText_;
+}
+
+PlotWidget::PanelHeaderFit PlotWidget::panelHeaderFit (bool allowFullRate) const
+{
+    PanelHeaderFit f;
+    const QRect hr = headerRect_;
+    const bool valued = kind_ == Kind::Scalar || kind_ == Kind::Vital;
+    const double gap = valued ? 9.0 : 8.0;
+    const QFontMetricsF ft (fTitle_), fu (fUnits_), fr (fRate_), fv (fValue_), fvu (fValueUnit_), fc (fChip_);
+    const double vw = fv.horizontalAdvance (valueText_.value (0, kNoValue));
+
+    // The title and the value always show; a narrow panel drops the units,
+    // then shortens the rate to its measured part, then hides it, then elides
+    // the title. The Lanes key goes before the rate does.
+    const double left = hr.left () + 9.0 + 7.0 + gap;
+    const double right = hr.left () + hr.width () - 9.0;
+    if (kind_ == Kind::Scalar)
+        f.valueW = std::max (62.0, vw) + 9.0;
+    else if (kind_ == Kind::Vital)
+        f.valueW = std::max (58.0, vw + 4.0 + fvu.horizontalAdvance (units ())) + 12.0;
+    const QString u = kind_ == Kind::Scalar ? units () : QString (); // Lanes: in the strip; Vital: by the value
+    const double titleW = ft.horizontalAdvance (title_);
+    const double fullW = rateText_.isEmpty () ? 0.0 : fr.horizontalAdvance (rateText_) + gap;
+    const double compactW = rateText_.isEmpty () ? 0.0 : fr.horizontalAdvance (compactRateText ()) + gap;
+    const double unitsW = u.isEmpty () ? 0.0 : fu.horizontalAdvance (u) + gap;
+    const double tagW = noteFlag_ ? fc.horizontalAdvance (QStringLiteral ("SUBST")) + gap : 0.0;
+    double room = right - f.valueW - left;
+    if (kind_ == Kind::Scalar && titleW + unitsW + tagW + fullW > room)
+    {
+        f.valueW = vw + 9.0; // the value's 62 px minimum gives way first
+        room = right - f.valueW - left;
+    }
+    double rateW = 0.0;
+    if (fullW > 0.0 && allowFullRate && titleW + fullW <= room)
+    {
+        f.rate = 2;
+        rateW = fullW;
+    }
+    else if (compactW > 0.0 && titleW + compactW <= room)
+    {
+        f.rate = 1;
+        rateW = compactW;
+    }
+    // units only beside the full rate (they go first)
+    f.showUnits = !u.isEmpty () && (fullW == 0.0 || f.rate == 2) && titleW + unitsW + tagW + rateW <= room;
+    f.showTag = noteFlag_ && titleW + (f.showUnits ? unitsW : 0.0) + tagW + rateW <= room;
+    if (kind_ == Kind::Lanes && laneStripLayout (nullptr, nullptr) < 2)
+    {
+        const double keyW = laneKeyWidth () + 2.0 * gap;
+        f.showKey = titleW + rateW + keyW <= room;
+    }
+    return f;
+}
+
 void PlotWidget::paintPanelHeader (QPainter &p)
 {
     const QRect hr = headerRect_;
@@ -930,31 +1003,10 @@ void PlotWidget::paintPanelHeader (QPainter &p)
     const QColor valC = tone_ == Tone::Off ? Theme::textDim : (tone_ == Tone::Warn ? Theme::warn : Theme::textStrong);
     const QString v = valueText_.value (0, kNoValue);
     const double vw = fv.horizontalAdvance (v);
-
-    // Widths first, then what fits: the title and the value always show; a
-    // narrow panel drops the units, then the rate, then elides the title.
+    const PanelHeaderFit f = panelHeaderFit (!rateCompact_);
+    const QString u = kind_ == Kind::Scalar ? units () : QString ();
     const double left = hr.left () + 9.0 + 7.0 + gap;
     double right = hr.left () + hr.width () - 9.0;
-    double valueW = 0.0;
-    if (kind_ == Kind::Scalar)
-        valueW = std::max (62.0, vw) + 9.0;
-    else if (kind_ == Kind::Vital)
-        valueW = std::max (58.0, vw + 4.0 + fvu.horizontalAdvance (units ())) + 12.0;
-    const QString u = kind_ == Kind::Scalar ? units () : QString (); // Lanes: in the strip; Vital: by the value
-    const QString tag = QStringLiteral ("SUBST");
-    const double titleW = ft.horizontalAdvance (title_);
-    const double rateW = rateText_.isEmpty () ? 0.0 : fr.horizontalAdvance (rateText_) + gap;
-    const double unitsW = u.isEmpty () ? 0.0 : fu.horizontalAdvance (u) + gap;
-    const double tagW = noteFlag_ ? fc.horizontalAdvance (tag) + gap : 0.0;
-    double room = right - valueW - left;
-    if (kind_ == Kind::Scalar && titleW + unitsW + tagW + rateW > room)
-    {
-        valueW = vw + 9.0; // the value's 62 px minimum gives way first
-        room = right - valueW - left;
-    }
-    const bool showUnits = titleW + unitsW + tagW + rateW <= room;
-    const bool showTag = noteFlag_ && titleW + (showUnits ? unitsW : 0.0) + tagW + rateW <= room;
-    const bool showRate = rateW > 0.0 && titleW + rateW <= room;
 
     if (kind_ == Kind::Scalar)
     {
@@ -974,13 +1026,21 @@ void PlotWidget::paintPanelHeader (QPainter &p)
         p.setPen (valC);
         p.drawText (QPointF (right - uw - 4.0 - vw, base), v);
     }
-    right -= valueW;
-    if (showRate)
+    right -= f.valueW;
+    if (f.rate > 0)
     {
+        const QString rate = f.rate == 2 ? rateText_ : compactRateText ();
         p.setFont (fRate_);
         p.setPen (rateColor_);
-        p.drawText (QPointF (right - fr.horizontalAdvance (rateText_), baselineFor (fr, cy)), rateText_);
-        right -= rateW;
+        p.drawText (QPointF (right - fr.horizontalAdvance (rate), baselineFor (fr, cy)), rate);
+        right -= fr.horizontalAdvance (rate) + gap;
+    }
+    if (f.showKey)
+    {
+        // the strip is too narrow for its X / Y / Z letters: one key here
+        right -= gap;
+        paintLaneKey (p, right - laneKeyWidth (), cy);
+        right -= laneKeyWidth () + gap;
     }
 
     p.fillRect (QRectF (hr.left () + 9.0, std::floor (cy - 3.5), 7, 7), led_);
@@ -990,7 +1050,7 @@ void PlotWidget::paintPanelHeader (QPainter &p)
     const QString title = ft.elidedText (title_, Qt::ElideRight, std::max (16.0, right - x));
     p.drawText (QPointF (x, baselineFor (ft, cy)), title);
     x += ft.horizontalAdvance (title) + gap;
-    if (showUnits && !u.isEmpty ())
+    if (f.showUnits)
     {
         p.setFont (fUnits_);
         p.setPen (Theme::textDim);
@@ -998,11 +1058,101 @@ void PlotWidget::paintPanelHeader (QPainter &p)
         x += fu.horizontalAdvance (u) + gap;
     }
     // source substituted through a fallback (details in the tooltip)
-    if (showTag)
+    if (f.showTag)
     {
         p.setFont (fChip_);
         p.setPen (Theme::textFaint);
-        p.drawText (QPointF (x, baselineFor (fc, cy)), tag);
+        p.drawText (QPointF (x, baselineFor (fc, cy)), QStringLiteral ("SUBST"));
+    }
+}
+
+namespace
+{
+
+// The widest value the strip plans for: a sign and four digits at the lane's
+// decimals ("−8.888", "−888.8", "−8,888"). Fixed, so the strip's format does
+// not change with the live values.
+QString stripValueTemplate (int decimals)
+{
+    const int d = std::clamp (decimals, 0, 3);
+    return Readouts::number (-8.888 * std::pow (10.0, 3 - d), d, true, true);
+}
+
+constexpr double kKeyGap = 10.0; // between the key's X / Y / Z entries
+
+} // namespace
+
+int PlotWidget::laneStripLayout (std::vector<QString> *kicks, std::vector<StripColumn> *cols) const
+{
+    const QRect sr = stripRect_;
+    const double left = sr.left () + 9.0;
+    const double inner = sr.width () - 18.0;
+    const int nL = laneCount ();
+    const double sepW = 21.0;
+    const double groupW = (inner - sepW * (nL - 1)) / std::max (1, nL);
+    const QFontMetricsF fk (fKicker_), fl (fLetter_), fv (fLegendValue_);
+    auto layout = [&] (bool withUnits, bool glyph, bool letter, std::vector<QString> *k, std::vector<StripColumn> *c) {
+        bool fits = true;
+        for (int li = 0; li < nL; ++li)
+        {
+            const Lane &L = lanes_[static_cast<std::size_t> (li)];
+            QString kick = L.spec.label;
+            if (withUnits && !L.spec.units.isEmpty ())
+                kick += QStringLiteral (" ") + L.spec.units;
+            const double x0 = left + li * (groupW + sepW);
+            const int nT = L.spec.traces.size ();
+            const double cx0 = x0 + fk.horizontalAdvance (kick) + 10.0;
+            const double colW = (x0 + groupW - cx0 - 8.0 * (nT - 1)) / std::max (1, nT);
+            const double vw = fv.horizontalAdvance (stripValueTemplate (L.decimals));
+            for (int i = 0; i < nT; ++i)
+            {
+                double need = vw;
+                if (glyph)
+                    need += 14.0 + 6.0;
+                if (letter)
+                    need += 4.0 + fl.horizontalAdvance (L.spec.traces[i].name);
+                fits = fits && colW >= need;
+                if (c)
+                    c->push_back ({cx0 + i * (colW + 8.0), colW});
+            }
+            if (k)
+                k->push_back (kick);
+        }
+        return fits;
+    };
+    int mode = 0;
+    if (layout (true, true, true, nullptr, nullptr))
+        mode = 3;
+    else if (layout (false, true, true, nullptr, nullptr))
+        mode = 2;
+    else if (layout (false, true, false, nullptr, nullptr))
+        mode = 1;
+    if (kicks || cols)
+        layout (mode == 3, mode >= 1, mode >= 2, kicks, cols);
+    return mode;
+}
+
+double PlotWidget::laneKeyWidth () const
+{
+    const QFontMetricsF fl (fLetter_);
+    double w = 0.0;
+    const QVector<Trace> &traces = lanes_.front ().spec.traces;
+    for (int i = 0; i < traces.size (); ++i)
+        w += (i ? kKeyGap : 0.0) + 14.0 + 4.0 + fl.horizontalAdvance (traces[i].name);
+    return w;
+}
+
+void PlotWidget::paintLaneKey (QPainter &p, double x, double cy)
+{
+    // [-- X  - - Y  .. Z]: the lanes share their traces' names and dashes
+    const QFontMetricsF fl (fLetter_);
+    p.setFont (fLetter_);
+    for (const Trace &T : lanes_.front ().spec.traces)
+    {
+        legendGlyph (p, T, x, cy);
+        p.setPen (Theme::textMuted);
+        p.drawText (QPointF (x + 14.0 + 4.0, baselineFor (fl, cy)), T.name);
+        x += 14.0 + 4.0 + fl.horizontalAdvance (T.name) + kKeyGap;
     }
 }
 
@@ -1019,39 +1169,10 @@ void PlotWidget::paintLaneStrip (QPainter &p)
     const QFontMetricsF fk (fKicker_), fl (fLetter_), fv (fLegendValue_);
     const QColor valC = tone_ == Tone::Off ? Theme::textDim : (tone_ == Tone::Warn ? Theme::warn : Theme::textStrong);
 
-    struct Column
-    {
-        double x, w;
-    };
     std::vector<QString> kicks;
-    std::vector<Column> cols;
-    // One format for the whole strip: glyph + letter + value when every
-    // column has room, else glyph + value, else the values alone.
-    int mode = 2;
+    std::vector<StripColumn> cols;
+    const int mode = laneStripLayout (&kicks, &cols);
     int flat = 0;
-    for (int li = 0; li < nL; ++li)
-    {
-        const Lane &L = lanes_[static_cast<std::size_t> (li)];
-        QString kick = L.spec.label;
-        if (!L.spec.units.isEmpty ())
-            kick += QStringLiteral (" ") + L.spec.units;
-        kicks.push_back (kick);
-        const double x0 = left + li * (groupW + sepW);
-        const int nT = L.spec.traces.size ();
-        const double cx0 = x0 + fk.horizontalAdvance (kick) + 10.0;
-        const double colW = (x0 + groupW - cx0 - 8.0 * (nT - 1)) / std::max (1, nT);
-        for (int i = 0; i < nT; ++i, ++flat)
-        {
-            cols.push_back ({cx0 + i * (colW + 8.0), colW});
-            const double vw = fv.horizontalAdvance (valueText_.value (flat, kNoValue));
-            if (colW < 14.0 + 4.0 + fl.horizontalAdvance (L.spec.traces[i].name) + 6.0 + vw)
-                mode = std::min (mode, 1);
-            if (colW < 14.0 + 6.0 + vw)
-                mode = 0;
-        }
-    }
-
-    flat = 0;
     for (int li = 0; li < nL; ++li)
     {
         const Lane &L = lanes_[static_cast<std::size_t> (li)];
@@ -1064,19 +1185,22 @@ void PlotWidget::paintLaneStrip (QPainter &p)
         for (int i = 0; i < L.spec.traces.size (); ++i, ++flat)
         {
             const Trace &T = L.spec.traces[i];
-            const Column &c = cols[static_cast<std::size_t> (flat)];
-            if (mode >= 1)
+            const StripColumn &c = cols[static_cast<std::size_t> (flat)];
+            const QString v = valueText_.value (flat, kNoValue);
+            const double vw = fv.horizontalAdvance (v);
+            // a value wider than planned (e.g. -1,234.5 °/s) hides only its
+            // own glyph / letter rather than overlapping them
+            if (mode >= 1 && c.w >= 14.0 + 6.0 + vw)
                 legendGlyph (p, T, c.x, cy);
-            if (mode == 2)
+            if (mode >= 2 && c.w >= 14.0 + 4.0 + fl.horizontalAdvance (T.name) + 6.0 + vw)
             {
                 p.setFont (fLetter_);
                 p.setPen (Theme::textMuted);
                 p.drawText (QPointF (c.x + 14.0 + 4.0, baselineFor (fl, cy)), T.name);
             }
-            const QString v = valueText_.value (flat, kNoValue);
             p.setFont (fLegendValue_);
             p.setPen (valC);
-            p.drawText (QPointF (c.x + c.w - fv.horizontalAdvance (v), baselineFor (fv, cy)), v);
+            p.drawText (QPointF (c.x + c.w - vw, baselineFor (fv, cy)), v);
         }
     }
 }
@@ -1250,9 +1374,13 @@ void PlotWidget::ensureRecessCache ()
         const double topBase = baselineFor (fa, L.mapTop - o.y ());
         if (kind_ == Kind::Lanes && !L.spec.label.isEmpty ())
         {
+            // "ACC g": the units stay here when the strip drops them
+            QString label = L.spec.label;
+            if (!L.spec.units.isEmpty ())
+                label += QStringLiteral (" ") + L.spec.units;
             p.setPen (Theme::textDim);
-            p.drawText (QPointF (x, topBase), L.spec.label);
-            x += fa.horizontalAdvance (L.spec.label) + 8.0;
+            p.drawText (QPointF (x, topBase), label);
+            x += fa.horizontalAdvance (label) + 8.0;
         }
         if (L.finite)
         {

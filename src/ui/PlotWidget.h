@@ -103,7 +103,13 @@ public:
     void setSubtitle (const QString &text);     // hero
     void setChips (const QVector<Chip> &chips); // hero
     void setLed (const QColor &c);
-    void setRate (const QString &text, const QColor &color);
+    void setRate (const QString &text, const QColor &color); // "24.9 / 25 Hz"
+    // Panels (not the hero): a header too narrow for the full rate shows the
+    // measured part ("24.9 Hz") before it hides the rate. setRateCompact
+    // forces that form, so a row of sibling panels can stay uniform;
+    // fullRateFits says whether the full text fits in this header.
+    void setRateCompact (bool on);
+    bool fullRateFits () const;
     void setTone (Tone t);
     // Vital: the header value and the chips of the strip, set by the owner
     // (the heart-rate readout rules live in Readouts.h).
@@ -206,7 +212,29 @@ private:
         std::vector<char> denseMode;
     };
 
+    struct StripColumn
+    {
+        double x, w;
+    };
+    // What a panel header shows: the value's reserved width, the rate form
+    // (2 full, 1 measured only, 0 none), the units, the SUBST tag and (Lanes)
+    // the X / Y / Z key.
+    struct PanelHeaderFit
+    {
+        double valueW = 0.0;
+        int rate = 0;
+        bool showUnits = false, showTag = false, showKey = false;
+    };
+
     void init ();
+    PanelHeaderFit panelHeaderFit (bool allowFullRate) const;
+    QString compactRateText () const;
+    // Lanes strip format from the geometry and a fixed value template per
+    // lane: 3 kicker with units + glyph + letter + value, 2 kicker without
+    // units, 1 glyph + value, 0 values only. Fills the kickers and columns.
+    int laneStripLayout (std::vector<QString> *kicks, std::vector<StripColumn> *cols) const;
+    double laneKeyWidth () const;
+    void paintLaneKey (QPainter &p, double x, double cy);
     bool hasStrip () const
     {
         return kind_ == Kind::Lanes || kind_ == Kind::Vital;
@@ -240,6 +268,7 @@ private:
     QColor led_;
     QString rateText_;
     QColor rateColor_;
+    bool rateCompact_ = false;
     Tone tone_ = Tone::Off;
     QString placeholder_, stallText_, note_, valueOverride_;
     bool noteFlag_ = false;
