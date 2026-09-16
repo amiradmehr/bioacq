@@ -6,6 +6,7 @@
 #include "HeartRate.h"
 #include "PlotWidget.h"
 #include "RingBuffer.h"
+#include "SerialPorts.h"
 #include "Theme.h"
 #include "Widgets.h"
 
@@ -224,6 +225,24 @@ QString b (const QString &s, const QColor &c)
 bool isAuto (const QString &port)
 {
     return port.isEmpty () || port.compare (QStringLiteral ("Auto"), Qt::CaseInsensitive) == 0;
+}
+
+// Auto-detect: the preferred port (the last one that connected) if it is one
+// of the detected OpenBCI dongles, else the first dongle. "" = none.
+QString pickCytonDongle (const QVector<SerialPortEntry> &ports, const QString &preferred)
+{
+    QString first;
+    for (const SerialPortEntry &e : ports)
+    {
+        if (!e.cytonDongle)
+            continue;
+        const QString p = brainflowSerialPort (e);
+        if (!preferred.isEmpty () && sameSerialPort (p, preferred))
+            return p;
+        if (first.isEmpty ())
+            first = p;
+    }
+    return first;
 }
 
 } // namespace
@@ -1163,20 +1182,16 @@ void MainWindow::disconnectAll ()
     updateConnectUi ();
 }
 
-// INTEGRATE: SerialPorts::findCytonDongle
-// The Cyton dongle's serial port for a connect: the override if that device
-// exists; otherwise (auto) the preferred port (the last one that connected) if
-// it exists, else the first /dev/cu.usbserial-* (FTDI). "" = no dongle.
+// The Cyton dongle's serial port for a connect, as BrainFlow takes it ("COM3",
+// "/dev/cu.usbserial-..."): the override if that port exists; otherwise
+// (auto) the last port that connected if it is a detected OpenBCI dongle, else
+// the first dongle found (SerialPorts: FTDI 0403:6015). "" = no dongle.
+// Enumeration only reads the OS device registry; no port is opened.
 QString MainWindow::cytonPortFor (const QString &override) const
 {
     if (!override.isEmpty ())
-        return QFileInfo::exists (override) ? override : QString ();
-    if (!opts_.cytonPort.isEmpty () && QFileInfo::exists (opts_.cytonPort))
-        return opts_.cytonPort;
-    const QStringList e = QDir (QStringLiteral ("/dev"))
-                              .entryList (QStringList {QStringLiteral ("cu.usbserial-*")},
-                                  QDir::System | QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
-    return e.isEmpty () ? QString () : QStringLiteral ("/dev/") + e.front ();
+        return serialPortExists (override) ? override : QString ();
+    return pickCytonDongle (listSerialPorts (), opts_.cytonPort);
 }
 
 QString MainWindow::portOverride () const
@@ -2299,20 +2314,34 @@ void MainWindow::showMessage (const QString &text, int ms, const QColor &color)
 void MainWindow::refreshPorts (bool announce)
 {
     const QString current = portCombo_->currentText ().trimmed ();
-    QStringList ports;
-    const QStringList entries = QDir (QStringLiteral ("/dev"))
-                                    .entryList (QStringList {QStringLiteral ("cu.usbserial-*")},
-                                        QDir::System | QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
-    ports << QStringLiteral ("Auto");
-    for (const QString &e : entries)
-        ports << QStringLiteral ("/dev/") + e;
     const QString keep = current.isEmpty () ? portOverride_ : current;
-    if (!isAuto (keep) && !ports.contains (keep))
-        ports << keep; // keep a chosen override selectable even when unplugged
+    const QVector<SerialPortEntry> all = listSerialPorts (); // OpenBCI dongles first
     portCombo_->blockSignals (true);
     portCombo_->clear ();
-    portCombo_->addItems (ports);
-    if (entries.isEmpty ())
+    portCombo_->addItem (QStringLiteral ("Auto"));
+    portCombo_->setItemData (0, QStringLiteral ("The last port that connected if it is an OpenBCI dongle, else the first dongle"),
+        Qt::ToolTipRole);
+    int usb = 0, dongles = 0;
+    bool keepListed = isAuto (keep);
+    for (const SerialPortEntry &e : all)
+    {
+        if (e.vid == 0 && !e.cytonDongle)
+            continue; // not a USB serial device (Bluetooth, debug console, ...)
+        const QString port = brainflowSerialPort (e);
+        portCombo_->addItem (port);
+        auto hex4 = [] (quint16 id) { return QString::number (id, 16).rightJustified (4, QLatin1Char ('0')); };
+        portCombo_->setItemData (portCombo_->count () - 1,
+            QStringLiteral ("%1 · %2:%3%4")
+                .arg (e.description.isEmpty () ? QStringLiteral ("USB serial") : e.description, hex4 (e.vid),
+                    hex4 (e.pid), e.cytonDongle ? QStringLiteral (" · OpenBCI dongle") : QString ()),
+            Qt::ToolTipRole);
+        keepListed = keepListed || sameSerialPort (port, keep);
+        ++usb;
+        dongles += e.cytonDongle ? 1 : 0;
+    }
+    if (!keepListed)
+        portCombo_->addItem (keep); // keep a chosen override selectable even when unplugged
+    if (usb == 0)
     {
         portCombo_->addItem (QStringLiteral ("no USB serial ports found"));
         if (auto *m = qobject_cast<QStandardItemModel *> (portCombo_->model ()))
@@ -2322,9 +2351,11 @@ void MainWindow::refreshPorts (bool announce)
     portCombo_->blockSignals (false);
     if (portCombo_->lineEdit ())
         portCombo_->lineEdit ()->setCursorPosition (0); // show the start of the path
-    detectedPort_ = cytonPortFor (QString ());
+    detectedPort_ = pickCytonDongle (all, opts_.cytonPort);
     if (statusStrip_ && announce)
-        showMessage (QStringLiteral ("Found %1 USB serial port(s)").arg (entries.size ()), 3000);
+        showMessage (dongles > 0 ? QStringLiteral ("Found %1 USB serial port(s), %2 OpenBCI dongle(s)").arg (usb).arg (dongles)
+                                 : QStringLiteral ("Found %1 USB serial port(s), no OpenBCI dongle").arg (usb),
+            3000);
     if (cyton_.meta)
         updateSlotUi (cyton_);
 }

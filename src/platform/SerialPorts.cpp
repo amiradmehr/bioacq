@@ -83,3 +83,12 @@ bool serialPortExists (const QString &port)
     return QFileInfo::exists (p);
 #endif
 }
+
+bool sameSerialPort (const QString &a, const QString &b)
+{
+#ifdef Q_OS_WIN
+    return a.compare (b, Qt::CaseInsensitive) == 0;
+#else
+    return a == b;
+#endif
+}

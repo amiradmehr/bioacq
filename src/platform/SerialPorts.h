@@ -38,3 +38,7 @@ QString findCytonDongle ();
 // True if the port (a BrainFlow serial_port value: "COM3", "\\.\COM3" or a
 // device path) currently exists.
 bool serialPortExists (const QString &port);
+
+// True if both name the same port ("COM3" and "com3" on Windows; device
+// paths compare exactly elsewhere).
+bool sameSerialPort (const QString &a, const QString &b);

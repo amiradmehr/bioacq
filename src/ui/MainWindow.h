@@ -43,9 +43,9 @@ inline constexpr int kMaxDiscoveryTimeoutSec = 20;
 struct LaunchOptions
 {
     bool synthetic = false;
-    // Cyton: the port auto-detect prefers (the last port that connected, or the
-    // dongle main.cpp detected); an explicit --port (portSet) becomes the rail's
-    // port override instead.
+    // Cyton. Empty = auto-detect: the last port that connected if it is a
+    // detected OpenBCI dongle, else the first dongle found (SerialPorts).
+    // An explicit --port (portSet) becomes the rail's port override instead.
     QString cytonPort;
     QString emotibitIp = QStringLiteral ("192.168.1.12"); // blank = last IP that answered, then broadcast
     int emotibitTimeoutSec = 5;

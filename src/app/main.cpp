@@ -214,7 +214,7 @@ void usage ()
         "  --list-ports              list serial ports (OpenBCI dongles first) and exit\n\n"
         "options:\n"
         "  --port <dev>              Cyton serial port, e.g. COM3 or /dev/cu.usbserial-XXXXXXXX\n"
-        "                            (default: auto-detect the OpenBCI dongle, FTDI 0403:6015)\n"
+        "                            (default: auto-detect the OpenBCI dongle, FTDI 0403:6015, at connect)\n"
         "  --ip <addr>               EmotiBit IP (default 192.168.1.12; works across subnets)\n"
         "  --discover                EmotiBit broadcast discovery instead of an IP (same subnet only)\n"
         "  --timeout <s>             EmotiBit discovery timeout, 2-%d (default 5)\n"
@@ -313,8 +313,7 @@ int main (int argc, char **argv)
     const bool shot = a.mode == Args::Screenshot;
     LaunchOptions lo;
     lo.synthetic = a.synthetic || shot;
-    // No --port: preselect the first OpenBCI dongle found (screenshots stay reproducible).
-    lo.cytonPort = (a.portSet || shot) ? a.port : findCytonDongle ();
+    lo.cytonPort = a.port; // empty: MainWindow auto-detects the dongle at every connect
     lo.emotibitIp = a.ip;
     lo.emotibitTimeoutSec = a.timeout;
     lo.recordDir = a.recordDir;
