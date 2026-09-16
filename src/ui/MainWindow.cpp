@@ -811,24 +811,25 @@ QWidget *MainWindow::buildMain ()
     tempPlot_ = new PlotWidget (Kind::Scalar, QStringLiteral ("TEMPERATURE"), QStringLiteral ("°C"),
         {{QStringLiteral ("T"), Theme::traceTemp, Dash::Solid}});
 
-    // Hero ECG across the top; PPG green | red | IR, then the heart rate they
-    // produce; the IMU's three lanes need the width and height, temperature
-    // (slow, sample-and-hold) takes the remaining column.
+    // Hero ECG across the top; the PPG channels matter most after it, so
+    // green | red | IR get a third of the width each and the tallest row; heart
+    // rate, temperature (slow, sample-and-hold) and the IMU's three lanes share
+    // a shorter bottom row (12-column grid: 3 | 3 | 6).
     auto *grid = new QGridLayout;
     grid->setContentsMargins (0, 0, 0, 0);
     grid->setSpacing (Theme::gutter);
-    grid->addWidget (cytonPlot_, 0, 0, 1, 4);
-    grid->addWidget (ppgGreenPlot_, 1, 0);
-    grid->addWidget (ppgRedPlot_, 1, 1);
-    grid->addWidget (ppgIrPlot_, 1, 2);
-    grid->addWidget (hrPlot_, 1, 3);
-    grid->addWidget (imuPlot_, 2, 0, 1, 3);
-    grid->addWidget (tempPlot_, 2, 3);
-    for (int c = 0; c < 4; ++c)
+    grid->addWidget (cytonPlot_, 0, 0, 1, 12);
+    grid->addWidget (ppgGreenPlot_, 1, 0, 1, 4);
+    grid->addWidget (ppgRedPlot_, 1, 4, 1, 4);
+    grid->addWidget (ppgIrPlot_, 1, 8, 1, 4);
+    grid->addWidget (hrPlot_, 2, 0, 1, 3);
+    grid->addWidget (tempPlot_, 2, 3, 1, 3);
+    grid->addWidget (imuPlot_, 2, 6, 1, 6);
+    for (int c = 0; c < 12; ++c)
         grid->setColumnStretch (c, 1);
-    grid->setRowStretch (0, 125);
-    grid->setRowStretch (1, 95);
-    grid->setRowStretch (2, 130);
+    grid->setRowStretch (0, 110);
+    grid->setRowStretch (1, 150);
+    grid->setRowStretch (2, 90);
     v->addLayout (grid, 1);
 
     for (PlotWidget *p : allPlots ())
@@ -1847,15 +1848,15 @@ void MainWindow::updateStreamHealth (Slot &s, double now)
     }
 
     const bool allStale = streaming && total > 0 && stale == total;
-    // A device-wide stall is labelled once, on the device's largest panel (the
-    // IMU for the EmotiBit); a partial stall labels each stale plot.
+    // A device-wide stall is labelled once, on the device's largest panel (PPG
+    // green for the EmotiBit); a partial stall labels each stale plot.
     PlotWidget *labelPlot = nullptr;
     if (allStale && states.size () > 1)
     {
         labelPlot = states.back ().plot;
         for (const PlotState &ps : states)
-            if (ps.plot == imuPlot_)
-                labelPlot = imuPlot_;
+            if (ps.plot == ppgGreenPlot_)
+                labelPlot = ppgGreenPlot_;
     }
     for (const PlotState &ps : states)
     {
