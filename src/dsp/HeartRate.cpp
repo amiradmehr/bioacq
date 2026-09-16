@@ -280,35 +280,49 @@ void BeatDetector::candidate (double tp, double yp)
     lastBeatY_ = yp;
 }
 
-double BeatDetector::periodicity (double ibiSec) const
+double BeatDetector::correlation (int lag) const
 {
-    const double fsDec = fs_ / pStep_;
     const std::size_t w = pFilled_;
-    const int l0 = static_cast<int> (std::lround (ibiSec * fsDec));
-    if (!(ibiSec > 0.0) || l0 < 2 || w < static_cast<std::size_t> (2 * l0))
+    const std::size_t l = static_cast<std::size_t> (std::max (1, lag));
+    if (l >= w)
         return 0.0;
     const std::size_t cap = py_.size ();
     auto at = [&] (std::size_t k) { return py_[(pHead_ + cap - w + k) % cap]; }; // k = 0: oldest
-    double best = 0.0;
+    double sxy = 0.0, sxx = 0.0, syy = 0.0;
+    for (std::size_t k = l; k < w; ++k)
+    {
+        const double a = at (k), b = at (k - l);
+        sxy += a * b;
+        sxx += a * a;
+        syy += b * b;
+    }
+    const double den = std::sqrt (sxx * syy);
+    return den > 0.0 ? sxy / den : 0.0;
+}
+
+double BeatDetector::periodicity (double ibiSec) const
+{
+    const double fsDec = fs_ / pStep_;
+    const int l0 = static_cast<int> (std::lround (ibiSec * fsDec));
+    if (!(ibiSec > 0.0) || l0 < 2 || pFilled_ < static_cast<std::size_t> (2 * l0))
+        return 0.0;
+    // Best correlation within +-20 % of the beat interval ...
+    double best = -1.0;
+    int bestLag = l0;
     const int lagHi = static_cast<int> (std::ceil (1.2 * l0));
     for (int lag = std::max (2, static_cast<int> (std::floor (0.8 * l0))); lag <= lagHi; ++lag)
     {
-        const std::size_t l = static_cast<std::size_t> (lag);
-        if (l >= w)
-            break;
-        double sxy = 0.0, sxx = 0.0, syy = 0.0;
-        for (std::size_t k = l; k < w; ++k)
+        const double r = correlation (lag);
+        if (r > best)
         {
-            const double a = at (k), b = at (k - l);
-            sxy += a * b;
-            sxx += a * a;
-            syy += b * b;
+            best = r;
+            bestLag = lag;
         }
-        const double den = std::sqrt (sxx * syy);
-        if (den > 0.0)
-            best = std::max (best, sxy / den);
     }
-    return best;
+    // ... minus the correlation half a beat away: a pulse train decorrelates
+    // there, while slow baseline wander (respiration) stays correlated.
+    const double half = correlation (static_cast<int> (std::lround (bestLag / 2.0)));
+    return best - std::max (0.0, half);
 }
 
 Estimate BeatDetector::estimate (double now) const

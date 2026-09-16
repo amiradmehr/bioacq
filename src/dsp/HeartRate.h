@@ -40,8 +40,10 @@
 // inliers averages the sub-sample timing error that a single median IBI
 // keeps). Valid only with >= kMinBeats beats, quality >= kMinQuality, a beat
 // in the last max(2 s, 2.2 IBIs) and periodicity >= kMinPeriodicity: the
-// autocorrelation of the band-passed signal at the beat interval. Band-passed
-// noise also yields fairly regular "beats", but it does not repeat itself.
+// autocorrelation of the band-passed signal at the beat interval minus its
+// (positive) autocorrelation at half that interval. Band-passed noise also
+// yields fairly regular "beats", but it does not repeat itself; slow
+// respiratory wander repeats, but stays correlated at half a beat too.
 //
 // Tracker: one detector per PPG channel; the source is the valid channel with
 // the best quality, switched only when another channel is better by
@@ -107,8 +109,10 @@ public:
     // estimateFromBeats plus the periodicity check
     Estimate estimate (double now) const;
     // Largest normalised autocorrelation of the band-passed signal (last
-    // kWindowSec) at lags within +-20 % of ibiSec; 0 without enough data.
+    // kWindowSec) at lags within +-20 % of ibiSec, minus the (positive part of
+    // the) autocorrelation at half that lag; 0 without enough data.
     double periodicity (double ibiSec) const;
+    double correlation (int lagSamples) const; // at the ~25 Hz periodicity rate
 
     const std::deque<double> &beats () const
     {
