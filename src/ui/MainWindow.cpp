@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 
+#include "AppPaths.h"
 #include "BuildConfig.h"
 #include "DeviceWorker.h"
 #include "EmotiBitDiscovery.h"
@@ -251,7 +252,7 @@ QString pickCytonDongle (const QVector<SerialPortEntry> &ports, const QString &p
 MainWindow::MainWindow (const LaunchOptions &opts, QWidget *parent) : QMainWindow (parent), opts_ (opts)
 {
     if (opts_.recordDir.isEmpty ())
-        opts_.recordDir = QString::fromUtf8 (BIOACQ_RECORD_DIR);
+        opts_.recordDir = defaultRecordDir ();
     if (opts_.portSet)
         portOverride_ = opts_.cytonPort; // an explicit --port is the rail's override
     if (opts_.useSettings)
