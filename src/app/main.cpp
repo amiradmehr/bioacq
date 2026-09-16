@@ -1,5 +1,5 @@
-// bioacq -- native real-time viewer for OpenBCI Cyton ch1 + EmotiBit
-// (temperature, IMU, PPG green) via BrainFlow. See README.md.
+// bioacq -- native real-time viewer for an OpenBCI Cyton ECG channel + EmotiBit
+// (PPG green / red / IR, heart rate, temperature, IMU) via BrainFlow. See README.md.
 
 #include "BuildConfig.h"
 #include "Headless.h"
@@ -65,6 +65,7 @@ struct Args
     // test hooks (command line only)
     double testStallSec = -1.0;
     double testRailOffsetUv = 0.0;
+    double testPpgBpm = 0.0;
     QString error;
 };
 
@@ -162,6 +163,8 @@ Args parseArgs (int argc, char **argv)
         }
         else if (s == "--test-rail-offset-uv")
             a.testRailOffsetUv = value ("--test-rail-offset-uv").toDouble ();
+        else if (s == "--test-ppg-bpm")
+            a.testPpgBpm = std::clamp (value ("--test-ppg-bpm").toDouble (), 0.0, 220.0);
         else if (s == "--no-cyton")
             a.noCyton = true;
         else if (s == "--no-emotibit")
@@ -194,10 +197,13 @@ void usage ()
         "  --probe [seconds]         headless test of the REAL devices (default 8 s of data)\n"
         "  --screenshot <file.png>   render one UI state through the real code paths, save a PNG, quit\n"
         "      --state <s>           live (default) | idle | connecting | error | recording | warning\n"
-        "                            connecting / error: Cyton synthetic + EmotiBit discovery toward the\n"
-        "                            unanswered TEST-NET address 192.0.2.1 (timeout 20 s / 2 s);\n"
+        "                            every state presses Connect (both devices at once);\n"
+        "                            live / recording: synthetic, with --test-ppg-bpm 72 (heart rate);\n"
+        "                            connecting: Cyton held before prepare_session + EmotiBit discovery\n"
+        "                            toward the unanswered TEST-NET address 192.0.2.1 (timeout 20 s);\n"
+        "                            error: Cyton synthetic, EmotiBit not found at 192.0.2.1 (2 s);\n"
         "                            recording: records into --record-dir (default: a temporary folder);\n"
-        "                            warning: enables both test hooks below\n"
+        "                            warning: stall + rail-offset test hooks below\n"
         "      --size WxH            window size (default 1600x1000)\n\n"
         "options:\n"
         "  --port <dev>              Cyton serial port (default /dev/cu.usbserial-DP04W4GA)\n"
@@ -213,7 +219,9 @@ void usage ()
         "  --verbose                 BrainFlow log level INFO (stderr)\n\n"
         "test hooks (display only, never in the UI):\n"
         "  --test-stall-emotibit [s] stop polling the EmotiBit after s seconds of streaming (default 1.5)\n"
-        "  --test-rail-offset-uv <v> add v uV to the Cyton's raw Ch1 display value (near-rail path)\n",
+        "  --test-rail-offset-uv <v> add v uV to the Cyton's raw Ch1 display value (near-rail path)\n"
+        "  --test-ppg-bpm <bpm>      replace the EmotiBit PPG display values with a synthetic pulse\n"
+        "                            (drives the heart-rate panel)\n",
         BIOACQ_VERSION, kMaxDiscoveryTimeoutSec, BIOACQ_RECORD_DIR);
 }
 
@@ -297,6 +305,7 @@ int main (int argc, char **argv)
     lo.recordSet = a.record;
     lo.testFreezeEmotibitSec = a.testStallSec;
     lo.testRailOffsetUv = a.testRailOffsetUv;
+    lo.testPpgBpm = a.testPpgBpm;
 
     // --screenshot states: set up the real code paths that produce each state.
     std::unique_ptr<QTemporaryDir> tmpRecord;
@@ -307,6 +316,10 @@ int main (int argc, char **argv)
             lo.emotibitIp = QStringLiteral ("192.0.2.1"); // TEST-NET-1: never answers
             lo.emotibitTimeoutSec = a.state == QLatin1String ("connecting") ? 20 : 2;
         }
+        if (a.state == QLatin1String ("connecting"))
+            lo.testCytonPrepareDelayMs = 8000; // both devices still connecting at the capture
+        if ((a.state == QLatin1String ("live") || a.state == QLatin1String ("recording")) && lo.testPpgBpm <= 0.0)
+            lo.testPpgBpm = 72.0; // the synthetic board's PPG is noise: no heart rate without it
         if (a.state == QLatin1String ("warning"))
         {
             if (lo.testFreezeEmotibitSec < 0.0)
@@ -320,10 +333,18 @@ int main (int argc, char **argv)
             lo.recordDir = tmpRecord->path ();
         }
     }
-    if (lo.testFreezeEmotibitSec >= 0.0 || lo.testRailOffsetUv != 0.0)
-        std::fprintf (stderr, "bioacq: TEST HOOK ACTIVE (%s%s) -- display data is modified\n",
-            lo.testFreezeEmotibitSec >= 0.0 ? "EmotiBit polling freezes" : "",
-            lo.testRailOffsetUv != 0.0 ? (lo.testFreezeEmotibitSec >= 0.0 ? ", Cyton raw offset" : "Cyton raw offset") : "");
+    if (lo.testFreezeEmotibitSec >= 0.0 || lo.testRailOffsetUv != 0.0 || lo.testPpgBpm > 0.0)
+    {
+        QStringList hooks;
+        if (lo.testFreezeEmotibitSec >= 0.0)
+            hooks << QStringLiteral ("EmotiBit polling freezes");
+        if (lo.testRailOffsetUv != 0.0)
+            hooks << QStringLiteral ("Cyton raw offset");
+        if (lo.testPpgBpm > 0.0)
+            hooks << QStringLiteral ("synthetic PPG pulse at %1 bpm").arg (lo.testPpgBpm);
+        std::fprintf (stderr, "bioacq: TEST HOOK ACTIVE (%s) -- display data is modified\n",
+            qPrintable (hooks.join (QStringLiteral (", "))));
+    }
 
     MainWindow w (lo);
     w.resize (a.width, a.height);
@@ -349,10 +370,8 @@ int main (int argc, char **argv)
         // CPU over t = 2..4 s after the connect (getrusage, all threads; % of one core)
         double cpuA = 0.0, wallA = 0.0;
         QTimer::singleShot (150, &w, [&w, idle, emReal] {
-            if (idle)
-                return;
-            w.connectDeviceWith (DeviceKind::Cyton, true);
-            w.connectDeviceWith (DeviceKind::EmotiBit, !emReal);
+            if (!idle)
+                w.connectAllWith (true, !emReal); // the Connect button, both devices at once
         });
         if (state == QLatin1String ("recording"))
             QTimer::singleShot (1500, &w, [&w] { w.setRecording (true); });
@@ -366,7 +385,9 @@ int main (int argc, char **argv)
                 a.width, a.height, w.devicePixelRatioF ());
             std::fflush (stdout);
         });
-        QTimer::singleShot (idle ? 1500 : 4300, &w, [&] {
+        // late enough for a first heart-rate estimate (4 beats at 72 bpm) and
+        // for the 2 s error timeout; the connecting state is still connecting
+        QTimer::singleShot (idle ? 1500 : 6300, &w, [&] {
             const QPixmap pm = w.grab ();
             saved = !pm.isNull () && pm.save (a.screenshotPath);
             std::printf ("screenshot %s: %s (%dx%d, state %s)\n", saved ? "saved" : "FAILED",

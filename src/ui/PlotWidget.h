@@ -21,19 +21,24 @@ class SignalRing;
 
 // Real-time strip chart drawn as one instrument-panel "section": 1 px panel
 // edge, header (hero: LED, title, subtitle, filter chips, P-P / RATE / LATEST;
-// panel: LED, title, units, rate, value), optional X/Y/Z legend strip, and a
+// panel: LED, title, units, rate, value), an optional readout strip, and a
 // recessed plot on a dot raster.
 //
+// The recess holds one or more LANES stacked on one shared time axis. Each
+// lane has its own ring buffer, traces, units and Y autoscale (Kind::Lanes:
+// the IMU panel with ACC / GYR / MAG); every other kind has a single lane.
+//
 // Performance: tick() (one ~60 Hz timer for all plots) copies the visible
-// window out of the ring buffer and rebuilds min/max-decimated polylines
-// (<= ~2 points per pixel column); paintEvent() blits a cached pixmap of the
-// static recess and draws the cached geometry. The recess cache is two
-// layers: the dot raster + border (rasterised only when size / DPR change)
-// and, on top of one blit of it, the zero / rail lines and axis labels
-// (redrawn only when the snapped Y range, window or rail view change).
-// Trace frames repaint only the recess; header text is refreshed at <= 8 Hz
-// and repaints only the header. Traces use cosmetic 1 device-px pens -- Qt's
-// fast line path; exact segments keep the design's dash patterns.
+// window of every lane out of its ring buffer and rebuilds min/max-decimated
+// polylines per trace (<= ~2 points per pixel column); paintEvent() blits a
+// cached pixmap of the static recess and draws the cached geometry. The recess
+// cache is two layers: the dot raster + border (rasterised only when size /
+// DPR change) and, on top of one blit of it, the lane dividers, zero / rail
+// lines and axis labels (redrawn only when a snapped Y range, the window or
+// the rail view change). Trace frames repaint only the recess; header text is
+// refreshed at <= 8 Hz and repaints only the header and strip. Traces use
+// cosmetic 1 device-px pens -- Qt's fast line path; exact segments keep the
+// design's dash patterns.
 class PlotWidget : public QWidget
 {
     Q_OBJECT
@@ -41,9 +46,10 @@ class PlotWidget : public QWidget
 public:
     enum class Kind
     {
-        Hero,   // Cyton Ch1: big header readouts, 12 px dot raster, axis overlay
-        Scalar, // temperature / PPG: value in the header
-        Triple  // accel / gyro / mag: X / Y / Z legend strip with values
+        Hero,   // ECG: big header readouts, 12 px dot raster, axis overlay, near-rail view
+        Scalar, // one trace, value in the header (temperature, PPG)
+        Lanes,  // stacked lanes with their own Y scale; readout strip with every value (IMU)
+        Vital   // derived rate (heart rate): large value in the header, chip strip, trend
     };
     enum class Dash
     {
@@ -67,23 +73,42 @@ public:
     {
         QString text;
         bool on = true;
+        bool warn = false; // amber outline + text
         bool operator== (const Chip &o) const
         {
-            return text == o.text && on == o.on;
+            return text == o.text && on == o.on && warn == o.warn;
         }
     };
+    struct LaneSpec
+    {
+        QString label; // Lanes: "ACC" (in the lane and the readout strip)
+        QString units;
+        QVector<Trace> traces;
+        double minSpan = 0.0; // smallest Y span shown; 0 = one display digit
+    };
 
+    PlotWidget (Kind kind, const QString &title, const QVector<LaneSpec> &lanes, QWidget *parent = nullptr);
     PlotWidget (Kind kind, const QString &title, const QString &units, const QVector<Trace> &traces,
         QWidget *parent = nullptr);
 
+    int laneCount () const
+    {
+        return static_cast<int> (lanes_.size ());
+    }
+
     // ---- header
     void setTitle (const QString &title);
-    void setUnits (const QString &units);
-    void setSubtitle (const QString &text); // hero
+    void setUnits (const QString &units); // lane 0 (the header's units)
+    void setLaneUnits (int lane, const QString &units);
+    void setSubtitle (const QString &text);     // hero
     void setChips (const QVector<Chip> &chips); // hero
     void setLed (const QColor &c);
     void setRate (const QString &text, const QColor &color);
     void setTone (Tone t);
+    // Vital: the header value and the chips of the strip, set by the owner
+    // (the heart-rate readout rules live in Readouts.h).
+    void setValueText (const QString &text);
+    void setStripChips (const QVector<Chip> &chips);
 
     // ---- recess
     void setPlaceholder (const QString &text); // shown while there are no samples
@@ -106,17 +131,18 @@ public:
 
     // ---- data
     // rawChannel: ring channel with the unfiltered value (-1 = none).
-    void setSource (std::shared_ptr<SignalRing> ring, int rawChannel, double nominalRate, int valueDecimals);
+    void setSource (int lane, std::shared_ptr<SignalRing> ring, int rawChannel, double nominalRate, int valueDecimals);
+    void setSource (std::shared_ptr<SignalRing> ring, int rawChannel, double nominalRate, int valueDecimals)
+    {
+        setSource (0, std::move (ring), rawChannel, nominalRate, valueDecimals);
+    }
     void setWindowSeconds (double seconds);
     void setRemoveMean (bool on);
     void setPaused (bool on);
     void tick (double nowUnix);
 
     // ---- readouts (visible window)
-    bool hasSamples () const
-    {
-        return n_ > 0;
-    }
+    bool hasSamples () const;
     double peakToPeak () const
     {
         return pp_;
@@ -127,7 +153,7 @@ public:
     }
     QSize minimumSizeHint () const override
     {
-        return QSize (180, kind_ == Kind::Hero ? 150 : 100);
+        return QSize (180, kind_ == Kind::Hero ? 150 : (kind_ == Kind::Lanes ? 160 : 100));
     }
     QSize sizeHint () const override
     {
@@ -139,10 +165,57 @@ protected:
     void resizeEvent (QResizeEvent *event) override;
 
 private:
+    struct Lane
+    {
+        LaneSpec spec;
+        std::shared_ptr<SignalRing> ring;
+        int rawChannel = -1;
+        double nominalRate = 0.0;
+        int decimals = 2;
+        std::uint64_t lastWritten = UINT64_MAX;
+
+        // visible window (reused storage)
+        std::vector<double> t;
+        std::vector<std::vector<double>> v;
+        std::size_t n = 0;
+        bool finite = false; // any finite value in view
+        std::vector<double> means;
+
+        // newest sample
+        bool haveLatest = false;
+        double latestTs = 0.0;
+        std::vector<double> latestVals;
+
+        // Y autoscale with hysteresis, then snapped to nice steps for display
+        bool yValid = false;
+        bool shrinking = false;
+        double yLo = -1.0, yHi = 1.0;
+        double lastYUpdate = 0.0;
+        double dLo = -1.0, dHi = 1.0, dStep = 0.5;
+
+        // geometry: the lane's band, the autoscaled value range -> these rows,
+        // and the rows actually used (the rail view differs)
+        QRect band;
+        double mapTop = 0.0, mapBottom = 1.0;
+        double yTop = 0.0, yBot = 1.0;
+
+        // cached geometry per trace
+        std::vector<std::vector<QPolygonF>> polys;
+        std::vector<int> segCount;
+        std::vector<std::vector<unsigned char>> denseFlags;
+        std::vector<char> denseMode;
+    };
+
+    void init ();
+    bool hasStrip () const
+    {
+        return kind_ == Kind::Lanes || kind_ == Kind::Vital;
+    }
     void layoutRects ();
     void rebuild ();
-    void updateYRange (double lo, double hi);
-    void computeDisplayRange ();
+    void rebuildLane (Lane &L, bool first);
+    void updateYRange (Lane &L, double lo, double hi);
+    void computeDisplayRange (Lane &L);
     bool rawView () const; // hero in rail mode: plotting the raw channel
     void ensureDotRaster (const QSize &sz, qreal dpr);
     void ensureRecessCache ();
@@ -151,70 +224,49 @@ private:
     void paintChrome (QPainter &p);
     void paintHeroHeader (QPainter &p);
     void paintPanelHeader (QPainter &p);
-    void paintLegend (QPainter &p);
+    void paintLaneStrip (QPainter &p);
+    void paintChipStrip (QPainter &p);
     void paintRecess (QPainter &p);
-    double mapY (double v) const;
-    QString axisLabel (double v, bool withUnits) const;
+    double mapY (const Lane &L, double v) const;
+    QString axisLabel (const Lane &L, double v, bool withUnits) const;
+    const QString &units () const
+    {
+        return lanes_.front ().spec.units;
+    }
 
     const Kind kind_;
-    QString title_, units_, subtitle_;
-    QVector<Chip> chips_;
+    QString title_, subtitle_;
+    QVector<Chip> chips_, stripChips_;
     QColor led_;
     QString rateText_;
     QColor rateColor_;
     Tone tone_ = Tone::Off;
-    QString placeholder_, stallText_, note_;
+    QString placeholder_, stallText_, note_, valueOverride_;
     bool noteFlag_ = false;
     bool railMode_ = false;
     bool symmetric_ = false;
     double fullScale_ = 187500.0;
     QPointer<QWidget> overlay_;
-    QVector<Trace> traces_;
-
-    std::shared_ptr<SignalRing> ring_;
-    int rawChannel_ = -1;
-    double nominalRate_ = 0.0;
-    int decimals_ = 2;
+    std::vector<Lane> lanes_; // never empty
 
     double windowSec_ = 10.0;
     bool removeMean_ = false;
     bool paused_ = false;
     bool dirty_ = true;
     bool clockMismatch_ = false;
-
-    // visible window (reused storage)
-    std::vector<double> t_;
-    std::vector<std::vector<double>> v_;
-    std::size_t n_ = 0;
-    std::vector<double> means_;
     double refTime_ = 0.0;
-    std::uint64_t lastWritten_ = UINT64_MAX;
     double lastChangeWall_ = 0.0;
     double lastRebuildWall_ = 0.0;
 
-    // newest sample
-    bool haveLatest_ = false;
-    double latestTs_ = 0.0;
-    std::vector<double> latestVals_;
-
-    // Y autoscale with hysteresis, then snapped to nice steps for display
-    bool yValid_ = false;
-    bool shrinking_ = false;
-    double yLo_ = -1.0, yHi_ = 1.0;
-    double lastYUpdate_ = 0.0;
-    double dLo_ = -1.0, dHi_ = 1.0, dStep_ = 0.5;
-
     // readouts
     double pp_ = std::numeric_limits<double>::quiet_NaN ();
-    QStringList valueText_; // header / legend values
+    QStringList valueText_; // header / strip values, lane by lane
     QString ppText_;
     bool latestIsRaw_ = false;
     double lastHeaderWall_ = 0.0;
 
     // geometry (logical px)
-    QRect headerRect_, legendRect_, recessRect_, plotRect_;
-    double mapTop_ = 0.0, mapBottom_ = 1.0; // autoscaled value range -> these rows
-    double yTop_ = 0.0, yBot_ = 1.0;        // rows actually used (rail view differs)
+    QRect headerRect_, stripRect_, recessRect_, plotRect_;
 
     // recess cache: dot raster (size / DPR only), then lines + labels on top
     QPixmap dots_;
@@ -224,15 +276,11 @@ private:
     bool cacheValid_ = false;
     QSize cacheSize_;
     double cacheDpr_ = 0.0;
-    double cacheLo_ = 0.0, cacheHi_ = 0.0, cacheWindow_ = 0.0;
+    std::vector<double> cacheRanges_; // dLo, dHi per lane
+    double cacheWindow_ = 0.0;
     bool cacheRail_ = false;
     bool cacheLabels_ = false; // axis labels only while there are samples
 
-    // cached geometry
-    std::vector<std::vector<QPolygonF>> polys_;
-    std::vector<int> segCount_;
-    std::vector<std::vector<unsigned char>> denseFlags_;
-    std::vector<char> denseMode_;
     std::size_t lastPoints_ = 0;
 
     // fonts
