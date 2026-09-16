@@ -1,0 +1,81 @@
+# macOS build of BioAcq.app with official Qt and a patched BrainFlow built for
+# macOS 13+. Manual only: macOS minutes bill at 10x on private repositories.
+# scripts/package_macos.sh does the deployment, signing and all verifications
+# (the `open` launch test is skipped here).
+name: macos
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: build, selftest, package (arm64)
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      BIOACQ_SKIP_OPEN_TEST: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Paths
+        run: |
+          echo "BRAINFLOW_ROOT=$HOME/deps/brainflow-5.23.0" >> "$GITHUB_ENV"
+          echo "BIOACQ_BUILD_DIR=$RUNNER_TEMP/bioacq-build" >> "$GITHUB_ENV"
+
+      - name: Qt 6.10 (clang_64 + Serial Port)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.*'
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtserialport
+          cache: true
+
+      - name: Ninja
+        run: command -v ninja >/dev/null || brew install ninja
+
+      - name: Restore BrainFlow
+        id: brainflow-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/deps/brainflow-5.23.0
+          key: brainflow-5.23.0-macos14-arm64-min13-${{ hashFiles('third_party/brainflow/emotibit-ancillary-upsample.patch', 'scripts/build_brainflow.sh') }}
+
+      - name: Build BrainFlow 5.23.0 (patched)
+        if: steps.brainflow-cache.outputs.cache-hit != 'true'
+        env:
+          BRAINFLOW_SRC_DIR: ${{ runner.temp }}/brainflow-src
+        run: scripts/build_brainflow.sh "$BRAINFLOW_ROOT"
+
+      - name: Build, verify and package BioAcq.app
+        run: |
+          QT_PREFIX="$QT_ROOT_DIR" scripts/package_macos.sh
+          mkdir -p ci-out
+          cp "$BIOACQ_BUILD_DIR/package-check/live.png" ci-out/bioacq-macos-live.png
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bioacq-macos-screenshot
+          path: ci-out/bioacq-macos-live.png
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: BioAcq-macos-arm64
+          path: dist/BioAcq-macos-arm64.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

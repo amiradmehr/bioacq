@@ -1,0 +1,110 @@
+# Windows build: MSVC 2022 x64 + official Qt, patched BrainFlow (cached), the
+# headless selftest and a screenshot run on the PACKAGED app, and the
+# double-clickable zip as an artifact. Private repo: Windows minutes bill at 2x,
+# so one job, cached dependencies, and superseded runs are cancelled.
+name: windows
+
+on:
+  push:
+    branches: [main, windows, 'feat/**']
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: build, selftest, package (MSVC 2022 x64)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      BRAINFLOW_VERSION: '5.23.0'
+      BRAINFLOW_ROOT: C:\deps\brainflow-5.23.0
+      BIOACQ_BUILD_DIR: C:\bioacq-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Qt 6.10 (msvc2022_64 + Serial Port)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.*'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtserialport
+          cache: true
+
+      - name: Tool versions
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja --no-progress -y }
+          cmake --version | Select-Object -First 1
+          "ninja $(ninja --version)"
+          "cl: $((Get-Command cl.exe).Source)"
+          "Qt:  $env:QT_ROOT_DIR"
+
+      - name: Restore BrainFlow
+        id: brainflow-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\deps\brainflow-5.23.0
+          key: brainflow-5.23.0-win64-msvc2022-md-${{ hashFiles('third_party/brainflow/emotibit-ancillary-upsample.patch', 'scripts/build_brainflow.ps1') }}
+
+      - name: Build BrainFlow 5.23.0 (patched)
+        if: steps.brainflow-cache.outputs.cache-hit != 'true'
+        run: scripts\build_brainflow.ps1 -Prefix $env:BRAINFLOW_ROOT -SourceDir C:\deps\src\brainflow -BuildDir C:\deps\src\brainflow-build
+
+      - name: Build and package BioAcq
+        run: scripts\package_windows.ps1 -QtPrefix $env:QT_ROOT_DIR -BrainflowRoot $env:BRAINFLOW_ROOT -BuildDir $env:BIOACQ_BUILD_DIR
+
+      # The packaged folder must be self-contained: take Qt and BrainFlow off
+      # PATH and drop the Qt plugin path so nothing outside dist\ can fill a gap.
+      - name: Selftest (packaged app)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          Remove-Item Env:QT_PLUGIN_PATH, Env:QML2_IMPORT_PATH -ErrorAction SilentlyContinue
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -and -not $_.StartsWith($env:QT_ROOT_DIR) }) -join ';'
+          scripts\run_cli_windows.ps1 -Exe dist\windows\BioAcq\BioAcq.exe -Arguments '--selftest' -TimeoutSec 300
+
+      - name: Screenshot (live, 1600x1000)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          Remove-Item Env:QT_PLUGIN_PATH, Env:QML2_IMPORT_PATH -ErrorAction SilentlyContinue
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -and -not $_.StartsWith($env:QT_ROOT_DIR) }) -join ';'
+          New-Item -ItemType Directory -Force -Path ci-out | Out-Null
+          $png = Join-Path $PWD 'ci-out\bioacq-windows-live.png'
+          scripts\run_cli_windows.ps1 -Exe dist\windows\BioAcq\BioAcq.exe -TimeoutSec 120 `
+            -Arguments '--screenshot', $png, '--state', 'live', '--size', '1600x1000'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path $png)) { throw "no screenshot at $png" }
+
+      - name: Upload screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bioacq-windows-screenshot
+          path: ci-out/bioacq-windows-live.png
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: BioAcq-windows-x64
+          path: dist/BioAcq-windows-x64.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
