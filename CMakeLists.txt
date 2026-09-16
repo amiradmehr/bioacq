@@ -17,7 +17,12 @@ endif()
 # macOS build BioAcq.app. Development builds keep the plain `bioacq` binary.
 option(BIOACQ_PACKAGED "Build for distribution (recordings in Documents, macOS app bundle)" OFF)
 if(APPLE)
-    option(BIOACQ_MACOS_BUNDLE "Build BioAcq.app instead of the plain bioacq binary" ${BIOACQ_PACKAGED})
+    # BioAcq.app exactly when packaged, decided on every configure: a separate
+    # option() would take its default from BIOACQ_PACKAGED only in a new build
+    # tree, so re-using one tree for both kinds of build left the bundle
+    # setting stale. (unset: drops that cache entry from older trees.)
+    unset(BIOACQ_MACOS_BUNDLE CACHE)
+    set(BIOACQ_MACOS_BUNDLE ${BIOACQ_PACKAGED})
 endif()
 
 set(CMAKE_CXX_STANDARD 17)

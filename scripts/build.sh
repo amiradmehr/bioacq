@@ -23,9 +23,13 @@ if [[ ! -f "$BRAINFLOW_ROOT/inc/board_shim.h" ]]; then
 fi
 
 mkdir -p "$BUILD_DIR"
-if [[ ! -f "$BUILD_DIR/CMakeCache.txt" || ! -f "$BUILD_DIR/build.ninja" ]]; then
+# Configure on first use, and again if a packaging script configured this tree
+# (BIOACQ_PACKAGED=ON builds BioAcq.app, not the bioacq binary run.sh starts).
+if [[ ! -f "$BUILD_DIR/CMakeCache.txt" || ! -f "$BUILD_DIR/build.ninja" ]] ||
+    grep -q '^BIOACQ_PACKAGED:BOOL=ON$' "$BUILD_DIR/CMakeCache.txt"; then
     cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
+        -DBIOACQ_PACKAGED=OFF \
         -DBRAINFLOW_ROOT="$BRAINFLOW_ROOT" \
         -DQT_PREFIX="$QT_PREFIX" \
         -DCMAKE_PREFIX_PATH="$QT_PREFIX;$BRAINFLOW_ROOT"

@@ -43,13 +43,13 @@ All rows are resolved at runtime from BrainFlow's board descriptors, never hard-
 ## Build & run
 
 ```bash
-scripts/build.sh          # configure (first time) + incremental Release build
+scripts/build.sh          # configure (first time, or after a packaging script used the tree) + incremental Release build
 scripts/build.sh --clean  # wipe the build tree and reconfigure
 scripts/run.sh            # build if needed, then launch the GUI (extra args are passed through)
 ```
 
 * The scripts locate the repository root from their own location, so they work from any directory.
-* The build tree is `~/.local/build/bioacq`, outside Google Drive. Override it with `BIOACQ_BUILD_DIR` (`STREAM_GUI_BUILD_DIR` is still accepted as a fallback alias).
+* The build tree is `~/.local/build/bioacq`, outside Google Drive. Override it with `BIOACQ_BUILD_DIR` (`STREAM_GUI_BUILD_DIR` is still accepted as a fallback alias). The packaging scripts use their own trees by default; if one shares `BIOACQ_BUILD_DIR` with the development build, `build.sh` notices the packaged configuration in the cache and configures the tree back to the plain `bioacq` binary (and the packaging scripts configure it for `BioAcq.app` again).
 * Binary: `~/.local/build/bioacq/bioacq`. It's a plain executable, not a `.app`, and not on your `PATH`, so use `scripts/run.sh …` or the full binary path. Its rpath points at `~/.local/brainflow/lib` and Homebrew Qt, so it runs without `DYLD_*` variables.
 * Requirements: Homebrew Qt 6 (`/opt/homebrew/opt/qt`, modules Core/Gui/Widgets/Network/SerialPort), CMake ≥ 3.21, Ninja, and BrainFlow 5.23.0 installed to `~/.local/brainflow` with the patch in `third_party/brainflow/` (see *Local BrainFlow patch* below). You can override these with `BRAINFLOW_ROOT` or `QT_PREFIX` (together with `--clean`).
 * Fonts: JetBrains Mono and Inter (`resources/fonts/`, SIL Open Font License 1.1, licence texts next to them) are compiled into the binary as Qt resources and registered at startup. If registration fails the UI falls back to Menlo / the system font (printed on stderr).
