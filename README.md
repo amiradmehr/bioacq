@@ -13,9 +13,12 @@
 | `src/devices/` | `DeviceWorker` (BrainFlow thread per device), EmotiBit discovery, signal resolution, packet re-timing |
 | `src/ui/` | `MainWindow`, `PlotWidget`, widgets, theme |
 | `src/tools/` | `Headless` (`--selftest`, `--probe`) |
+| `src/platform/` | Portability layer: UDP sockets (POSIX / Winsock), serial port listing and OpenBCI dongle detection, default folders, Windows console attach; `compat/win32/` holds a `<sys/resource.h>` stand-in |
 | `resources/fonts/` | Embedded JetBrains Mono + Inter (SIL OFL 1.1, licence texts included) |
-| `scripts/` | `build.sh`, `run.sh` |
-| `third_party/brainflow/` | The local BrainFlow 5.23.0 patch and how to build BrainFlow with it |
+| `resources/macos/`, `resources/windows/` | `Info.plist` template and icon for `BioAcq.app`; version resource and icon for `BioAcq.exe` |
+| `scripts/` | `build.sh`, `run.sh` (development build); `build_brainflow.sh` / `.ps1`; `package_macos.sh`, `package_windows.ps1`; `run_cli_windows.ps1` |
+| `.github/workflows/` | `windows.yml` (every push: build, selftest, package), `macos.yml` (manual) |
+| `third_party/brainflow/` | The local BrainFlow 5.23.0 patch, BrainFlow's licence, and how to build BrainFlow with it |
 | `design/` | Claude Design export used as the visual spec |
 | `prototype/` | The superseded PySide6 prototype (`stream_gui.py`) |
 
@@ -49,6 +52,39 @@ scripts/run.sh            # build if needed, then launch the GUI (extra args are
 * Requirements: Homebrew Qt 6 (`/opt/homebrew/opt/qt`, modules Core/Gui/Widgets/Network), CMake ≥ 3.21, Ninja, and BrainFlow 5.23.0 installed to `~/.local/brainflow` with the patch in `third_party/brainflow/` (see *Local BrainFlow patch* below). You can override these with `BRAINFLOW_ROOT` or `QT_PREFIX` (together with `--clean`).
 * Fonts: JetBrains Mono and Inter (`resources/fonts/`, SIL Open Font License 1.1, licence texts next to them) are compiled into the binary as Qt resources and registered at startup. If registration fails the UI falls back to Menlo / the system font (printed on stderr).
 
+## Packages: BioAcq.app and BioAcq.exe
+
+The development build above is a plain `bioacq` binary tied to this machine's Qt and BrainFlow. The packaged builds are self-contained and start with a double-click. They are built with `-DBIOACQ_PACKAGED=ON`, which also changes the default recording folder to `Documents/BioAcq Recordings` (development builds record into `recordings/` in the repository).
+
+**macOS** (`scripts/package_macos.sh`, Apple Silicon):
+
+```bash
+scripts/build_brainflow.sh ~/.local/brainflow        # once: clone 5.23.0, patch, build, install
+scripts/package_macos.sh                             # -> dist/macos/BioAcq.app, dist/BioAcq-macos-arm64.zip
+```
+
+* The script builds `BioAcq.app`, deploys Qt with `macdeployqt` (plus the offscreen platform plugin, so `BioAcq.app/Contents/MacOS/BioAcq --selftest` and `--screenshot` work from inside the bundle), copies BrainFlow's `libBoardController` / `libDataHandler` / `libMLModule` into `Contents/Frameworks`, rewrites every install name and rpath to point inside the bundle, sets `LSMinimumSystemVersion` to the highest minimum macOS of the bundled binaries, and signs ad hoc.
+* It then verifies the result and stops on the first failure: `codesign --verify --deep --strict`; no `/opt/homebrew`, `/usr/local` or `/Users` path in any load command or rpath; `--selftest` and `--screenshot` run from the bundle with every image dyld loads inside the bundle or the OS; the embedded fonts register; and `open BioAcq.app` stays up for 5 s without opening the dongle or an EmotiBit socket, then quits.
+* Environment: `QT_PREFIX` (default `$QT_ROOT_DIR`, else Homebrew), `BRAINFLOW_ROOT`, `BIOACQ_BUILD_DIR` (default `~/.local/build/bioacq-package-macos`), `BIOACQ_SKIP_OPEN_TEST=1`. With Homebrew Qt the bundle needs the macOS version Homebrew's bottles were built for (currently 26); build BrainFlow with `MACOSX_DEPLOYMENT_TARGET=13.0` and use the official Qt (as `macos.yml` does) for macOS 13+.
+* The app is signed ad hoc, not notarised. A copy downloaded from GitHub is quarantined by Gatekeeper: right-click → *Open* the first time, or run `xattr -dr com.apple.quarantine BioAcq.app`.
+* `Info.plist` carries `NSLocalNetworkUsageDescription`. macOS 15+ asks once for Local Network access on the first EmotiBit connect; without that permission the discovery packet cannot be sent.
+
+**Windows 10 / 11 x64** (`scripts\package_windows.ps1`), from a *x64 Native Tools* / Developer PowerShell for VS 2022, with CMake, Ninja and Qt 6.10 for `msvc2022_64` including Qt Serial Port:
+
+```powershell
+scripts\build_brainflow.ps1                                      # once: -> %USERPROFILE%\brainflow
+scripts\package_windows.ps1 -QtPrefix C:\Qt\6.10.2\msvc2022_64    # -> dist\windows\BioAcq\BioAcq.exe, dist\BioAcq-windows-x64.zip
+```
+
+* The folder contains `BioAcq.exe`, the Qt DLLs and plugins from `windeployqt` (plus `platforms\qoffscreen.dll`), BrainFlow's `BoardController.dll` / `DataHandler.dll` / `MLModule.dll`, and the MSVC runtime DLLs, so nothing needs to be installed. Unzip it anywhere and double-click `BioAcq.exe`.
+* BrainFlow is built with the dynamic MSVC runtime (`-DMSVC_RUNTIME=dynamic`), because its static C++ binding is linked into the same executable as Qt.
+* `BioAcq.exe` uses the GUI subsystem, so a double-click opens no console window. Started with arguments from cmd or PowerShell, it attaches to that console and prints there. The shell does not wait for a GUI program, though, so for exit codes use `start /wait BioAcq.exe --selftest` in cmd, or `scripts\run_cli_windows.ps1 -Exe <path>\BioAcq.exe -Arguments '--selftest'`, which waits, prints stdout/stderr and returns the exit code.
+* Windows Firewall may ask to allow `BioAcq.exe` on private networks the first time the EmotiBit is contacted.
+
+**Cyton port.** Without `--port`, the app looks for the OpenBCI dongle (FTDI FT231X, USB VID `0403` / PID `6015`, or a port description naming FT231X / OpenBCI) and preselects it: `COM3`-style names on Windows, `/dev/cu.usbserial-…` on macOS (the `tty.` twin is skipped). `--list-ports` prints every serial port with its VID:PID, dongles first. Listing never opens a port.
+
+**CI.** `.github/workflows/windows.yml` runs on every push to `main`, `windows` and `feat/**` (and manually): MSVC 2022 + Qt 6.10 via `install-qt-action`, the patched BrainFlow (cached on the patch and script hash), `package_windows.ps1`, then `--selftest` and a `--screenshot --state live --size 1600x1000` run on the packaged folder with Qt taken off `PATH`. Artifacts: `BioAcq-windows-x64` (the zip) and `bioacq-windows-screenshot`. `.github/workflows/macos.yml` runs `package_macos.sh` on `macos-14` with the official Qt and a BrainFlow built for macOS 13; it is manual only (`gh workflow run macos.yml --ref <branch>`), because macOS minutes cost 10× on a private repository.
+
 ## Modes
 
 Run these from the repository root (`scripts/run.sh` builds if needed and passes the arguments through):
@@ -63,7 +99,7 @@ Run these from the repository root (`scripts/run.sh` builds if needed and passes
 
 Screenshot states (`--state`, default `live`): `live` (both slots synthetic), `idle` (nothing connected), `connecting` (Cyton synthetic + EmotiBit discovery toward the unanswered TEST-NET address 192.0.2.1, 20 s timeout, captured mid-discovery), `error` (same with a 2 s timeout, captured after the failure), `recording` (both synthetic, the record button pressed after 1.5 s; files go to `--record-dir`, or to a temporary folder that is deleted afterwards), `warning` (both synthetic with the two test hooks below).
 
-Options: `--port /dev/cu.usbserial-XXXX`, `--ip <emotibit ip>` (default `192.168.1.12`), `--discover` (blank IP: broadcast discovery), `--timeout <s>` (2–20), `--record` (arm recording), `--record-dir <dir>`, `--window <s>` (1–60), `--bf-discovery` (see below), `--verbose` (BrainFlow INFO log).
+Options: `--port <port>` (`COM3`, `/dev/cu.usbserial-XXXX`; default: the detected OpenBCI dongle), `--list-ports`, `--ip <emotibit ip>` (default `192.168.1.12`), `--discover` (blank IP: broadcast discovery), `--timeout <s>` (2–20), `--record` (arm recording), `--record-dir <dir>`, `--window <s>` (1–60), `--bf-discovery` (see below), `--verbose` (BrainFlow INFO log).
 
 Test hooks (command line only, never in the UI; a warning is printed on stderr): `--test-stall-emotibit [s]` stops polling the EmotiBit after *s* seconds of streaming (default 1.5; the session stays open, so the stalled path renders; `0` freezes before the first sample, which renders the *no samples since connect* path), `--test-rail-offset-uv <µV>` adds a DC offset to the Cyton's raw Ch1 **display** value (the near-rail path). Recordings are not affected by either.
 
@@ -85,10 +121,10 @@ The window is an instrument panel: a 30 px session bar (session label = start ti
   * BrainFlow writes every row of the preset tab-separated with no header, despite the `.csv` name. A `*_columns.json` next to each file maps row numbers to channels.
   * Timestamps are UNIX seconds, BrainFlow's raw values.
   * The record module shows the folder, the elapsed time and the files' actual size on disk (polled once per second).
-  * Recording falls back to `~/bioacq_recordings` if the folder can't be created, is too long for BrainFlow's 512-byte limit, or contains a `:`. BrainFlow splits `file://path:mode` at the last `:`.
+  * Recording falls back to `~/bioacq_recordings` if the folder can't be created, is too long for BrainFlow's 512-byte limit, or contains a `:` (other than a Windows drive letter's). BrainFlow splits `file://path:mode` at the last `:`.
 * **Display.** *Time window* sets the visible span, 1–60 s. *Pause display* freezes the plots only; streaming, recording and the rail-headroom / near-rail warning continue.
 * **Simulate devices.** The *simulate devices* switch sits in the idle call to action, next to the shortcut hints. It can only change while nothing is connected, which is exactly when that overlay shows. It connects the slots to BrainFlow's synthetic board; a synthetic session is labelled `synthetic` in the session bar, the Cyton meta line and the hero subtitle.
-* **Remembered settings.** The GUI stores the last successfully used Cyton port and EmotiBit IP, plus the discovery timeout, window length, filter toggles and the armed/recording state of the record button. Settings are saved on each successful connect and on close, and restored at start. The store is `QSettings`: `~/Library/Preferences/com.bioacq.bioacq.plist`. Command-line `--port` / `--ip` / `--timeout` / `--window` / `--record` override the stored values. `--screenshot` neither reads nor writes them.
+* **Remembered settings.** The GUI stores the last successfully used Cyton port and EmotiBit IP, plus the discovery timeout, window length, filter toggles and the armed/recording state of the record button. Settings are saved on each successful connect and on close, and restored at start. The store is `QSettings`: `~/Library/Preferences/com.bioacq.bioacq.plist` on macOS, `HKEY_CURRENT_USER\Software\bioacq\bioacq` on Windows. Command-line `--port` / `--ip` / `--timeout` / `--window` / `--record` override the stored values. `--screenshot` neither reads nor writes them.
 
 ## Networking / EmotiBit not found
 
@@ -117,7 +153,7 @@ The window is an instrument panel: a 30 px session bar (session label = start ti
 
 ## Local BrainFlow patch
 
-The BrainFlow build in `~/.local/brainflow` was compiled from `~/.local/src/brainflow` with one fix in `src/board_controller/emotibit/emotibit.cpp`, in the ancillary 2× upsampling around line 376. Upstream writes the duplicate to `anc_packages[i + 1]`, which overwrites newer temperature values with older ones. The local copy writes `anc_packages[i * 2 + 1]` (marked `patched (stream_gui_cpp)`; the diff is `third_party/brainflow/emotibit-ancillary-upsample.patch`). **If you rebuild or update BrainFlow, re-apply this patch**, or the EmotiBit temperature trace shows stale, duplicated values.
+The BrainFlow build in `~/.local/brainflow` was compiled from `~/.local/src/brainflow` with one fix in `src/board_controller/emotibit/emotibit.cpp`, in the ancillary 2× upsampling around line 376. Upstream writes the duplicate to `anc_packages[i + 1]`, which overwrites newer temperature values with older ones. The local copy writes `anc_packages[i * 2 + 1]` (marked `patched (stream_gui_cpp)`; the diff is `third_party/brainflow/emotibit-ancillary-upsample.patch`). **If you rebuild or update BrainFlow, re-apply this patch**, or the EmotiBit temperature trace shows stale, duplicated values. `scripts/build_brainflow.sh` (macOS) and `scripts\build_brainflow.ps1` (Windows) clone 5.23.0, apply the patch and install in one step.
 
 ## Known limitations
 
@@ -125,4 +161,5 @@ The BrainFlow build in `~/.local/brainflow` was compiled from `~/.local/src/brai
 * BrainFlow labels EmotiBit's nominal rates as placeholders (25 / 25 / 15 Hz). The rate readouts compare the measured rate against them.
 * EmotiBit temperature is sample-and-hold at the EDA push rate, which is how BrainFlow packs the ancillary preset.
 * Traces are one device pixel wide (thin on a Retina display, 1 px at DPR 1 instead of the design's 1.4 / 1.3 px) — that is what keeps rendering on Qt's fast path.
+* Windows: recording paths reach `std::filesystem` and BrainFlow's file streamer as 8-bit strings, which Windows reads in the ANSI code page. A recording folder with non-ASCII characters in its path (e.g. an accented user name under `Documents`) therefore ends up with a garbled name; use `--record-dir` with an ASCII path.
 * The dropped-packet counter only exists for the Cyton (its package number increments once per sample); the EmotiBit has no equivalent in BrainFlow's rows.
