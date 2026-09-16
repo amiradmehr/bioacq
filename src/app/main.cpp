@@ -3,6 +3,7 @@
 
 #include "AppPaths.h"
 #include "BuildConfig.h"
+#include "EmotiBitWifiDialog.h"
 #include "Headless.h"
 #include "MainWindow.h"
 #include "ProcessSetup.h"
@@ -16,6 +17,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QPixmap>
+#include <QPushButton>
 #include <QTemporaryDir>
 #include <QTimer>
 
@@ -43,8 +45,10 @@ struct Args
         Selftest,
         Probe,
         Screenshot,
-        ListPorts
+        ListPorts,
+        EmotibitWifiList
     } mode = Gui;
+    QString wifiPort; // --wifi-port: the EmotiBit's USB serial port (empty = likeliest)
     double seconds = -1.0;
     QString screenshotPath;
     QString state = QStringLiteral ("live");
@@ -70,6 +74,7 @@ struct Args
     double testStallSec = -1.0;
     double testRailOffsetUv = 0.0;
     double testPpgBpm = 0.0;
+    bool testWifiRead = false; // --state wifi: press "read saved networks" (real EmotiBit over USB)
     QString error;
 };
 
@@ -102,6 +107,10 @@ Args parseArgs (int argc, char **argv)
         }
         else if (s == "--list-ports")
             a.mode = Args::ListPorts;
+        else if (s == "--emotibit-wifi-list")
+            a.mode = Args::EmotibitWifiList;
+        else if (s == "--wifi-port")
+            a.wifiPort = value ("--wifi-port");
         else if (s == "--screenshot")
         {
             a.mode = Args::Screenshot;
@@ -112,9 +121,9 @@ Args parseArgs (int argc, char **argv)
             a.state = value ("--state").toLower ();
             static const QStringList states = {QStringLiteral ("live"), QStringLiteral ("idle"),
                 QStringLiteral ("connecting"), QStringLiteral ("error"), QStringLiteral ("recording"),
-                QStringLiteral ("warning")};
+                QStringLiteral ("warning"), QStringLiteral ("wifi")};
             if (!states.contains (a.state))
-                a.error = QStringLiteral ("unknown --state '%1' (live|idle|connecting|error|recording|warning)").arg (a.state);
+                a.error = QStringLiteral ("unknown --state '%1' (live|idle|connecting|error|recording|warning|wifi)").arg (a.state);
         }
         else if (s == "--size")
         {
@@ -169,6 +178,8 @@ Args parseArgs (int argc, char **argv)
         }
         else if (s == "--test-rail-offset-uv")
             a.testRailOffsetUv = value ("--test-rail-offset-uv").toDouble ();
+        else if (s == "--test-wifi-read")
+            a.testWifiRead = true;
         else if (s == "--test-ppg-bpm")
             a.testPpgBpm = std::clamp (value ("--test-ppg-bpm").toDouble (), 0.0, 220.0);
         else if (s == "--no-cyton")
@@ -210,8 +221,11 @@ void usage ()
         "                            error: Cyton synthetic, EmotiBit not found at 192.0.2.1 (2 s);\n"
         "                            recording: records into --record-dir (default: a temporary folder);\n"
         "                            warning: stall + rail-offset test hooks below\n"
+        "                            wifi: idle, with the EmotiBit Wi-Fi dialog open (saves the dialog)\n"
         "      --size WxH            window size (default 1600x1000)\n"
-        "  --list-ports              list serial ports (OpenBCI dongles first) and exit\n\n"
+        "  --list-ports              list serial ports (OpenBCI dongles first) and exit\n"
+        "  --emotibit-wifi-list      list the Wi-Fi networks saved on the EmotiBit, over USB (restarts it);\n"
+        "      --wifi-port <dev>     its USB serial port (default: the likeliest USB-UART port)\n\n"
         "options:\n"
         "  --port <dev>              Cyton serial port, e.g. COM3 or /dev/cu.usbserial-XXXXXXXX\n"
         "                            (default: auto-detect the OpenBCI dongle, FTDI 0403:6015, at connect)\n"
@@ -229,6 +243,8 @@ void usage ()
         "test hooks (display only, never in the UI):\n"
         "  --test-stall-emotibit [s] stop polling the EmotiBit after s seconds of streaming (default 1.5)\n"
         "  --test-rail-offset-uv <v> add v uV to the Cyton's raw Ch1 display value (near-rail path)\n"
+        "  --test-wifi-read          with --screenshot --state wifi: press \"read saved networks\" and capture\n"
+        "                            the result (talks to the real EmotiBit over USB and restarts it)\n"
         "  --test-ppg-bpm <bpm>      replace the EmotiBit PPG display values with a synthetic pulse\n"
         "                            (drives the heart-rate panel)\n",
         BIOACQ_VERSION, kMaxDiscoveryTimeoutSec, qPrintable (QDir::toNativeSeparators (defaultRecordDir ())));
@@ -284,6 +300,11 @@ int main (int argc, char **argv)
                 qPrintable (e.description), e.cytonDongle ? "  [OpenBCI dongle]" : "");
         std::fflush (stdout);
         return 0;
+    }
+    if (a.mode == Args::EmotibitWifiList)
+    {
+        QCoreApplication app (argc, argv);
+        return runEmotibitWifiList (a.wifiPort);
     }
     if (a.mode == Args::Selftest)
     {
@@ -391,7 +412,8 @@ int main (int argc, char **argv)
     {
         bool saved = false;
         const QString state = a.state;
-        const bool idle = state == QLatin1String ("idle");
+        const bool wifi = state == QLatin1String ("wifi");
+        const bool idle = state == QLatin1String ("idle") || wifi;
         const bool emReal = state == QLatin1String ("connecting") || state == QLatin1String ("error");
         w.show ();
         // CPU over t = 2..4 s after the connect (getrusage, all threads; % of one core)
@@ -414,15 +436,28 @@ int main (int argc, char **argv)
         });
         // late enough for a first heart-rate estimate (4 beats at 72 bpm) and
         // for the 2 s error timeout; the connecting state is still connecting
-        QTimer::singleShot (idle ? 1500 : 6300, &w, [&] {
-            const QPixmap pm = w.grab ();
+        std::unique_ptr<EmotiBitWifiDialog> wifiDialog; // destroyed before w
+        const bool wifiRead = wifi && a.testWifiRead;
+        if (wifi)
+            QTimer::singleShot (300, &w, [&] {
+                wifiDialog = std::make_unique<EmotiBitWifiDialog> (&w);
+                wifiDialog->setModal (false);
+                wifiDialog->show ();
+                if (!wifiRead)
+                    return;
+                for (QPushButton *b : wifiDialog->findChildren<QPushButton *> ())
+                    if (b->text () == QLatin1String ("[ read saved networks ]") && b->isEnabled ())
+                        b->click ();
+            });
+        QTimer::singleShot (wifiRead ? 25000 : (idle ? 1500 : 6300), &w, [&] {
+            const QPixmap pm = wifiDialog ? wifiDialog->grab () : w.grab ();
             saved = !pm.isNull () && pm.save (a.screenshotPath);
             std::printf ("screenshot %s: %s (%dx%d, state %s)\n", saved ? "saved" : "FAILED",
                 qPrintable (a.screenshotPath), pm.width (), pm.height (), qPrintable (state));
             std::fflush (stdout);
             w.close ();
         });
-        QTimer::singleShot (40000, [] {
+        QTimer::singleShot (wifiRead ? 60000 : 40000, [] {
             std::fprintf (stderr, "screenshot mode: timed out\n");
             std::_Exit (3);
         });

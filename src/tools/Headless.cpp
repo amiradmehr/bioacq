@@ -5,6 +5,7 @@
 #include "Decimate.h"
 #include "DeviceWorker.h"
 #include "EmotiBitDiscovery.h"
+#include "EmotiBitWifiSetup.h"
 #include "HeartRate.h"
 #include "RateMeter.h"
 #include "Readouts.h"
@@ -174,11 +175,12 @@ DeviceConfig makeConfig (DeviceKind kind, bool synthetic, const ProbeOptions *po
     else
     {
         // Same as MainWindow::connectDeviceWith, minus the GUI's remembered
-        // "last IP that answered": a blank IP is broadcast discovery only.
+        // "last IP that answered": a typed IP gets a short unicast try, then
+        // broadcast discovery; a blank IP is broadcast discovery only.
         cfg.params.ip_address = po->emotibitIp.trimmed ().toStdString ();
         cfg.params.timeout = po->emotibitTimeoutSec;
         cfg.ownDiscovery = !po->bfDiscovery;
-        cfg.broadcastFallback = false;
+        cfg.broadcastFallback = cfg.ownDiscovery && !cfg.params.ip_address.empty ();
     }
     cfg.signalSpecs = resolveSignals (cfg.boardId, signalDefsFor (kind), problems);
     cfg.pollIntervalMs = kind == DeviceKind::Cyton ? 10 : 15;
@@ -1079,6 +1081,44 @@ DeviceConfig emotibitTestConfig (int port, double timeoutSec)
 
 void discoveryChecks (Checker &check)
 {
+    {
+        const auto h24 = emotibit::subnetHosts ("192.168.1.10", 24);
+        const auto h28 = emotibit::subnetHosts ("172.20.10.3", 28);
+        const auto h16 = emotibit::subnetHosts ("172.31.22.55", 16);
+        check (h24.size () == 253 && h24.front () == "192.168.1.1" && h24.back () == "192.168.1.254" &&
+                std::find (h24.begin (), h24.end (), "192.168.1.10") == h24.end () && h28.size () == 13 &&
+                h28.front () == "172.20.10.1" && h28.back () == "172.20.10.14" && h16.empty (),
+            fmt ("discovery: subnet scan targets %.0f hosts on a /24 (not this computer), %.0f on an iPhone-hotspot "
+                 "/28, none on a /16",
+                double (h24.size ()), double (h28.size ())));
+    }
+    {
+        QString e1, e2, e3;
+        const std::string ok = emotibit_wifi::addCommand (QStringLiteral ("Lab \"2.4G\""),
+            QStringLiteral ("pa\\ss word"), &e1);
+        const bool tilde = emotibit_wifi::addCommand (QStringLiteral ("net"), QStringLiteral ("abc~defgh"), &e2).empty ();
+        const bool shortPw = emotibit_wifi::addCommand (QStringLiteral ("net"), QStringLiteral ("short"), &e3).empty ();
+        check (ok == "@WA,{\"ssid\":\"Lab \\\"2.4G\\\"\",\"password\":\"pa\\\\ss word\"}~" && tilde && shortPw &&
+                e2.contains (QLatin1Char ('~')) && !e2.contains (QStringLiteral ("abc")),
+            "EmotiBit Wi-Fi: add command JSON-escapes the SSID and password; '~' and short passwords are refused "
+            "without echoing the password");
+    }
+    {
+        const QString out = QStringLiteral (
+            "@AK,WA~\r\nUpdated file contents:\r\n{\"WifiCredentials\":[{\"ssid\":\"x\",\"password\":\"secret1\"}]}\r\n"
+            "##################################\r\nconfig file credentials:\r\n0. WSSL Wifi - 2.4G : hunter2hunter2\r\n"
+            "1. Phone : a : b c\r\n##################################\r\n@AK,LS~\r\n");
+        int budget = 0;
+        const QStringList nets = emotibit_wifi::parseNetworkList (out, &budget);
+        const int expected = emotibit_wifi::kConfigBase + 2 * emotibit_wifi::kPerNetwork + 16 + 14 + 5 + 7;
+        check (nets == QStringList ({QStringLiteral ("WSSL Wifi - 2.4G"), QStringLiteral ("Phone")}) &&
+                budget == expected && emotibit_wifi::replyFor (out, QStringLiteral ("LS")) == QLatin1String ("AK") &&
+                emotibit_wifi::replyFor (QStringLiteral ("@NK,WD~"), QStringLiteral ("WD")) == QLatin1String ("NK") &&
+                emotibit_wifi::replyFor (out, QStringLiteral ("WD")).isEmpty (),
+            fmt ("EmotiBit Wi-Fi: list output parsed to SSIDs only (config estimate %.0f bytes), @AK / @NK replies found",
+                double (budget)));
+    }
+
     FakeEmotibit dev (true), mute (false);
     if (!dev.ok () || !mute.ok ())
     {
@@ -1149,6 +1189,35 @@ void discoveryChecks (Checker &check)
         check (started && fin && ed.failed && ed.error.contains (QStringLiteral ("no EmotiBit answered at 127.0.0.1")) &&
                 sec < 2.0,
             fmt ("worker: unanswered EmotiBit IP fails after %.2f s without touching BrainFlow", sec));
+    }
+    {
+        // A typed IP that does not answer (the EmotiBit moved to another
+        // network, e.g. a hotspot) gets a short unicast try, then the
+        // broadcast fallback finds it at its new address.
+        ed.resetFlags ();
+        DeviceConfig cfg = emotibitTestConfig (dev.port (), 5.0);
+        cfg.params.ip_address = "192.0.2.1"; // TEST-NET-1: never answers
+        cfg.broadcastFallback = true;
+        cfg.testBroadcastTargets = {"127.0.0.1"};
+        DeviceWorker *w = ed.worker.get ();
+        QString foundIp;
+        double foundSec = -1.0;
+        // direct: runs on the worker thread, so the stop lands before prepare_session
+        const auto conn = QObject::connect (
+            w, &DeviceWorker::discovered, w,
+            [&foundIp, &foundSec, &ed, w] (const QString &ip, const QString &) {
+                foundIp = ip;
+                foundSec = since (ed.startedAt);
+                w->requestStop ();
+            },
+            Qt::DirectConnection);
+        ed.startedAt = SteadyClock::now ();
+        const bool started = w->start (cfg);
+        const bool fin = pumpUntil ([&] { return ed.finished; }, 10.0) && w->waitForFinished (5000);
+        QObject::disconnect (conn);
+        check (started && fin && foundIp == QStringLiteral ("127.0.0.1") && foundSec > 1.8 && foundSec < 3.5 &&
+                !ed.connected,
+            fmt ("worker: a typed IP without an answer falls back to broadcast; EmotiBit found after %.2f s", foundSec));
     }
 }
 
@@ -1613,4 +1682,38 @@ int runProbe (const ProbeOptions &options)
     }
     std::fflush (stdout);
     return g_interruptRequested ? 130 : rc;
+}
+
+// =============================================================================
+int runEmotibitWifiList (const QString &portArg)
+{
+    QString port = portArg;
+    if (port.isEmpty ())
+    {
+        const QStringList candidates = emotibit_wifi::candidatePorts ();
+        if (candidates.isEmpty ())
+        {
+            std::printf ("no USB serial port that could be an EmotiBit: plug it in with a USB data cable\n");
+            return 1;
+        }
+        port = candidates.front ();
+    }
+    std::printf ("EmotiBit Wi-Fi networks, over USB on %s (the EmotiBit restarts)\n", qPrintable (port));
+    std::fflush (stdout);
+    const emotibit_wifi::Result r = emotibit_wifi::listNetworks (port, [] (const QString &m) {
+        std::printf ("  %s\n", qPrintable (m));
+        std::fflush (stdout);
+    });
+    if (!r.ok)
+    {
+        std::printf ("FAILED: %s\n", qPrintable (r.error));
+        return 1;
+    }
+    std::printf ("saved networks, tried in this order at boot (up to 20 s each):\n");
+    for (int i = 0; i < r.networks.size (); ++i)
+        std::printf ("  %d. %s\n", i, qPrintable (r.networks[i]));
+    if (r.networks.isEmpty ())
+        std::printf ("  (none)\n");
+    std::fflush (stdout);
+    return 0;
 }

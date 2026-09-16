@@ -4,6 +4,7 @@
 #include "BuildConfig.h"
 #include "DeviceWorker.h"
 #include "EmotiBitDiscovery.h"
+#include "EmotiBitWifiDialog.h"
 #include "HeartRate.h"
 #include "PlotWidget.h"
 #include "RingBuffer.h"
@@ -620,8 +621,9 @@ QWidget *MainWindow::buildEmotibitModule ()
     ipEdit_->setPlaceholderText (QStringLiteral ("auto"));
     ipEdit_->setToolTip (QStringLiteral (
         "EmotiBit IP address (shown in its serial boot log and in EmotiBit Oscilloscope).\n"
-        "A typed IP works across subnets (unicast). Blank: the last EmotiBit that answered,\n"
-        "then broadcast discovery, which only works when this computer and the EmotiBit share a subnet."));
+        "Connect tries this address first (unicast, works across subnets; blank: the last EmotiBit\n"
+        "that answered), then broadcast discovery, which finds the EmotiBit on any network this\n"
+        "computer shares with it (same subnet), e.g. a hotspot. A new address replaces the field."));
     c1->addWidget (ipEdit_);
     auto *c2 = new QVBoxLayout;
     c2->setSpacing (5);
@@ -640,10 +642,28 @@ QWidget *MainWindow::buildEmotibitModule ()
     row->addLayout (c2);
     v->addLayout (row);
     v->addSpacing (7);
+    auto *metaRow = new QHBoxLayout;
+    metaRow->setContentsMargins (0, 0, 0, 0);
+    metaRow->setSpacing (8);
     emotibit_.meta = new ElideLabel (QString (), Qt::ElideRight);
     emotibit_.meta->setFont (Theme::mono (10, 400, 0.02));
     Theme::setTextColor (emotibit_.meta, Theme::textDim);
-    v->addWidget (emotibit_.meta);
+    metaRow->addWidget (emotibit_.meta, 1);
+    // Wi-Fi setup over USB (EmotiBitWifiDialog): a text link, so the rail keeps its height
+    wifiBtn_ = new QPushButton (QStringLiteral ("wi-fi setup"));
+    wifiBtn_->setObjectName (QStringLiteral ("wifiLink"));
+    wifiBtn_->setFixedHeight (16);
+    wifiBtn_->setCursor (Qt::PointingHandCursor);
+    wifiBtn_->setFocusPolicy (Qt::TabFocus);
+    wifiBtn_->setStyleSheet (
+        QStringLiteral ("QPushButton#wifiLink { border: 0; background: transparent; padding: 0; color: %1;"
+                        " font-family: \"%4\"; font-size: 10px; font-weight: 400; text-decoration: underline; }"
+                        "QPushButton#wifiLink:hover { color: %2; }"
+                        "QPushButton#wifiLink:disabled { color: %3; text-decoration: none; }")
+            .arg (Theme::textMuted.name (), Theme::textStrong.name (), Theme::textFainter.name (), Theme::monoFamily ()));
+    connect (wifiBtn_, &QPushButton::clicked, this, [this] { openWifiSetup (); });
+    metaRow->addWidget (wifiBtn_, 0, Qt::AlignRight | Qt::AlignVCenter);
+    v->addLayout (metaRow);
 
     // discovering module (cancelled with the Connect button)
     discoverWrap_ = new QWidget;
@@ -869,8 +889,8 @@ QWidget *MainWindow::buildIdleOverlay ()
     gap (14);
     auto *para = makeLabel (richPara (QStringLiteral (
                                           "One button opens every available device at once: the Cyton on its USB "
-                                          "dongle and the EmotiBit at the address in the left rail (blank: the last "
-                                          "address that answered, then broadcast discovery). Plots arm themselves "
+                                          "dongle and the EmotiBit at the address in the left rail, or anywhere on "
+                                          "this computer's network (broadcast discovery). Plots arm themselves "
                                           "as soon as samples arrive."),
                                 20), // 12.5 px x 1.6
         Theme::sans (12.5), Theme::textMuted);
@@ -1018,6 +1038,11 @@ void MainWindow::wireWorker (DeviceKind kind)
         Slot &s = slot (kind);
         s.address = ip;
         s.serial = serial;
+        // found by the broadcast fallback at a new address: the typed IP was
+        // stale, so the field (saved on connect) follows the device
+        const QString field = ipEdit_->text ().trimmed ();
+        if (kind == DeviceKind::EmotiBit && !field.isEmpty () && field != ip && validIpv4 (ip))
+            ipEdit_->setText (ip);
         showMessage (QStringLiteral ("EmotiBit%1 found at %2")
                          .arg (serial.isEmpty () ? QString () : QStringLiteral (" ") + serial, ip));
     });
@@ -1263,15 +1288,16 @@ void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
             failNow (DeviceWorker::FailOther, QStringLiteral ("'%1' is not an IPv4 address").arg (field));
             return;
         }
-        // Blank field: the last EmotiBit that answered (unicast), then broadcast.
+        // The typed IP (blank field: the last EmotiBit that answered) gets a
+        // short unicast try, which works across subnets; then broadcast
+        // discovery on every interface, so an EmotiBit that joined another
+        // network both share (e.g. a hotspot) is found at its new address.
         QString target = field;
         s.fieldBlank = field.isEmpty ();
         cfg.ownDiscovery = !opts_.brainflowDiscovery;
         if (s.fieldBlank && validIpv4 (lastEmotibitIp_) && cfg.ownDiscovery)
-        {
             target = lastEmotibitIp_;
-            cfg.broadcastFallback = true;
-        }
+        cfg.broadcastFallback = cfg.ownDiscovery && !target.isEmpty ();
         cfg.params.ip_address = target.toStdString ();
         cfg.params.timeout = timeoutSpin_->value ();
         s.address = target;
@@ -1488,7 +1514,8 @@ QString MainWindow::metaText (const Slot &s) const
         }
         const QString field = ipEdit_->text ().trimmed ();
         if (!field.isEmpty ())
-            return validIpv4 (field) ? QStringLiteral ("unicast to %1").arg (field) : QStringLiteral ("not an IPv4 address");
+            return validIpv4 (field) ? QStringLiteral ("%1, then broadcast").arg (field)
+                                     : QStringLiteral ("not an IPv4 address");
         return validIpv4 (lastEmotibitIp_) ? QStringLiteral ("auto · %1, then broadcast").arg (lastEmotibitIp_)
                                            : QStringLiteral ("auto · broadcast (same subnet)");
     }
@@ -1571,6 +1598,12 @@ void MainWindow::updateSlotUi (Slot &s)
     {
         ipEdit_->setReadOnly (!editable);
         timeoutSpin_->setReadOnly (!editable);
+        wifiBtn_->setEnabled (editable);
+        const QString wifiTip = editable
+            ? QStringLiteral ("Add or remove the Wi-Fi networks the EmotiBit joins, over USB (no SD card needed).")
+            : QStringLiteral ("Disconnect the EmotiBit first: Wi-Fi setup restarts it.");
+        if (wifiBtn_->toolTip () != wifiTip)
+            wifiBtn_->setToolTip (wifiTip);
         const bool nf = s.failed && s.failKind == DeviceWorker::FailNotFound;
         setFlag (ipEdit_, "attention", nf && editable);
         updateDiscoverBox (s);
@@ -1665,13 +1698,19 @@ void MainWindow::updateErrorBox (Slot &s)
         }
         else
         {
-            text = QStringLiteral ("No answer from %1 within %2&nbsp;s (unicast, across subnets). This computer is on %3.")
-                       .arg (b (s.typedIp, Theme::textStrong))
-                       .arg (s.failTimeout, 0, 'f', 1)
-                       .arg (subnets ().toHtmlEscaped ());
-            hint = QStringLiteral ("Check the %1 (serial monitor at boot) and that EmotiBit Oscilloscope is closed, "
-                                   "or clear the field to auto-discover.")
-                       .arg (b (QStringLiteral ("IP address"), Theme::textBody));
+            if (opts_.brainflowDiscovery)
+                text = QStringLiteral ("No answer from %1 within %2&nbsp;s (unicast, across subnets). This computer is on %3.")
+                           .arg (b (s.typedIp, Theme::textStrong))
+                           .arg (s.failTimeout, 0, 'f', 1)
+                           .arg (subnets ().toHtmlEscaped ());
+            else
+                text = QStringLiteral ("No answer from %1, and broadcast discovery found no EmotiBit on this "
+                                       "computer's network (%2).")
+                           .arg (b (s.typedIp, Theme::textStrong), subnets ().toHtmlEscaped ());
+            hint = QStringLiteral ("Check that the EmotiBit is on and has joined a network this computer is on, and "
+                                   "that EmotiBit Oscilloscope is closed. To use this network, add it to the EmotiBit "
+                                   "with %1 (USB).")
+                       .arg (b (QStringLiteral ("wi-fi setup"), Theme::textBody));
         }
     }
     else
@@ -2312,6 +2351,15 @@ void MainWindow::showMessage (const QString &text, int ms, const QColor &color)
     msgUntil_ = DeviceWorker::steadyNow () + ms / 1000.0;
     if (statusStrip_)
         statusStrip_->setMessage (text, color.isValid () ? color : Theme::textMuted);
+}
+
+void MainWindow::openWifiSetup ()
+{
+    // Setup restarts the EmotiBit: the link is enabled only while it is idle.
+    if (!wifiBtn_->isEnabled ())
+        return;
+    EmotiBitWifiDialog dialog (this);
+    dialog.exec ();
 }
 
 void MainWindow::refreshPorts (bool announce)
