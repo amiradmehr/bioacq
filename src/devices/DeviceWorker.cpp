@@ -509,6 +509,11 @@ void DeviceWorker::run (DeviceConfig cfg, std::vector<SignalChannel> chans)
                     " does not exist (dongle unplugged? press the rescan button)");
             }
         }
+        else if (cfg.boardId == static_cast<int> (BoardIds::CYTON_BOARD))
+        {
+            failKind_.store (FailNotFound); // auto-detect found no dongle (--probe without --port)
+            throw std::runtime_error ("no OpenBCI dongle found (plug it in, or give its serial port)");
+        }
 
         // EmotiBit: find the device without holding BrainFlow's global lock.
         if (cfg.boardId == static_cast<int> (BoardIds::EMOTIBIT_BOARD) && cfg.ownDiscovery)
