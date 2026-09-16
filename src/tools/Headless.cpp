@@ -674,6 +674,51 @@ void unitChecks (Checker &check)
         const bool hyst = Readouts::nearRail (0.09, false) && !Readouts::nearRail (0.11, false) &&
             Readouts::nearRail (0.11, true) && !Readouts::nearRail (0.13, true);
         check (hyst, "near-rail warning: enter below 10 % headroom, leave above 12 % (hysteresis)");
+        {
+            // Raw ECG near the rail for 3 s, then a normal ECG: judged on the
+            // last 2 s at the GUI's 4 Hz cadence, the warning must clear within
+            // ~2 s of the recovery (it used to wait for the whole plot window).
+            SignalRing ring (1, 4000);
+            const double fs = 250.0, recovery = 3.0;
+            for (int i = 0; i < 2000; ++i)
+            {
+                const double t = i / fs;
+                const double v = t < recovery ? 181000.0 + 500.0 * std::sin (2.0 * M_PI * 5.0 * t)
+                                              : 1200.0 * std::sin (2.0 * M_PI * 1.2 * t);
+                const double *vals[1] = {&v};
+                ring.append (&t, vals, 1);
+            }
+            std::vector<double> tb;
+            std::vector<std::vector<double>> vb;
+            bool near = false, wasOn = false;
+            double clearedAt = std::numeric_limits<double>::quiet_NaN ();
+            for (double now = 0.25; now <= 8.0; now += 0.25)
+            {
+                // evaluate the ring as it was at `now` (samples up to now only)
+                SignalRing part (1, 4000);
+                const std::size_t n = ring.copySince (-1.0, tb, vb);
+                for (std::size_t k = 0; k < n && tb[k] <= now; ++k)
+                {
+                    const double *vals[1] = {&vb[0][k]};
+                    part.append (&tb[k], vals, 1);
+                }
+                const double peak = Readouts::ringPeakAbs (part, 0, now, Readouts::kRailWindowSec, tb, vb);
+                near = Readouts::nearRail (Readouts::railHeadroom (peak), near);
+                wasOn = wasOn || (near && now < recovery);
+                if (!near && wasOn && !std::isfinite (clearedAt))
+                    clearedAt = now;
+            }
+            check (wasOn && std::isfinite (clearedAt) && clearedAt - recovery <= Readouts::kRailWindowSec + 0.25 && !near,
+                fmt ("near-rail on the last 2 s of raw ECG: warning cleared %.2f s after the input recovered", clearedAt - recovery));
+        }
+        {
+            const QString sat = Readouts::nearRailSentence (Readouts::railHeadroom (187500.0), 187500.0, false);
+            const QString nearTxt = Readouts::nearRailSentence (Readouts::railHeadroom (181000.0), 181000.0, false);
+            check (sat == QStringLiteral ("ECG saturated at ±187,500 µV — reseat the electrode or check contact.") &&
+                    !sat.contains (QStringLiteral ("within")) && Readouts::saturated (-187499.5) &&
+                    !Readouts::saturated (187400.0) && nearTxt.contains (QStringLiteral ("within 3.4 %")),
+                "near-rail wording: '" + sat.toStdString () + "' at full scale, 'within 3.4 %' at 181 mV");
+        }
         using RT = Readouts::RateTone;
         check (Readouts::rateTone (true, 249.8, 250.0) == RT::Ok && Readouts::rateTone (true, 237.6, 250.0) == RT::Ok &&
                 Readouts::rateTone (true, 237.4, 250.0) == RT::Low && Readouts::rateTone (true, 18.1, 25.0) == RT::Low &&
@@ -722,6 +767,26 @@ void unitChecks (Checker &check)
             sink = sink + std::sqrt (sink + 1.0);
         const double pct = cm.sample ();
         check (pct > 50.0 && pct < 400.0, fmt ("CPU meter (getrusage, all threads): a busy loop reads %.0f %% of one core", pct));
+        {
+            const double nan = std::numeric_limits<double>::quiet_NaN ();
+            using Readouts::heartRateView;
+            const auto ok = heartRateView (true, true, 0.6, 71.6, 0.95, HeartRate::SourceGreen, 9, 0.9, 20.0);
+            const auto stale = heartRateView (true, true, 5.0, 71.6, 0.95, HeartRate::SourceGreen, 9, 0.9, 20.0);
+            const auto noPulse = heartRateView (true, true, 0.4, nan, 1.0, HeartRate::SourceNone, 2, 0.1, 20.0);
+            const auto irregular = heartRateView (true, true, 0.4, nan, 0.45, HeartRate::SourceNone, 9, 0.8, 20.0);
+            const auto acquiring = heartRateView (true, true, 0.4, nan, 0.0, HeartRate::SourceNone, 1, 0.0, 3.0);
+            const auto stalled = heartRateView (true, true, 4.5, nan, 0.0, HeartRate::SourceNone, 1, 0.0, 3.0);
+            const auto off = heartRateView (false, true, 0.6, 71.6, 0.95, HeartRate::SourceGreen, 9, 0.9, 20.0);
+            check (ok.value == QStringLiteral ("72") && ok.source == QStringLiteral ("GREEN") &&
+                    ok.chip == QStringLiteral ("QUALITY 95 %") && ok.valid && stale.value == QStringLiteral ("—") &&
+                    stale.chip == QStringLiteral ("NO DATA") && stale.warn && noPulse.value == QStringLiteral ("—") &&
+                    noPulse.chip == QStringLiteral ("NO PULSE") && irregular.chip == QStringLiteral ("IRREGULAR · Q 45 %") &&
+                    acquiring.chip == QStringLiteral ("ACQUIRING") && !acquiring.warn &&
+                    stalled.chip == QStringLiteral ("NO DATA") && stalled.warn && off.value == QStringLiteral ("—") &&
+                    !off.valid,
+                "heart-rate readout: '72' + GREEN + 'QUALITY 95 %'; stale -> '—' NO DATA (also while acquiring); "
+                "no pulse / irregular / acquiring -> '—' with the reason; not streaming -> '—'");
+        }
     }
 }
 
