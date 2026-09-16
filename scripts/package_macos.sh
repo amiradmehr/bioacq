@@ -6,7 +6,7 @@
 #
 # Output:
 #   dist/macos/BioAcq.app              double-click to start the GUI
-#   dist/BioAcq-macos-<arch>.zip       the app, zipped with ditto (keeps signatures)
+#   dist/BioAcq-macos-<arch>.zip       the app, zipped with ditto (signature intact after any unzip)
 #
 # Steps: configure + build with -DBIOACQ_PACKAGED=ON -> the Qt plugins the app
 # needs (cocoa + offscreen platforms for the GUI and headless --selftest /
@@ -282,6 +282,17 @@ fi
 
 # ---------------------------------------------------------------- zip
 step "zip"
-ditto -c -k --keepParent "$APP" "$ZIP"
+# No extended attributes (macOS tags every file with com.apple.provenance): as
+# ._* AppleDouble entries they would break the signature seal for anyone who
+# unpacks the zip with a plain unzip tool.
+ditto -c -k --norsrc --noextattr --noacl --keepParent "$APP" "$ZIP"
+if unzip -l "$ZIP" | grep -q '/\._'; then
+    fail "the zip contains AppleDouble (._*) entries"
+fi
+rm -rf "$CHECK_DIR/unzipped"
+mkdir -p "$CHECK_DIR/unzipped"
+unzip -q "$ZIP" -d "$CHECK_DIR/unzipped"
+codesign --verify --deep --strict "$CHECK_DIR/unzipped/BioAcq.app" || fail "the app unpacked with unzip fails codesign --verify"
+echo "  unpacked with unzip: signature valid"
 echo "  $ZIP ($(du -h "$ZIP" | cut -f1 | tr -d ' '))"
 echo "  $APP ($(du -sh "$APP" | cut -f1 | tr -d ' '))"
