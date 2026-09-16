@@ -1,0 +1,15 @@
+diff --git a/src/board_controller/emotibit/emotibit.cpp b/src/board_controller/emotibit/emotibit.cpp
+index 1dea8de..369e076 100644
+--- a/src/board_controller/emotibit/emotibit.cpp
++++ b/src/board_controller/emotibit/emotibit.cpp
+@@ -373,7 +373,9 @@ void Emotibit::read_thread ()
+                             try
+                             {
+                                 anc_packages[i * 2][channel_index] = std::stod (payload[i]);
+-                                anc_packages[i + 1][channel_index] = anc_packages[i][channel_index];
++                                // patched (stream_gui_cpp): duplicate into i*2+1, not i+1
++                                anc_packages[i * 2 + 1][channel_index] =
++                                    anc_packages[i * 2][channel_index];
+                             }
+                             catch (...)
+                             {

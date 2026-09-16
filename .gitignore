@@ -1,0 +1,19 @@
+# Build trees (normally kept outside the repo, see scripts/build.sh)
+build/
+build-*/
+cmake-build-*/
+out/
+compile_commands.json
+
+# Runtime output
+recordings/
+
+# Packaged builds (only committed on the mac / windows branches)
+dist/
+
+# OS / editor / tooling
+.DS_Store
+__pycache__/
+*.pyc
+.claude/
+.vscode/
