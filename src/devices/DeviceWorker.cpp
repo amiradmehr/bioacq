@@ -1,12 +1,12 @@
 #include "DeviceWorker.h"
 
+#include "AppPaths.h"
 #include "Biquad.h"
 #include "RateMeter.h"
 #include "Readouts.h"
+#include "SerialPorts.h"
 
 #include "board_shim.h"
-
-#include <sys/stat.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -39,8 +39,7 @@ QString cleanWhat (const BrainFlowException &e)
 
 std::string homeFallbackDir ()
 {
-    const char *home = std::getenv ("HOME");
-    return std::string (home ? home : "/tmp") + "/bioacq_recordings";
+    return fallbackRecordDir ().toStdString ();
 }
 
 QString joinTargets (const std::vector<std::string> &targets)
@@ -387,7 +386,7 @@ QString DeviceWorker::discoveryFailureText (
                                "If macOS denied Local Network access to the app that launched this "
                                "program, allow it in System Settings > Privacy & Security > Local "
                                "Network. Otherwise check that WiFi is on and the IP address is right.")
-            .arg (where, QString::fromLocal8Bit (std::strerror (r.lastSendErrno)));
+            .arg (where, QString::fromLocal8Bit (emotibit::socketErrorText (r.lastSendErrno).c_str ()));
     if (typedIp.empty ())
         return QStringLiteral ("no EmotiBit answered the broadcast discovery (sent to %1) within %2 s.\n")
                    .arg (where.isEmpty () ? QStringLiteral ("no interface") : where, secs) +
@@ -452,8 +451,7 @@ void DeviceWorker::run (DeviceConfig cfg, std::vector<SignalChannel> chans)
     {
         if (!cfg.params.serial_port.empty ())
         {
-            struct stat st;
-            if (::stat (cfg.params.serial_port.c_str (), &st) != 0)
+            if (!serialPortExists (QString::fromStdString (cfg.params.serial_port)))
                 throw std::runtime_error ("serial port " + cfg.params.serial_port +
                     " does not exist (dongle unplugged? press the refresh button)");
         }
@@ -763,8 +761,14 @@ void DeviceWorker::startRecording (
 
     // BrainFlow's file streamer copies the path into a 512-byte buffer and
     // splits "file://<path>:<mode>" at the first "://" and the LAST ':' --
-    // spaces and '@' are fine; a ':' inside the path and over-long paths are not.
-    if (dir.find (':') != std::string::npos)
+    // spaces and '@' are fine; a ':' inside the path and over-long paths are not
+    // (except a Windows drive letter's, which sits before the last ':').
+#ifdef _WIN32
+    const std::size_t colonFrom = (dir.size () >= 2 && dir[1] == ':') ? 2 : 0;
+#else
+    const std::size_t colonFrom = 0;
+#endif
+    if (dir.find (':', colonFrom) != std::string::npos)
     {
         emit message (QString ("recording folder contains ':' (BrainFlow's file streamer cannot "
                                "handle it), using %1")

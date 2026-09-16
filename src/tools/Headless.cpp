@@ -8,7 +8,9 @@
 #include "Readouts.h"
 #include "Retimer.h"
 #include "RingBuffer.h"
+#include "SerialPorts.h"
 #include "SignalSpec.h"
+#include "Sockets.h"
 
 #include "board_shim.h"
 
@@ -18,12 +20,6 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QTemporaryDir>
-
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -567,7 +563,7 @@ void unitChecks (Checker &check)
         while (since (tb) < 0.25)
             sink = sink + std::sqrt (sink + 1.0);
         const double pct = cm.sample ();
-        check (pct > 50.0 && pct < 400.0, fmt ("CPU meter (getrusage, all threads): a busy loop reads %.0f %% of one core", pct));
+        check (pct > 50.0 && pct < 400.0, fmt ("CPU meter (process CPU time, all threads): a busy loop reads %.0f %% of one core", pct));
     }
 }
 
@@ -580,27 +576,26 @@ class FakeEmotibit
 public:
     explicit FakeEmotibit (bool answer) : answer_ (answer)
     {
-        fd_ = ::socket (AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (fd_ < 0)
+        if (!wsa_.ok ())
+            return;
+        fd_ = netsock::openUdp ();
+        if (fd_ == netsock::kInvalidSocket)
             return;
         struct sockaddr_in a;
         std::memset (&a, 0, sizeof (a));
         a.sin_family = AF_INET;
         a.sin_addr.s_addr = htonl (INADDR_LOOPBACK);
         a.sin_port = 0;
-        socklen_t al = sizeof (a);
+        netsock::SockLen al = sizeof (a);
         if (::bind (fd_, reinterpret_cast<struct sockaddr *> (&a), sizeof (a)) != 0 ||
             ::getsockname (fd_, reinterpret_cast<struct sockaddr *> (&a), &al) != 0)
         {
-            ::close (fd_);
-            fd_ = -1;
+            netsock::closeSocket (fd_);
+            fd_ = netsock::kInvalidSocket;
             return;
         }
         port_ = ntohs (a.sin_port);
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 50000;
-        ::setsockopt (fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
+        netsock::setReceiveTimeoutMs (fd_, 50);
         thread_ = std::thread ([this] { serve (); });
     }
     ~FakeEmotibit ()
@@ -608,15 +603,14 @@ public:
         quit_.store (true);
         if (thread_.joinable ())
             thread_.join ();
-        if (fd_ >= 0)
-            ::close (fd_);
+        netsock::closeSocket (fd_);
     }
     FakeEmotibit (const FakeEmotibit &) = delete;
     FakeEmotibit &operator= (const FakeEmotibit &) = delete;
 
     bool ok () const
     {
-        return fd_ >= 0 && port_ > 0;
+        return fd_ != netsock::kInvalidSocket && port_ > 0;
     }
     int port () const
     {
@@ -634,9 +628,7 @@ private:
         while (!quit_.load ())
         {
             struct sockaddr_in from;
-            socklen_t fl = sizeof (from);
-            const ssize_t n = ::recvfrom (
-                fd_, buf, sizeof (buf), 0, reinterpret_cast<struct sockaddr *> (&from), &fl);
+            const long n = netsock::recvFrom (fd_, buf, sizeof (buf), &from);
             if (n <= 0)
                 continue;
             if (std::string (buf, static_cast<std::size_t> (n)).find (",HE,") == std::string::npos)
@@ -646,12 +638,13 @@ private:
                 continue;
             // header (6 fields) + payload; BrainFlow reads the serial from field 9
             static const std::string hh = "123456,7,4,HH,1,100,DI,127.0.0.1,DP,MD-V5-0000123\n";
-            ::sendto (fd_, hh.data (), hh.size (), 0, reinterpret_cast<struct sockaddr *> (&from), fl);
+            netsock::sendTo (fd_, hh.data (), hh.size (), from);
         }
     }
 
+    netsock::Session wsa_;
     bool answer_;
-    int fd_ = -1;
+    netsock::Socket fd_ = netsock::kInvalidSocket;
     int port_ = 0;
     std::atomic<bool> quit_ {false};
     std::atomic<int> hellos_ {0};
@@ -1006,14 +999,23 @@ int runSelftest (double seconds)
 }
 
 // =============================================================================
-int runProbe (const ProbeOptions &o)
+int runProbe (const ProbeOptions &options)
 {
+    ProbeOptions o = options;
+    QString cytonDesc = o.cytonPort;
+    if (!o.skipCyton && o.cytonPort.trimmed ().isEmpty ())
+    {
+        // no --port: the first OpenBCI dongle (FTDI 0403:6015) found
+        o.cytonPort = findCytonDongle ();
+        cytonDesc = o.cytonPort.isEmpty () ? QStringLiteral ("no OpenBCI dongle found")
+                                           : o.cytonPort + QStringLiteral (" (auto-detected)");
+    }
     const QString emDesc = o.emotibitIp.trimmed ().isEmpty ()
         ? QStringLiteral ("broadcast discovery")
         : o.emotibitIp.trimmed ();
     std::printf ("bioacq probe -- real devices (Cyton: %s, EmotiBit: %s%s, timeout %d s), "
                  "measuring %.1f s\n",
-        o.skipCyton ? "skipped" : qPrintable (o.cytonPort),
+        o.skipCyton ? "skipped" : qPrintable (cytonDesc),
         o.skipEmotibit ? "skipped" : qPrintable (emDesc),
         (!o.skipEmotibit && o.bfDiscovery) ? " via BrainFlow's discovery" : "",
         o.emotibitTimeoutSec, o.seconds);

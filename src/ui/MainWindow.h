@@ -41,7 +41,7 @@ inline constexpr int kMaxDiscoveryTimeoutSec = 20;
 struct LaunchOptions
 {
     bool synthetic = false;
-    QString cytonPort = QStringLiteral ("/dev/cu.usbserial-DP04W4GA");
+    QString cytonPort; // empty = auto-detect (main.cpp preselects findCytonDongle ())
     QString emotibitIp = QStringLiteral ("192.168.1.12"); // blank = broadcast discovery
     int emotibitTimeoutSec = 5;
     QString recordDir;

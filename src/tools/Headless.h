@@ -9,7 +9,7 @@ extern volatile std::sig_atomic_t g_interruptRequested;
 
 struct ProbeOptions
 {
-    QString cytonPort = QStringLiteral ("/dev/cu.usbserial-DP04W4GA");
+    QString cytonPort; // empty = auto-detect the OpenBCI dongle (findCytonDongle)
     QString emotibitIp = QStringLiteral ("192.168.1.12"); // blank = broadcast discovery
     int emotibitTimeoutSec = 5;
     bool bfDiscovery = false; // let BrainFlow discover the EmotiBit (holds its global lock)

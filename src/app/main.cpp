@@ -1,10 +1,13 @@
 // bioacq -- native real-time viewer for OpenBCI Cyton ch1 + EmotiBit
 // (temperature, IMU, PPG green) via BrainFlow. See README.md.
 
+#include "AppPaths.h"
 #include "BuildConfig.h"
 #include "Headless.h"
 #include "MainWindow.h"
+#include "ProcessSetup.h"
 #include "Readouts.h"
+#include "SerialPorts.h"
 #include "Theme.h"
 
 #include "board_shim.h"
@@ -39,17 +42,18 @@ struct Args
         Gui,
         Selftest,
         Probe,
-        Screenshot
+        Screenshot,
+        ListPorts
     } mode = Gui;
     double seconds = -1.0;
     QString screenshotPath;
     QString state = QStringLiteral ("live");
     int width = 1600, height = 1000;
     bool synthetic = false;
-    QString port = QStringLiteral ("/dev/cu.usbserial-DP04W4GA");
+    QString port; // empty = auto-detect the OpenBCI dongle (findCytonDongle)
     QString ip = QStringLiteral ("192.168.1.12");
     int timeout = 5;
-    QString recordDir = QString::fromUtf8 (BIOACQ_RECORD_DIR);
+    QString recordDir = defaultRecordDir ();
     bool recordDirSet = false;
     bool record = false;
     int window = -1;
@@ -95,6 +99,8 @@ Args parseArgs (int argc, char **argv)
             if (i + 1 < argc && isNumber (argv[i + 1]))
                 a.seconds = std::atof (argv[++i]);
         }
+        else if (s == "--list-ports")
+            a.mode = Args::ListPorts;
         else if (s == "--screenshot")
         {
             a.mode = Args::Screenshot;
@@ -198,9 +204,11 @@ void usage ()
         "                            unanswered TEST-NET address 192.0.2.1 (timeout 20 s / 2 s);\n"
         "                            recording: records into --record-dir (default: a temporary folder);\n"
         "                            warning: enables both test hooks below\n"
-        "      --size WxH            window size (default 1600x1000)\n\n"
+        "      --size WxH            window size (default 1600x1000)\n"
+        "  --list-ports              list serial ports (OpenBCI dongles first) and exit\n\n"
         "options:\n"
-        "  --port <dev>              Cyton serial port (default /dev/cu.usbserial-DP04W4GA)\n"
+        "  --port <dev>              Cyton serial port, e.g. COM3 or /dev/cu.usbserial-XXXXXXXX\n"
+        "                            (default: auto-detect the OpenBCI dongle, FTDI 0403:6015)\n"
         "  --ip <addr>               EmotiBit IP (default 192.168.1.12; works across subnets)\n"
         "  --discover                EmotiBit broadcast discovery instead of an IP (same subnet only)\n"
         "  --timeout <s>             EmotiBit discovery timeout, 2-%d (default 5)\n"
@@ -214,7 +222,7 @@ void usage ()
         "test hooks (display only, never in the UI):\n"
         "  --test-stall-emotibit [s] stop polling the EmotiBit after s seconds of streaming (default 1.5)\n"
         "  --test-rail-offset-uv <v> add v uV to the Cyton's raw Ch1 display value (near-rail path)\n",
-        BIOACQ_VERSION, kMaxDiscoveryTimeoutSec, BIOACQ_RECORD_DIR);
+        BIOACQ_VERSION, kMaxDiscoveryTimeoutSec, qPrintable (QDir::toNativeSeparators (defaultRecordDir ())));
 }
 
 double steadyNow ()
@@ -226,6 +234,12 @@ double steadyNow ()
 
 int main (int argc, char **argv)
 {
+    // Windows GUI-subsystem build: print to the calling console (if any) when
+    // started with arguments; a double-click passes none.
+    if (argc > 1)
+        attachParentConsole ();
+    raiseTimerResolution ();
+
     const Args a = parseArgs (argc, argv);
     if (a.help)
     {
@@ -250,6 +264,18 @@ int main (int argc, char **argv)
     {
     }
 
+    if (a.mode == Args::ListPorts)
+    {
+        QCoreApplication app (argc, argv);
+        const QVector<SerialPortEntry> ports = listSerialPorts ();
+        if (ports.isEmpty ())
+            std::printf ("no serial ports found\n");
+        for (const SerialPortEntry &e : ports)
+            std::printf ("%-36s %04x:%04x  %s%s\n", qPrintable (brainflowSerialPort (e)), e.vid, e.pid,
+                qPrintable (e.description), e.cytonDongle ? "  [OpenBCI dongle]" : "");
+        std::fflush (stdout);
+        return 0;
+    }
     if (a.mode == Args::Selftest)
     {
         QCoreApplication app (argc, argv);
@@ -279,7 +305,8 @@ int main (int argc, char **argv)
     const bool shot = a.mode == Args::Screenshot;
     LaunchOptions lo;
     lo.synthetic = a.synthetic || shot;
-    lo.cytonPort = a.port;
+    // No --port: preselect the first OpenBCI dongle found (screenshots stay reproducible).
+    lo.cytonPort = (a.portSet || shot) ? a.port : findCytonDongle ();
     lo.emotibitIp = a.ip;
     lo.emotibitTimeoutSec = a.timeout;
     lo.recordDir = a.recordDir;
