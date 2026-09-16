@@ -410,6 +410,7 @@ void Tracker::update (double now, std::vector<Sample> &out)
         s.t = std::max (t, lastPublished_ + 1e-6);
         s.bpm = valid ? e.bpm : kNaN;
         s.quality = e.quality;
+        s.periodicity = e.periodicity;
         s.source = src;
         s.beats = e.beats;
         lastPublished_ = s.t;

@@ -49,6 +49,9 @@ struct DeviceConfig
     bool ownDiscovery = true;
     int discoveryPort = emotibit::kAdvertisingPort;
     double discoveryTimeoutSec = -1.0; // <= 0: use params.timeout
+    // Own discovery only: when unicast to params.ip_address (e.g. the last IP
+    // that answered) finds nothing, search again by broadcast (same subnet).
+    bool broadcastFallback = false;
 
     // Count gaps in the board's package-number row (Cyton: 0..255 per
     // sample) as dropped packets; resolved by start().
@@ -67,11 +70,15 @@ struct DeviceConfig
     // near-rail path). BrainFlow's recordings are unaffected by both.
     double testFreezeAfterSec = -1.0;
     double testRawOffset = 0.0;
+    // Test hook (--test-ppg-bpm): replace the PPG display values (and so the
+    // heart-rate input) with HeartRate::syntheticPpg at this rate. 0 = off.
+    double testPpgBpm = 0.0;
 };
 
 // One plotted signal: its resolved spec and the ring buffer the worker fills.
 // Ring channel layout: one channel per trace; filterable signals get one more
-// channel at index rawChannel holding the unfiltered value.
+// channel at index rawChannel holding the unfiltered value. A derived signal
+// (heart rate) has no BrainFlow rows: its ring holds HeartRateRing channels.
 struct SignalChannel
 {
     ResolvedSignal spec;
@@ -133,9 +140,10 @@ public:
     enum FailureKind
     {
         FailNone = 0,
-        FailNotFound = 1, // discovery ran, nothing answered
+        FailNotFound = 1, // discovery ran and nothing answered / the serial port does not exist
         FailNoSend = 2,   // discovery could not send (no interface / permission)
-        FailOther = 3
+        FailOther = 3,
+        FailPortBusy = 4  // Cyton: the port exists but cannot be opened or the board does not answer
     };
 
     explicit DeviceWorker (QObject *parent = nullptr);
@@ -201,8 +209,10 @@ public:
     }
 
     // Filter settings (applied to filterable signals, state reset on change).
-    void setHighPass (bool on, double hz = 1.0);
+    // Chain order: high-pass, notch, low-pass.
+    void setHighPass (bool on, double hz = 0.5);
     void setNotch (bool on, double hz = 60.0);
+    void setLowPass (bool on, double hz = 40.0);
 
     // Start (on) or stop (off) recording every preset to
     // <dir>/<prefix>_<preset>_<stamp>.csv. Applied by the worker thread within
@@ -281,8 +291,10 @@ private:
 
     std::atomic<bool> hpOn_ {false};
     std::atomic<bool> notchOn_ {false};
-    std::atomic<double> hpHz_ {1.0};
+    std::atomic<bool> lpOn_ {false};
+    std::atomic<double> hpHz_ {0.5};
     std::atomic<double> notchHz_ {60.0};
+    std::atomic<double> lpHz_ {40.0};
     std::atomic<unsigned> filterGen_ {0};
 
     // recording requests (GUI -> worker) and state

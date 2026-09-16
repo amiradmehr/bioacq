@@ -841,7 +841,7 @@ std::array<PlotWidget *, 6> MainWindow::allPlots () const
 
 PlotWidget *MainWindow::plotForKey (const std::string &key) const
 {
-    if (key == SignalKeys::CytonCh1)
+    if (key == SignalKeys::CytonEcg)
         return cytonPlot_;
     if (key == SignalKeys::EmotiTemp)
         return tempPlot_;
@@ -1587,7 +1587,7 @@ double MainWindow::cytonRawPeak (double now)
 {
     for (const SignalChannel &ch : cyton_.worker->channels ())
     {
-        if (ch.spec.key != SignalKeys::CytonCh1 || !ch.ring || ch.rawChannel < 0)
+        if (ch.spec.key != SignalKeys::CytonEcg || !ch.ring || ch.rawChannel < 0)
             continue;
         double ref = now;
         const double latest = ch.ring->latestTimestamp ();

@@ -176,9 +176,12 @@ DeviceConfig makeConfig (DeviceKind kind, bool synthetic, const ProbeOptions *po
         cfg.params.serial_port = po->cytonPort.toStdString ();
     else
     {
+        // Same as MainWindow::connectDeviceWith, minus the GUI's remembered
+        // "last IP that answered": a blank IP is broadcast discovery only.
         cfg.params.ip_address = po->emotibitIp.trimmed ().toStdString ();
         cfg.params.timeout = po->emotibitTimeoutSec;
         cfg.ownDiscovery = !po->bfDiscovery;
+        cfg.broadcastFallback = false;
     }
     cfg.signalSpecs = resolveSignals (cfg.boardId, signalDefsFor (kind), problems);
     cfg.pollIntervalMs = kind == DeviceKind::Cyton ? 10 : 15;
@@ -652,16 +655,38 @@ void unitChecks (Checker &check)
         std::vector<std::string> problems;
         const auto cy = resolveSignals (realBoardIdFor (DeviceKind::Cyton), signalDefsFor (DeviceKind::Cyton), &problems);
         const auto em = resolveSignals (realBoardIdFor (DeviceKind::EmotiBit), signalDefsFor (DeviceKind::EmotiBit), &problems);
-        bool ok = problems.empty () && cy.size () == 1 && em.size () == 5;
+        bool ok = problems.empty () && cy.size () == 1 && em.size () == 8 && cy.front ().key == SignalKeys::CytonEcg &&
+            cy.front ().filterable;
         std::string detail;
         for (const auto &s : cy)
             detail += s.key + "=" + presetName (s.preset) + rowsStr (s.rows) + " ";
         for (const auto &s : em)
         {
-            detail += s.key + "=" + presetName (s.preset) + rowsStr (s.rows) + " ";
+            detail += s.key + "=" + (s.derived ? std::string ("derived") : presetName (s.preset) + rowsStr (s.rows)) + " ";
             ok = ok && !s.substituted;
         }
         check (ok, "real board mapping: " + detail);
+        // BrainFlow's emotibit.cpp writes PPG_INFRARED to ppg_channels[0], PPG_RED to [1], PPG_GREEN to [2].
+        const int board = realBoardIdFor (DeviceKind::EmotiBit);
+        const std::vector<int> ppg = BoardShim::get_ppg_channels (board, static_cast<int> (BrainFlowPresets::AUXILIARY_PRESET));
+        auto rowOf = [&em] (const char *key) {
+            for (const auto &s : em)
+                if (s.key == key && s.rows.size () == 1)
+                    return s.rows.front ();
+            return -1;
+        };
+        auto inputOf = [&em] (const char *key) {
+            for (const auto &s : em)
+                if (s.key == key)
+                    return s.heartRateInput;
+            return -9;
+        };
+        check (ppg.size () == 3 && rowOf (SignalKeys::EmotiPpgIr) == ppg[0] && rowOf (SignalKeys::EmotiPpgRed) == ppg[1] &&
+                rowOf (SignalKeys::EmotiPpgGreen) == ppg[2] && inputOf (SignalKeys::EmotiPpgGreen) == HeartRate::SourceGreen &&
+                inputOf (SignalKeys::EmotiPpgRed) == HeartRate::SourceRed && inputOf (SignalKeys::EmotiPpgIr) == HeartRate::SourceIr,
+            fmt ("EmotiBit PPG order: IR row %.0f, red row %.0f, green row %.0f (ppg_channels[0..2] @ auxiliary)",
+                double (rowOf (SignalKeys::EmotiPpgIr)), double (rowOf (SignalKeys::EmotiPpgRed)),
+                double (rowOf (SignalKeys::EmotiPpgGreen))));
     }
     // Instrument-panel readout rules (Readouts.h)
     {
@@ -1039,8 +1064,23 @@ int runSelftest (double seconds)
         if (!r->worker->start (cfg))
             std::printf ("  [%s] start() refused\n", r->name.c_str ());
     }
-    const bool bothResolved = pumpUntil ([&] { return cy.resolved () && em.resolved (); }, 20.0);
-    check (bothResolved && cy.connected && em.connected, "both synthetic sessions connected");
+    // A third session: the EmotiBit pipeline with the --test-ppg-bpm hook, so
+    // the heart rate runs through the worker, the re-timed PPG and the ring.
+    DeviceRun hr;
+    hr.name = "emotibit+ppg";
+    hr.kind = DeviceKind::EmotiBit;
+    wire (hr, false);
+    {
+        std::vector<std::string> problems;
+        DeviceConfig cfg = makeConfig (DeviceKind::EmotiBit, true, nullptr, &problems);
+        cfg.params.other_info = "bioacq:emotibit-hr";
+        cfg.testPpgBpm = 72.0;
+        hr.resetFlags ();
+        hr.startedAt = SteadyClock::now ();
+        hr.worker->start (cfg);
+    }
+    const bool bothResolved = pumpUntil ([&] { return cy.resolved () && em.resolved () && hr.resolved (); }, 20.0);
+    check (bothResolved && cy.connected && em.connected && hr.connected, "synthetic sessions connected (Cyton, EmotiBit, EmotiBit + PPG hook)");
 
     if (cy.connected && em.connected)
     {
@@ -1055,10 +1095,12 @@ int runSelftest (double seconds)
             sampleMeters (em);
             if (!toggled && since (t0) >= seconds / 2.0)
             {
-                cy.worker->setHighPass (true, 1.0);
+                cy.worker->setHighPass (true, 0.5);
                 cy.worker->setNotch (true, 60.0);
+                cy.worker->setLowPass (true, 40.0);
                 toggled = true;
-                std::printf ("  [cyton] high-pass 1 Hz + notch 60 Hz enabled at t=%.1f s\n", since (t0));
+                std::printf ("  [cyton] ECG filters high-pass 0.5 Hz + notch 60 Hz + low-pass 40 Hz enabled at t=%.1f s\n",
+                    since (t0));
             }
         }
         const double measured = since (t0);
@@ -1074,6 +1116,8 @@ int runSelftest (double seconds)
         std::printf ("\n");
         for (const SignalReport &rep : reps)
         {
+            if (rep.nominal <= 0.0)
+                continue; // derived (heart rate): checked below
             const bool rateOk = rep.nominal > 0.0 && std::fabs (rep.rate2s - rep.nominal) / rep.nominal < 0.15 &&
                 std::fabs (rep.rateAvg - rep.nominal) / rep.nominal < 0.20;
             char line[256];
@@ -1105,7 +1149,44 @@ int runSelftest (double seconds)
                 mr /= static_cast<double> (n);
             }
             check (n > 0 && std::fabs (mf) < 2.0 && std::fabs (mr) > 5.0,
-                fmt ("worker filters: raw mean %.2f uV -> filtered mean %.2f uV over last %.2f s", mr, mf, win));
+                fmt ("worker ECG filters: raw mean %.2f uV -> filtered mean %.2f uV over last %.2f s", mr, mf, win));
+        }
+
+        // Heart rate: synthetic board PPG is noise -> status samples only; with
+        // the PPG hook at 72 bpm -> a valid HR from the worker's ring.
+        {
+            auto hrLatest = [] (DeviceRun &r, std::vector<double> &v, std::uint64_t &count, double &finiteBpm) {
+                count = 0;
+                finiteBpm = std::numeric_limits<double>::quiet_NaN ();
+                double ts = 0.0;
+                for (const SignalChannel &ch : r.worker->channels ())
+                    if (ch.spec.derived && ch.spec.key == SignalKeys::EmotiHeartRate)
+                    {
+                        count = ch.ring->totalWritten ();
+                        std::vector<double> t;
+                        std::vector<std::vector<double>> w;
+                        const std::size_t n = ch.ring->copySince (-1.0, t, w);
+                        for (std::size_t k = 0; k < n; ++k)
+                            if (std::isfinite (w[HeartRateRing::Bpm][k]))
+                                finiteBpm = w[HeartRateRing::Bpm][k];
+                        return ch.ring->latest (ts, v);
+                    }
+                return false;
+            };
+            std::vector<double> ev, hv;
+            std::uint64_t en = 0, hn = 0;
+            double eBpm = 0.0, hBpm = 0.0;
+            const bool eHave = hrLatest (em, ev, en, eBpm);
+            pumpUntil ([&] { return hrLatest (hr, hv, hn, hBpm) && hv.size () > 0 && std::isfinite (hv[HeartRateRing::Bpm]); },
+                std::max (0.0, 10.0 - since (hr.startedAt)));
+            const bool hHave = hrLatest (hr, hv, hn, hBpm);
+            check (eHave && en > 0 && !std::isfinite (eBpm),
+                fmt ("heart rate on the synthetic board's noise PPG: %.0f status samples, no HR value", double (en)));
+            const double bpm = hHave ? hv[HeartRateRing::Bpm] : std::numeric_limits<double>::quiet_NaN ();
+            check (hHave && std::fabs (bpm - 72.0) <= 2.0 && hv[HeartRateRing::Source] >= 0.0 &&
+                    hv[HeartRateRing::Quality] >= HeartRate::kMinQuality,
+                fmt ("heart rate through the worker (PPG hook 72 bpm): %.2f bpm, source %.0f, quality %.2f", bpm,
+                    hHave ? hv[HeartRateRing::Source] : -1.0, hHave ? hv[HeartRateRing::Quality] : 0.0));
         }
 
         // Recording started and stopped on the RUNNING session (BrainFlow
@@ -1145,12 +1226,14 @@ int runSelftest (double seconds)
         const auto t0 = SteadyClock::now ();
         cy.worker->requestStop ();
         em.worker->requestStop ();
-        const bool fin = pumpUntil ([&] { return cy.finished && em.finished; }, 15.0);
+        hr.worker->requestStop ();
+        const bool fin = pumpUntil ([&] { return cy.finished && em.finished && hr.finished; }, 15.0);
         const double ms = since (t0) * 1000.0;
         const bool joined = cy.worker->waitForFinished (2000) && em.worker->waitForFinished (2000) &&
-            !cy.worker->isActive () && !em.worker->isActive ();
-        check (fin && joined && !cy.failed && !em.failed,
-            fmt ("stop_stream + release_session on both workers, threads joined in %.0f ms", ms));
+            hr.worker->waitForFinished (2000) && !cy.worker->isActive () && !em.worker->isActive () &&
+            !hr.worker->isActive ();
+        check (fin && joined && !cy.failed && !em.failed && !hr.failed,
+            fmt ("stop_stream + release_session on every worker, threads joined in %.0f ms", ms));
     }
 
     // ---------------------------------------------------------- reconnect

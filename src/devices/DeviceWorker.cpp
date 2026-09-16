@@ -1,6 +1,7 @@
 #include "DeviceWorker.h"
 
 #include "Biquad.h"
+#include "HeartRate.h"
 #include "RateMeter.h"
 #include "Readouts.h"
 
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <thread>
 
@@ -91,11 +93,16 @@ bool DeviceWorker::start (const DeviceConfig &cfg)
             nch += 1;
         }
         const double rate = std::max (s.nominalRate, 250.0);
-        ch.ring = std::make_shared<SignalRing> (
-            nch, static_cast<std::size_t> (rate * cfg.ringSeconds) + 16);
+        if (s.derived)
+            // heart rate: one sample per beat (<= 200 bpm) or status second
+            ch.ring = std::make_shared<SignalRing> (
+                HeartRateRing::Count, static_cast<std::size_t> (4.0 * cfg.ringSeconds) + 16);
+        else
+            ch.ring = std::make_shared<SignalRing> (
+                nch, static_cast<std::size_t> (rate * cfg.ringSeconds) + 16);
         // EmotiBit stamps every sample of a packet with one host time; spread
         // them for display (never for the filterable EXG path / other boards).
-        ch.retime = cfg.boardId == static_cast<int> (BoardIds::EMOTIBIT_BOARD) && !s.filterable;
+        ch.retime = cfg.boardId == static_cast<int> (BoardIds::EMOTIBIT_BOARD) && !s.filterable && !s.derived;
         ch.retimer.reset (s.nominalRate);
         channels_.push_back (ch);
     }
@@ -201,6 +208,13 @@ void DeviceWorker::setNotch (bool on, double hz)
 {
     notchHz_.store (hz);
     notchOn_.store (on);
+    filterGen_.fetch_add (1);
+}
+
+void DeviceWorker::setLowPass (bool on, double hz)
+{
+    lpHz_.store (hz);
+    lpOn_.store (on);
     filterGen_.fetch_add (1);
 }
 
@@ -416,10 +430,30 @@ bool DeviceWorker::discoverEmotibit (DeviceConfig &cfg)
             : QStringLiteral ("looking for the EmotiBit at %1 (up to %2 s)…")
                   .arg (QString::fromStdString (typed), secs));
 
-    const emotibit::DiscoveryResult r = emotibit::discover (targets, cfg.discoveryPort, timeout,
+    emotibit::DiscoveryResult r = emotibit::discover (targets, cfg.discoveryPort, timeout,
         cfg.params.serial_number, [this] { return stop_.load (); }, &probes_);
     if (r.cancelled)
         return false;
+    if (!r.found && !typed.empty () && cfg.broadcastFallback)
+    {
+        // The remembered IP did not answer: the EmotiBit may have a new
+        // address on this subnet.
+        const std::vector<std::string> bc = emotibit::ipv4BroadcastAddresses ();
+        emit progress (QStringLiteral ("no answer at %1; broadcast discovery on %2 (same subnet only, up to %3 s)…")
+                           .arg (QString::fromStdString (typed),
+                               bc.empty () ? QStringLiteral ("no interface") : joinTargets (bc), secs));
+        setPhase (PhaseDiscovering); // restarts the elapsed / timeout readout
+        probes_.store (0);
+        r = emotibit::discover (bc, cfg.discoveryPort, timeout, cfg.params.serial_number,
+            [this] { return stop_.load (); }, &probes_);
+        if (r.cancelled)
+            return false;
+        if (!r.found)
+        {
+            failKind_.store (r.anySendOk ? FailNotFound : FailNoSend);
+            throw std::runtime_error (discoveryFailureText (r, std::string (), timeout).toStdString ());
+        }
+    }
     if (!r.found)
     {
         failKind_.store (r.anySendOk ? FailNotFound : FailNoSend);
@@ -454,8 +488,11 @@ void DeviceWorker::run (DeviceConfig cfg, std::vector<SignalChannel> chans)
         {
             struct stat st;
             if (::stat (cfg.params.serial_port.c_str (), &st) != 0)
+            {
+                failKind_.store (FailNotFound);
                 throw std::runtime_error ("serial port " + cfg.params.serial_port +
-                    " does not exist (dongle unplugged? press the refresh button)");
+                    " does not exist (dongle unplugged? press the rescan button)");
+            }
         }
 
         // EmotiBit: find the device without holding BrainFlow's global lock.
@@ -499,6 +536,11 @@ void DeviceWorker::run (DeviceConfig cfg, std::vector<SignalChannel> chans)
     catch (const BrainFlowException &e)
     {
         error = cleanWhat (e) + ": " + describeError (e.exit_code, cfg.boardId);
+        const auto code = static_cast<BrainFlowExitCodes> (e.exit_code);
+        if (cfg.boardId == static_cast<int> (BoardIds::CYTON_BOARD) &&
+            (code == BrainFlowExitCodes::UNABLE_TO_OPEN_PORT_ERROR || code == BrainFlowExitCodes::SET_PORT_ERROR ||
+                code == BrainFlowExitCodes::PORT_ALREADY_OPEN_ERROR || code == BrainFlowExitCodes::BOARD_NOT_READY_ERROR))
+            failKind_.store (FailPortBusy);
     }
     catch (const std::exception &e)
     {
@@ -589,6 +631,20 @@ void DeviceWorker::pollLoop (
     ptrs.reserve (8);
     int lastPkg = -1;
 
+    // Heart rate from the PPG channels (display samples, after re-timing).
+    SignalChannel *hrChannel = nullptr;
+    double ppgRate = 25.0;
+    for (SignalChannel &ch : chans)
+    {
+        if (ch.spec.derived && ch.spec.key == SignalKeys::EmotiHeartRate)
+            hrChannel = &ch;
+        if (ch.spec.heartRateInput >= 0 && ch.spec.nominalRate > 0.0)
+            ppgRate = ch.spec.nominalRate;
+    }
+    HeartRate::Tracker hrTracker (ppgRate);
+    std::vector<HeartRate::Sample> hrOut;
+    std::vector<double> ppgTest; // test hook: synthetic PPG values
+
     const double streamStart = wallClockSeconds ();
     double lastData = streamStart;
     bool stalled = false;
@@ -609,6 +665,8 @@ void DeviceWorker::pollLoop (
                     fc.stages.push_back (Biquad::highPass (fs, hpHz_.load ()));
                 if (notchOn_.load ())
                     fc.stages.push_back (Biquad::notch (fs, notchHz_.load (), 30.0));
+                if (lpOn_.load ())
+                    fc.stages.push_back (Biquad::lowPass (fs, lpHz_.load ()));
                 filters[i] = fc; // fresh (reset) state
             }
         }
@@ -641,10 +699,11 @@ void DeviceWorker::pollLoop (
                 dropped_.fetch_add (Readouts::packageGaps (
                     lastPkg, data.get_address (cfg.packageNumRow), static_cast<std::size_t> (n)));
 
+            double hrNow = -std::numeric_limits<double>::infinity (); // newest PPG time fed this poll
             for (std::size_t i = 0; i < chans.size (); ++i)
             {
                 SignalChannel &ch = chans[i]; // persistent: the retimer keeps state across polls
-                if (ch.spec.preset != preset)
+                if (ch.spec.preset != preset || ch.spec.derived)
                     continue;
                 if (ch.spec.timestampRow < 0 || ch.spec.timestampRow >= rows)
                     continue;
@@ -710,6 +769,25 @@ void DeviceWorker::pollLoop (
                     ts = tsBuf.data ();
                 }
 
+                if (ch.spec.heartRateInput >= 0 && hrChannel)
+                {
+                    if (cfg.testPpgBpm > 0.0)
+                    {
+                        // test hook: a distinct synthetic waveform per PPG colour
+                        static constexpr double dc[3] = {118000.0, 64000.0, 152000.0};
+                        static constexpr double amp[3] = {900.0, 420.0, 640.0};
+                        const int c = std::clamp (ch.spec.heartRateInput, 0, 2);
+                        ppgTest.resize (static_cast<std::size_t> (m));
+                        for (int k = 0; k < m; ++k)
+                            ppgTest[static_cast<std::size_t> (k)] =
+                                HeartRate::syntheticPpg (ts[k], cfg.testPpgBpm, dc[c], amp[c]) +
+                                0.35 * amp[c] * std::sin (2.0 * M_PI * 0.2 * ts[k] + c);
+                        ptrs[0] = ppgTest.data ();
+                    }
+                    hrTracker.process (ch.spec.heartRateInput, ts, ptrs[0], static_cast<std::size_t> (m));
+                    hrNow = std::max (hrNow, ts[m - 1]);
+                }
+
                 if (ch.rawChannel >= 0)
                 {
                     const double *raw = ptrs[0];
@@ -731,6 +809,19 @@ void DeviceWorker::pollLoop (
                     ptrs.push_back (raw);
                 }
                 ch.ring->append (ts, ptrs.data (), static_cast<std::size_t> (m));
+            }
+
+            if (hrChannel && std::isfinite (hrNow))
+            {
+                hrOut.clear ();
+                hrTracker.update (hrNow, hrOut);
+                for (const HeartRate::Sample &hs : hrOut)
+                {
+                    const double v[HeartRateRing::Count] = {hs.bpm, hs.quality, static_cast<double> (hs.source),
+                        static_cast<double> (hs.beats), hs.periodicity};
+                    const double *vp[HeartRateRing::Count] = {&v[0], &v[1], &v[2], &v[3], &v[4]};
+                    hrChannel->ring->append (&hs.t, vp, 1);
+                }
             }
         }
 

@@ -173,6 +173,7 @@ struct Sample
     double t = 0.0;
     double bpm = std::numeric_limits<double>::quiet_NaN ();
     double quality = 0.0;
+    double periodicity = 0.0;
     int source = SourceNone;
     int beats = 0;
 };
