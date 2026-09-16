@@ -1,5 +1,9 @@
 * text=auto
 *.sh text eol=lf
+*.yml text eol=lf
+# applied with git apply on every platform: keep LF even with core.autocrlf=true
+*.patch text eol=lf
+*.ps1 text
 
 *.ttf binary
 *.otf binary

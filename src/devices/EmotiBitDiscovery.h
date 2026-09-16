@@ -33,7 +33,7 @@ struct DiscoveryResult
     std::string serial;               // serial number from the HELLO_HOST (may be empty)
     std::vector<std::string> targets; // addresses the HELLO_EMOTIBIT was sent to
     bool anySendOk = false;           // at least one sendto() succeeded
-    int lastSendErrno = 0;            // errno of the last failed sendto()
+    int lastSendErrno = 0;            // error code of the last failed sendto() (errno / WSAGetLastError)
     std::string error;                // reason when !found && !cancelled
     double seconds = 0.0;             // time spent
 };
@@ -41,6 +41,9 @@ struct DiscoveryResult
 // IPv4 broadcast addresses (address | ~netmask) of every interface that is up
 // and not loopback -- BrainFlow's own list, minus 127.255.255.255 and /32s.
 std::vector<std::string> ipv4BroadcastAddresses ();
+
+// Text for DiscoveryResult::lastSendErrno (strerror / FormatMessage).
+std::string socketErrorText (int code);
 
 // The HELLO_EMOTIBIT datagram, byte-identical to BrainFlow's
 // create_package (HELLO_EMOTIBIT, 0, "", 0).

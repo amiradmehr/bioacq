@@ -1,17 +1,17 @@
 #include "EmotiBitDiscovery.h"
 
-#include <arpa/inet.h>
-#include <fcntl.h>
+#include "Sockets.h"
+
+#ifdef _WIN32
+#include <iphlpapi.h>
+#else
 #include <ifaddrs.h>
 #include <net/if.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#endif
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 
 namespace emotibit
@@ -36,6 +36,58 @@ std::vector<std::string> splitNonEmpty (const std::string &s, char delim)
 
 } // namespace
 
+namespace
+{
+
+void addUnique (std::vector<std::string> &out, const struct in_addr &bcast)
+{
+    char buf[INET_ADDRSTRLEN] = {0};
+    if (!inet_ntop (AF_INET, &bcast, buf, sizeof (buf)))
+        return;
+    const std::string s = buf;
+    if (s != "0.0.0.0" && std::find (out.begin (), out.end (), s) == out.end ())
+        out.push_back (s);
+}
+
+} // namespace
+
+#ifdef _WIN32
+std::vector<std::string> ipv4BroadcastAddresses ()
+{
+    // Same rule as below: address | ~netmask of every IPv4 interface that is up,
+    // minus loopback and host (/32) routes.
+    std::vector<std::string> out;
+    ULONG size = 16384;
+    std::vector<unsigned char> buf;
+    ULONG rc = ERROR_BUFFER_OVERFLOW;
+    for (int attempt = 0; attempt < 4 && rc == ERROR_BUFFER_OVERFLOW; ++attempt)
+    {
+        buf.resize (size);
+        rc = GetAdaptersAddresses (AF_INET,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr,
+            reinterpret_cast<PIP_ADAPTER_ADDRESSES> (buf.data ()), &size);
+    }
+    if (rc != NO_ERROR)
+        return out;
+    for (auto *ad = reinterpret_cast<PIP_ADAPTER_ADDRESSES> (buf.data ()); ad; ad = ad->Next)
+    {
+        if (ad->OperStatus != IfOperStatusUp || ad->IfType == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue;
+        for (auto *ua = ad->FirstUnicastAddress; ua; ua = ua->Next)
+        {
+            const struct sockaddr *sa = ua->Address.lpSockaddr;
+            if (!sa || sa->sa_family != AF_INET || ua->OnLinkPrefixLength >= 32)
+                continue;
+            const std::uint32_t mask =
+                ua->OnLinkPrefixLength == 0 ? 0u : (0xFFFFFFFFu << (32 - ua->OnLinkPrefixLength));
+            struct in_addr bcast;
+            bcast.s_addr = reinterpret_cast<const struct sockaddr_in *> (sa)->sin_addr.s_addr | htonl (~mask);
+            addUnique (out, bcast);
+        }
+    }
+    return out;
+}
+#else
 std::vector<std::string> ipv4BroadcastAddresses ()
 {
     std::vector<std::string> out;
@@ -61,15 +113,16 @@ std::vector<std::string> ipv4BroadcastAddresses ()
                 ~reinterpret_cast<struct sockaddr_in *> (ifa->ifa_netmask)->sin_addr.s_addr;
         else
             continue;
-        char buf[INET_ADDRSTRLEN] = {0};
-        if (!inet_ntop (AF_INET, &bcast, buf, sizeof (buf)))
-            continue;
-        const std::string s = buf;
-        if (s != "0.0.0.0" && std::find (out.begin (), out.end (), s) == out.end ())
-            out.push_back (s);
+        addUnique (out, bcast);
     }
     freeifaddrs (ifap);
     return out;
+}
+#endif
+
+std::string socketErrorText (int code)
+{
+    return netsock::errorText (code);
 }
 
 std::string helloEmotibitPacket ()
@@ -125,20 +178,21 @@ DiscoveryResult discover (const std::vector<std::string> &targets, int port, dou
         return r;
     }
 
-    const int fd = ::socket (AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (fd < 0)
+    const netsock::Session session;
+    const netsock::Socket fd = session.ok () ? netsock::openUdp () : netsock::kInvalidSocket;
+    if (fd == netsock::kInvalidSocket)
     {
-        r.lastSendErrno = errno;
-        r.error = std::string ("cannot create a UDP socket: ") + std::strerror (errno);
+        r.lastSendErrno = netsock::lastError ();
+        r.error = "cannot create a UDP socket: " + netsock::errorText (r.lastSendErrno);
         r.seconds = elapsed ();
         return r;
     }
-    int on = 1;
-    ::setsockopt (fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof (on));
+    netsock::setBroadcast (fd);
 #ifdef SO_NOSIGPIPE
+    int on = 1;
     ::setsockopt (fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof (on));
 #endif
-    ::fcntl (fd, F_SETFL, ::fcntl (fd, F_GETFL, 0) | O_NONBLOCK);
+    netsock::setNonBlocking (fd);
 
     const std::string hello = helloEmotibitPacket ();
     std::vector<char> buf (32768);
@@ -156,12 +210,11 @@ DiscoveryResult discover (const std::vector<std::string> &targets, int port, dou
         {
             for (const struct sockaddr_in &a : addrs)
             {
-                const ssize_t n = ::sendto (fd, hello.data (), hello.size (), 0,
-                    reinterpret_cast<const struct sockaddr *> (&a), sizeof (a));
-                if (n == static_cast<ssize_t> (hello.size ()))
+                const long n = netsock::sendTo (fd, hello.data (), hello.size (), a);
+                if (n == static_cast<long> (hello.size ()))
                     r.anySendOk = true;
                 else
-                    r.lastSendErrno = errno;
+                    r.lastSendErrno = netsock::lastError ();
             }
             nextSend = el + 1.0; // re-greet once per second (UDP may drop packets)
             if (probesSent)
@@ -170,20 +223,12 @@ DiscoveryResult discover (const std::vector<std::string> &targets, int port, dou
         if (el > timeoutSec)
             break;
 
-        struct pollfd p;
-        p.fd = fd;
-        p.events = POLLIN;
-        p.revents = 0;
-        const int pr = ::poll (&p, 1, 100);
-        if (pr <= 0 || !(p.revents & POLLIN))
+        if (netsock::waitReadable (fd, 100) <= 0)
             continue;
         for (;;)
         {
             struct sockaddr_in from;
-            socklen_t fl = sizeof (from);
-            std::memset (&from, 0, sizeof (from));
-            const ssize_t n = ::recvfrom (fd, buf.data (), buf.size (), 0,
-                reinterpret_cast<struct sockaddr *> (&from), &fl);
+            const long n = netsock::recvFrom (fd, buf.data (), buf.size (), &from);
             if (n <= 0)
                 break;
             std::string serial;
@@ -202,13 +247,12 @@ DiscoveryResult discover (const std::vector<std::string> &targets, int port, dou
         if (r.found)
             break;
     }
-    ::close (fd);
+    netsock::closeSocket (fd);
 
     if (!r.found && !r.cancelled)
     {
         if (!r.anySendOk)
-            r.error = std::string ("could not send the discovery packet (") +
-                std::strerror (r.lastSendErrno) + ")";
+            r.error = "could not send the discovery packet (" + netsock::errorText (r.lastSendErrno) + ")";
         else
             r.error = "no EmotiBit answered";
     }

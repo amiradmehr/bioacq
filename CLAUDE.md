@@ -7,10 +7,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This folder is the `bioacq` repository (GitHub `amiradmehr/bioacq`, private). `bioacq` is a C++17 / Qt6 Widgets real-time viewer that streams two devices through the BrainFlow C++ API: an OpenBCI Cyton (serial dongle, EXG channel 1) and an EmotiBit (WiFi: temperature, PPG green, accel/gyro/mag). `README.md` specifies the UI behaviour, modes, networking and known limitations in detail. Read the relevant section before changing behaviour, and update it when behaviour changes.
 
 - `CMakeLists.txt`: the build (target `bioacq`).
-- `src/app/`: `main.cpp`, `BuildConfig.h.in`. `src/core/`: `RingBuffer.h`, `RateMeter.h`, `Readouts.h`, `Decimate.h`. `src/dsp/`: `Biquad.h`. `src/devices/`: `DeviceWorker`, `EmotiBitDiscovery`, `SignalSpec`, `Retimer.h`. `src/ui/`: `MainWindow`, `PlotWidget`, `Widgets`, `Theme`. `src/tools/`: `Headless` (selftest, probe). Every `src/` subfolder is an include directory, so includes are plain `#include "X.h"`.
-- `resources/fonts/`: the embedded TTFs and OFL texts (served at `:/fonts/...`).
-- `scripts/`: `build.sh`, `run.sh`.
-- `third_party/brainflow/`: the local BrainFlow patch and its build instructions.
+- `src/app/`: `main.cpp`, `BuildConfig.h.in`. `src/core/`: `RingBuffer.h`, `RateMeter.h`, `Readouts.h`, `Decimate.h`. `src/dsp/`: `Biquad.h`. `src/devices/`: `DeviceWorker`, `EmotiBitDiscovery`, `SignalSpec`, `Retimer.h`. `src/ui/`: `MainWindow`, `PlotWidget`, `Widgets`, `Theme`. `src/tools/`: `Headless` (selftest, probe). `src/platform/`: `Sockets.h`, `SerialPorts`, `AppPaths`, `ProcessSetup`, `compat/win32/sys/resource.h`. Every `src/` subfolder is an include directory, so includes are plain `#include "X.h"`.
+- `resources/fonts/`: the embedded TTFs and OFL texts (served at `:/fonts/...`). `resources/macos/` (`Info.plist.in`, `BioAcq.icns`) and `resources/windows/` (`bioacq.rc.in`, `BioAcq.ico`) are the package resources.
+- `scripts/`: `build.sh`, `run.sh` (development build); `build_brainflow.sh` / `.ps1`; `package_macos.sh`, `package_windows.ps1`; `run_cli_windows.ps1`.
+- `.github/workflows/`: `windows.yml` (runs on push), `macos.yml` (manual only, never trigger it casually: macOS minutes cost 10x on this private repo).
+- `third_party/brainflow/`: the local BrainFlow patch, BrainFlow's licence and the build instructions.
 - `prototype/stream_gui.py` is the original PySide6 + pyqtgraph prototype, now superseded. The user rejected Python for real-time streaming UIs as too slow, so new work goes into the C++/Qt code.
 - `design/Biosignal streaming GUI system.zip` is the Claude Design export that serves as the visual spec (`Instrument Screen.dc.html`, `Component Sheet.dc.html`, `Biosignal GUI.dc.html`). The `src/ui/Theme.h` tokens and the pixel sizes in `src/ui/Widgets.cpp` / `src/ui/PlotWidget.cpp` mirror it. Read it without extracting: `unzip -p "design/Biosignal streaming GUI system.zip" "Instrument Screen.dc.html"`. Its `_ds/` folder is the author's website design system and only supplies the font families. The instrument colours are inline hex in the `.dc.html` files.
 - Branches: `main` holds the source; `mac` / `windows` hold double-clickable builds.
@@ -29,7 +30,8 @@ scripts/run.sh [args]      # build if needed, then exec the binary with args
 - The build tree is kept outside Google Drive on purpose, at `~/.local/build/bioacq` (override with `BIOACQ_BUILD_DIR`; `STREAM_GUI_BUILD_DIR` is still accepted as a fallback). The binary and `compile_commands.json` are there. clangd won't find `compile_commands.json` on its own.
 - `build.sh` only runs the CMake configure step when there's no cache, so `BRAINFLOW_ROOT` / `QT_PREFIX` overrides need `--clean`. The default recording folder is `BIOACQ_RECORD_DIR`: `recordings/` at the repo root, inside Drive and gitignored. It's a CMake cache variable baked in through `src/app/BuildConfig.h.in`, and `--record-dir` overrides it at runtime.
 - Dependencies: Homebrew Qt 6 (`/opt/homebrew/opt/qt`), CMake ≥ 3.21, Ninja, and BrainFlow 5.23.0 installed in `~/.local/brainflow` (patched, see below).
-- `CMakeLists.txt` lists every source and header explicitly in `add_executable`, so new files must be added there. AUTOMOC is on, and the fonts are compiled in with `qt_add_resources`.
+- `CMakeLists.txt` lists every source and header explicitly in `add_executable`, so new files must be added there (Windows-only files go in the `if(WIN32)` `target_sources`). AUTOMOC is on, and the fonts are compiled in with `qt_add_resources`. BrainFlow is found directly under `BRAINFLOW_ROOT` (`inc/`, `lib/`), not through its `brainflowConfig.cmake`, which hard-codes the install prefix.
+- Packaged builds: `-DBIOACQ_PACKAGED=ON` (records into `Documents/BioAcq Recordings`; on macOS builds `BioAcq.app`, target output name `BioAcq`). `scripts/package_macos.sh` builds, deploys, signs and verifies `dist/macos/BioAcq.app` + `dist/BioAcq-macos-arm64.zip`; `scripts\package_windows.ps1` produces `dist\windows\BioAcq\BioAcq.exe` + `dist\BioAcq-windows-x64.zip`. `dist/` is gitignored on `main`. Use a separate `BIOACQ_BUILD_DIR` for packaging.
 
 ## Testing
 
@@ -95,11 +97,11 @@ Filterable signals also keep their unfiltered value in an extra ring channel, wh
 Recordings are BrainFlow file streamers added to the running session:
 - They keep BrainFlow's raw rows and timestamps.
 - They're tab-separated with no header, despite the `.csv` name, and each file comes with a `*_columns.json` sidecar.
-- `DeviceWorker.cpp` falls back to `~/bioacq_recordings` when the folder can't be created, is longer than BrainFlow's 512-byte streamer path, or contains `:`.
+- `DeviceWorker.cpp` falls back to `~/bioacq_recordings` (`fallbackRecordDir ()`) when the folder can't be created, is longer than BrainFlow's 512-byte streamer path, or contains `:` other than a Windows drive letter's.
 
 **Defined in more than one place (keep in sync).**
 - `DeviceConfig` is built in `MainWindow::connectDeviceWith` (GUI) and in `makeConfig` in `Headless.cpp` (selftest and probe). Change both, or the selftest stops testing what the GUI actually does.
-- The Cyton port, EmotiBit IP and discovery-timeout defaults are in `main.cpp` (`Args` and the `usage ()` text), in `LaunchOptions` in `MainWindow.h`, and in `ProbeOptions` in `Headless.h`.
+- The Cyton port, EmotiBit IP and discovery-timeout defaults are in `main.cpp` (`Args` and the `usage ()` text), in `LaunchOptions` in `MainWindow.h`, and in `ProbeOptions` in `Headless.h`. The Cyton port default is empty, meaning auto-detect: `findCytonDongle ()` (`SerialPorts.h`) in `main.cpp` for the GUI and in `runProbe`.
 - Readout thresholds and formatting live in `Readouts.h` (header-only, no widgets). `unitChecks` in `Headless.cpp` asserts them, and the README's "Using the GUI" section restates them.
 
 **Rendering performance.** `PlotWidget` depends on four performance choices:
@@ -110,6 +112,15 @@ Recordings are BrainFlow file streamers added to the running session:
 
 Re-measure with `--screenshot` before trading any of these for looks.
 
+## Platforms (macOS, Windows)
+
+- Keep platform `#ifdef`s in `src/platform/`. Plain UDP code uses `netsock::` from `Sockets.h` (POSIX sockets / Winsock with `WSAStartup`, `closesocket`, `ioctlsocket`, `WSAPoll`); `Readouts.h` keeps calling `getrusage`, which Windows gets from `compat/win32/sys/resource.h` (on the include path of Windows builds only). `M_PI` comes from `_USE_MATH_DEFINES`, set with `NOMINMAX` and `WIN32_LEAN_AND_MEAN` for the whole target on Windows.
+- MSVC builds with `/utf-8` (the sources contain UTF-8 literals) and `/permissive-`. Don't include `<windows.h>` from headers that UI code includes.
+- Serial ports: `listSerialPorts ()` / `findCytonDongle ()` (Qt SerialPort, FTDI 0403:6015) and `serialPortExists ()`. Port strings are BrainFlow's: `COM3` on Windows, `/dev/cu.*` on macOS. `--list-ports` prints them.
+- `BioAcq.exe` is a GUI-subsystem program (`WIN32_EXECUTABLE`): `attachParentConsole ()` in `main ()` makes the CLI modes print to the calling console. cmd / PowerShell don't wait for it; use `scripts\run_cli_windows.ps1` (or `start /wait`) for exit codes. `raiseTimerResolution ()` sets 1 ms timers (otherwise the 10 / 15 ms polls stretch to 15.6 ms).
+- On Windows, BrainFlow must be built with `-DMSVC_RUNTIME=dynamic` (`build_brainflow.ps1` does), or linking its static C++ binding next to Qt fails on the runtime mismatch.
+- CI: `windows.yml` builds BrainFlow (cached), runs `package_windows.ps1`, then `--selftest` and `--screenshot --state live --size 1600x1000` on the packaged folder with Qt removed from `PATH`. Check a run with `gh run list --workflow windows.yml` / `gh run view <id> --log-failed`; artifacts `BioAcq-windows-x64` and `bioacq-windows-screenshot`.
+
 ## Local BrainFlow patch
 
 `~/.local/brainflow` is built from `~/.local/src/brainflow` (v5.23.0) with one fix in `src/board_controller/emotibit/emotibit.cpp`, around line 376 (diff and build steps in `third_party/brainflow/`). The ancillary 2× upsampling writes `anc_packages[i * 2 + 1]`, and the change is marked `patched (stream_gui_cpp)`. Re-apply it after any BrainFlow rebuild or update, or the EmotiBit temperature shows stale duplicate values. To check that it's in place:
@@ -117,6 +128,8 @@ Re-measure with `--screenshot` before trading any of these for looks.
 ```bash
 grep -n "patched (stream_gui_cpp)" ~/.local/src/brainflow/src/board_controller/emotibit/emotibit.cpp
 ```
+
+`scripts/build_brainflow.sh [prefix]` / `scripts\build_brainflow.ps1 -Prefix <dir>` clone 5.23.0 into a separate checkout (`~/.local/src/brainflow-5.23.0`), apply the patch and install; they don't touch `~/.local/src/brainflow`. Don't run them with the default prefix unless you mean to replace `~/.local/brainflow`.
 
 ## Code style
 

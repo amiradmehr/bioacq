@@ -4,3 +4,5 @@
 #define BIOACQ_VERSION "@PROJECT_VERSION@"
 #define BIOACQ_RECORD_DIR "@BIOACQ_RECORD_DIR@"
 #define BIOACQ_BRAINFLOW_LIB_DIR "@brainflow_LIBRARY_DIRS@"
+// 1 for distribution builds (CMake -DBIOACQ_PACKAGED=ON), else 0
+#cmakedefine01 BIOACQ_PACKAGED
