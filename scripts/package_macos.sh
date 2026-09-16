@@ -13,7 +13,8 @@
 # --screenshot, macOS style) -> macdeployqt (Qt frameworks and their
 # dependencies) -> BrainFlow core dylibs into Contents/Frameworks -> install
 # names and rpaths relative to the bundle -> LSMinimumSystemVersion from the
-# bundled binaries ->
+# bundled binaries -> licences into Contents/Resources/licenses (fonts,
+# BrainFlow, Qt, and the Homebrew libraries a Homebrew Qt pulls in) ->
 # ad-hoc codesign -> verify (signature, no /opt/homebrew or /Users paths in any
 # load command or rpath, --selftest and --screenshot from inside the bundle
 # with every loaded image inside the bundle, fonts registered, a launch via
@@ -164,6 +165,82 @@ done | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
 /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion $min_os" "$APP/Contents/Info.plist"
 echo "  $min_os (highest minimum of all bundled binaries)"
 
+# ---------------------------------------------------------------- licences
+# Before signing: Contents/Resources is sealed by the signature.
+step "licences"
+LICENSES="$APP/Contents/Resources/licenses"
+rm -rf "$LICENSES"
+mkdir -p "$LICENSES"
+cp "$ROOT_DIR"/resources/fonts/*-OFL.txt "$LICENSES/"
+cp "$ROOT_DIR/third_party/brainflow/LICENSE" "$LICENSES/BrainFlow-LICENSE.txt"
+cp "$ROOT_DIR/third_party/brainflow/README.md" "$LICENSES/BrainFlow-patch-README.md"
+cp "$ROOT_DIR/third_party/qt/README.md" "$LICENSES/Qt-NOTICE.md"
+cp "$ROOT_DIR/third_party/qt/LGPL-3.0.txt" "$LICENSES/Qt-LGPL-3.0.txt"
+cp "$ROOT_DIR/third_party/qt/GPL-3.0.txt" "$LICENSES/Qt-GPL-3.0.txt"
+echo "  fonts (OFL), BrainFlow (MIT), Qt (LGPL-3.0 + GPL-3.0 texts, notice)"
+# Libraries macdeployqt copied from outside Qt (a Homebrew Qt pulls in ICU,
+# OpenSSL, GLib, HarfBuzz, ...): each one's licence files from its Homebrew keg,
+# and a summary with the formula version and SPDX licence.
+brew_prefix=""
+if command -v brew >/dev/null; then
+    brew_prefix="$(brew --prefix 2>/dev/null || true)"
+fi
+extra_libs=()
+for f in "$FRAMEWORKS"/*.dylib; do
+    [[ -e "$f" ]] || continue
+    base="$(basename "$f")"
+    case " ${BRAINFLOW_LIBS[*]} " in *" $base "*) continue ;; esac
+    extra_libs+=("$base")
+done
+if [[ ${#extra_libs[@]} -gt 0 ]]; then
+    [[ -n "$brew_prefix" ]] || fail "bundled libraries ${extra_libs[*]} come from outside Qt, but brew is not available to find their licences"
+    mkdir -p "$LICENSES/homebrew"
+    summary="$LICENSES/homebrew/THIRD-PARTY.txt"
+    formulae=()
+    rows=()
+    for base in "${extra_libs[@]}"; do
+        src="$(ls -d "$brew_prefix"/opt/*/lib/"$base" 2>/dev/null | head -1 || true)"
+        [[ -n "$src" ]] || fail "no Homebrew keg provides $base: cannot ship its licence"
+        keg="$(cd "$(dirname "$src")/.." && pwd -P)"
+        formula="$(basename "$(dirname "$keg")")"
+        version="$(basename "$keg")"
+        if [[ ! -d "$LICENSES/homebrew/$formula" ]]; then
+            mkdir -p "$LICENSES/homebrew/$formula"
+            find "$keg" -maxdepth 1 -type f \( -iname 'LICEN[CS]E*' -o -iname 'COPYING*' -o -iname 'NOTICE*' \
+                -o -iname 'COPYRIGHT*' -o -iname '*GPL*' \) -exec cp {} "$LICENSES/homebrew/$formula/" \;
+            formulae+=("$formula")
+        fi
+        rows+=("$base $formula $version")
+    done
+    spdx_json="$(HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 watchdog 120 brew info --json=v2 --formula "${formulae[@]}" 2>/dev/null || true)"
+    {
+        echo "Libraries bundled in BioAcq.app/Contents/Frameworks besides Qt and BrainFlow."
+        echo "macdeployqt copied them from Homebrew as dependencies of Homebrew's Qt. Each formula's licence files"
+        echo "are in the folder of the same name; the licence column is Homebrew's SPDX expression."
+        echo
+        printf '%-32s %-20s %-14s %s\n' library formula version licence
+        for row in "${rows[@]}"; do
+            read -r base formula version <<<"$row"
+            spdx="$(printf '%s' "$spdx_json" | /usr/bin/python3 -c 'import json, sys
+try:
+    data = json.load(sys.stdin)
+    print(next((f.get("license") or "?") for f in data["formulae"] if f["name"] == sys.argv[1]))
+except Exception:
+    print("?")' "$formula" 2>/dev/null || echo "?")"
+            printf '%-32s %-20s %-14s %s\n' "$base" "$formula" "$version" "$spdx"
+        done
+    } > "$summary"
+    for formula in "${formulae[@]}"; do
+        if [[ -z "$(ls -A "$LICENSES/homebrew/$formula")" ]]; then
+            grep -E "^[^ ]+ +$formula " "$summary" | grep -qv ' ?$' ||
+                fail "no licence file and no SPDX licence for Homebrew formula $formula"
+            echo "  $formula: no licence file in the keg (SPDX licence in THIRD-PARTY.txt)"
+            rmdir "$LICENSES/homebrew/$formula"
+        fi
+    done
+    echo "  ${#extra_libs[@]} Homebrew libraries from ${#formulae[@]} formulae: licences in Resources/licenses/homebrew"
+fi
+
 # ---------------------------------------------------------------- sign
 step "ad-hoc codesign"
 xattr -cr "$APP"
@@ -197,6 +274,10 @@ for req in PlugIns/platforms/libqcocoa.dylib PlugIns/platforms/libqoffscreen.dyl
 done
 /usr/libexec/PlistBuddy -c "Print :NSLocalNetworkUsageDescription" "$APP/Contents/Info.plist" >/dev/null ||
     fail "Info.plist has no NSLocalNetworkUsageDescription"
+for req in Inter-OFL.txt JetBrainsMono-OFL.txt BrainFlow-LICENSE.txt Qt-NOTICE.md Qt-LGPL-3.0.txt Qt-GPL-3.0.txt; do
+    [[ -s "$APP/Contents/Resources/licenses/$req" ]] || fail "missing licence Contents/Resources/licenses/$req"
+done
+echo "  licences present (fonts, BrainFlow, Qt$([[ -d "$APP/Contents/Resources/licenses/homebrew" ]] && echo ', Homebrew libraries'))"
 
 rm -rf "$CHECK_DIR"
 mkdir -p "$CHECK_DIR"

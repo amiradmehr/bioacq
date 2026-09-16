@@ -10,8 +10,9 @@
     The folder holds the Qt runtime (windeployqt, release, no translations, only
     the platform and style plugins the app uses),
     the offscreen platform plugin (for --screenshot without a display), the
-    BrainFlow core DLLs and the MSVC runtime DLLs (app-local, so no VC++
-    redistributable install is needed).
+    BrainFlow core DLLs, the MSVC runtime DLLs (app-local, so no VC++
+    redistributable install is needed) and a licenses folder (fonts, BrainFlow,
+    Qt).
 
     Requirements: an MSVC x64 developer environment (cl.exe on PATH, e.g. the
     "x64 Native Tools" prompt or ilammy/msvc-dev-cmd), CMake, Ninja, Qt 6 for
@@ -101,11 +102,19 @@ if (-not $crt) { throw "no Microsoft.VC*.CRT folder under $env:VCToolsRedistDir\
 Copy-Item (Join-Path $crt.FullName '*.dll') $AppDir
 Write-Host "   MSVC runtime from $($crt.FullName)"
 
-# licences of what we ship
+# licences of what we ship: the fonts (OFL), BrainFlow (MIT, plus what the
+# local patch changes) and Qt (LGPLv3, which incorporates the GPLv3)
 $licenses = Join-Path $AppDir 'licenses'
 New-Item -ItemType Directory -Force -Path $licenses | Out-Null
 Copy-Item (Join-Path $RootDir 'resources\fonts\*-OFL.txt') $licenses
+Copy-Item (Join-Path $RootDir 'third_party\brainflow\LICENSE') (Join-Path $licenses 'BrainFlow-LICENSE.txt')
 Copy-Item (Join-Path $RootDir 'third_party\brainflow\README.md') (Join-Path $licenses 'BrainFlow-patch-README.md')
+Copy-Item (Join-Path $RootDir 'third_party\qt\README.md') (Join-Path $licenses 'Qt-NOTICE.md')
+Copy-Item (Join-Path $RootDir 'third_party\qt\LGPL-3.0.txt') (Join-Path $licenses 'Qt-LGPL-3.0.txt')
+Copy-Item (Join-Path $RootDir 'third_party\qt\GPL-3.0.txt') (Join-Path $licenses 'Qt-GPL-3.0.txt')
+foreach ($required in 'Inter-OFL.txt', 'JetBrainsMono-OFL.txt', 'BrainFlow-LICENSE.txt', 'Qt-NOTICE.md', 'Qt-LGPL-3.0.txt', 'Qt-GPL-3.0.txt') {
+    if (-not (Test-Path (Join-Path $licenses $required))) { throw "licence file missing from the package: $required" }
+}
 
 # ------------------------------------------------------------------ zip
 if (Test-Path $Zip) { Remove-Item -Force $Zip }
