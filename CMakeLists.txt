@@ -46,6 +46,8 @@ add_executable(bioacq
     src/core/Readouts.h
     src/core/RingBuffer.h
     src/dsp/Biquad.h
+    src/dsp/HeartRate.cpp
+    src/dsp/HeartRate.h
     src/devices/DeviceWorker.cpp
     src/devices/DeviceWorker.h
     src/devices/EmotiBitDiscovery.cpp

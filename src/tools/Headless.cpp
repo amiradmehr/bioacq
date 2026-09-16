@@ -4,6 +4,7 @@
 #include "Decimate.h"
 #include "DeviceWorker.h"
 #include "EmotiBitDiscovery.h"
+#include "HeartRate.h"
 #include "RateMeter.h"
 #include "Readouts.h"
 #include "Retimer.h"
@@ -319,6 +320,140 @@ bool allFinite (const std::vector<QPolygonF> &segs, int count)
     return true;
 }
 
+// Synthetic EmotiBit PPG through HeartRate::Tracker: 25 Hz with +-2 ms timing
+// jitter, delivered in 3-sample packets. Per channel: pulse rate (0 = no
+// pulse), white noise and baseline wander (0.25 Hz respiration 1.5 x and
+// 0.05 Hz drift 3 x the given fraction), both relative to the pulse amplitude.
+struct PpgChannelSim
+{
+    double bpm = 0.0;
+    double noise = 0.0;
+    double wander = 0.0;
+};
+
+struct HrSimResult
+{
+    std::vector<HeartRate::Sample> samples;
+    int sourceSwitches = 0;
+    const HeartRate::Sample *lastValid () const
+    {
+        for (std::size_t i = samples.size (); i-- > 0;)
+            if (std::isfinite (samples[i].bpm))
+                return &samples[i];
+        return nullptr;
+    }
+    int validCount () const
+    {
+        int n = 0;
+        for (const HeartRate::Sample &s : samples)
+            n += std::isfinite (s.bpm) ? 1 : 0;
+        return n;
+    }
+};
+
+HrSimResult simulateHeartRate (const PpgChannelSim ch[HeartRate::kSources], double seconds, unsigned seed)
+{
+    const double fs = 25.0, t0 = 1.7e9, amp = 800.0;
+    const double dc[HeartRate::kSources] = {120000.0, 90000.0, 150000.0};
+    std::mt19937 rng (seed);
+    std::normal_distribution<double> noise (0.0, 1.0);
+    std::uniform_real_distribution<double> jitter (-0.002, 0.002);
+    HeartRate::Tracker tracker (fs);
+    HrSimResult r;
+    double t[3];
+    double x[HeartRate::kSources][3];
+    int k = 0, last = HeartRate::SourceNone;
+    const int n = static_cast<int> (seconds * fs);
+    for (int i = 0; i < n; ++i)
+    {
+        const double ti = i / fs;
+        t[k] = t0 + ti + jitter (rng);
+        for (int c = 0; c < HeartRate::kSources; ++c)
+        {
+            double v = ch[c].bpm > 0.0 ? HeartRate::syntheticPpg (ti, ch[c].bpm, dc[c], amp) : dc[c];
+            v += ch[c].wander * amp *
+                (1.5 * std::sin (2.0 * M_PI * 0.25 * ti + c) + 3.0 * std::sin (2.0 * M_PI * 0.05 * ti + 1.0 + c));
+            v += ch[c].noise * amp * noise (rng);
+            x[c][k] = v;
+        }
+        if (++k < 3)
+            continue;
+        k = 0;
+        for (int c = 0; c < HeartRate::kSources; ++c)
+            tracker.process (c, t, x[c], 3);
+        tracker.update (t[2], r.samples);
+        if (tracker.source () != HeartRate::SourceNone && tracker.source () != last)
+        {
+            if (last != HeartRate::SourceNone)
+                ++r.sourceSwitches;
+            last = tracker.source ();
+        }
+    }
+    return r;
+}
+
+void heartRateChecks (Checker &check)
+{
+    // A clean-ish green channel at each rate; red noisier, IR noise only.
+    for (double bpm : {60.0, 72.0, 120.0, 180.0})
+    {
+        const PpgChannelSim ch[3] = {{bpm, 0.08, 0.3}, {bpm, 0.6, 0.3}, {0.0, 1.0, 0.3}};
+        const HrSimResult r = simulateHeartRate (ch, 20.0, static_cast<unsigned> (bpm));
+        const HeartRate::Sample *s = r.lastValid ();
+        const bool ok = s && std::isfinite (r.samples.back ().bpm) && std::fabs (s->bpm - bpm) <= 2.0 &&
+            s->source == HeartRate::SourceGreen;
+        check (ok, fmt ("heart rate: %.0f bpm synthetic PPG (noise + baseline wander, 25 Hz) -> %.2f bpm from GREEN, "
+                        "quality %.0f %%",
+                       bpm, s ? s->bpm : std::numeric_limits<double>::quiet_NaN (), s ? 100.0 * s->quality : 0.0));
+    }
+    // Reflectance counts drop at systole: beats must sit at the count minima
+    // (plus the band-pass delay), not at the diastolic maxima half a beat away.
+    {
+        HeartRate::BeatDetector d (25.0);
+        std::vector<double> t, x;
+        for (int i = 0; i < 500; ++i)
+        {
+            t.push_back (i / 25.0);
+            x.push_back (HeartRate::syntheticPpg (i / 25.0, 72.0, 120000.0, 800.0));
+        }
+        d.process (t.data (), x.data (), t.size ());
+        double sum = 0.0, sq = 0.0;
+        for (double b : d.beats ())
+        {
+            const double lag = b - HeartRate::systolicTime (b + 0.5 * 60.0 / 72.0, 72.0);
+            sum += lag;
+            sq += lag * lag;
+        }
+        const double nb = static_cast<double> (d.beats ().size ());
+        const double mean = nb > 0.0 ? sum / nb : std::numeric_limits<double>::quiet_NaN ();
+        const double sd = nb > 0.0 ? std::sqrt (std::max (0.0, sq / nb - mean * mean)) : 0.0;
+        check (nb >= 20 && mean >= 0.0 && mean <= 0.12 && sd < 0.01,
+            fmt ("heart rate: beats found on the INVERTED counts, %.0f beats %.3f s after the systolic count minima "
+                 "(sd %.4f s)",
+                nb, mean, sd));
+    }
+    {
+        const PpgChannelSim noise[3] = {{0.0, 1.0, 0.3}, {0.0, 1.0, 0.0}, {0.0, 1.0, 1.0}};
+        const PpgChannelSim flat[3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+        int noiseValid = 0;
+        for (unsigned seed = 1; seed <= 4; ++seed)
+            noiseValid += simulateHeartRate (noise, 30.0, seed).validCount ();
+        const HrSimResult f = simulateHeartRate (flat, 20.0, 1);
+        check (noiseValid == 0 && f.validCount () == 0 && !f.samples.empty (),
+            fmt ("heart rate: noise-only (4 x 30 s) -> %.0f HR values, flat -> %.0f HR values (status only)",
+                double (noiseValid), double (f.validCount ())));
+    }
+    {
+        const PpgChannelSim ch[3] = {{0.0, 1.0, 0.3}, {72.0, 0.08, 0.3}, {72.0, 0.5, 0.3}};
+        const HrSimResult r = simulateHeartRate (ch, 20.0, 7);
+        const HeartRate::Sample *s = r.lastValid ();
+        check (s && s->source == HeartRate::SourceRed && std::fabs (s->bpm - 72.0) <= 2.0 && r.sourceSwitches == 0,
+            fmt ("heart rate: source selection picks the clean channel (RED %.2f bpm; green noise, IR noisy), "
+                 "%.0f source switches",
+                s ? s->bpm : std::numeric_limits<double>::quiet_NaN (), double (r.sourceSwitches)));
+    }
+}
+
 void unitChecks (Checker &check)
 {
     // Ring buffer wrap-around
@@ -474,13 +609,31 @@ void unitChecks (Checker &check)
         };
         const std::size_t N = static_cast<std::size_t> (fs * 6), tail = static_cast<std::size_t> (fs * 3);
 
-        Biquad hp = Biquad::highPass (fs, 1.0);
+        Biquad hp = Biquad::highPass (fs, 0.5);
         std::vector<double> y (N);
         for (std::size_t i = 0; i < N; ++i)
-            y[i] = hp.process (-35000.0 + 50.0 * std::sin (2.0 * M_PI * 10.0 * i / fs));
+            y[i] = hp.process (-35000.0 + 50.0 * std::sin (2.0 * M_PI * 5.0 * i / fs));
         const double hpMean = meanOfTail (y, tail), hpRms = rmsOfTail (y, tail);
-        check (std::fabs (hpMean) < 0.5 && std::fabs (hpRms - 50.0 / std::sqrt (2.0)) < 2.0,
-            fmt ("high-pass 1 Hz: -35000 uV DC removed (mean %.3f), 10 Hz kept (rms %.2f of 35.36)", hpMean, hpRms));
+        FilterChain hpChain;
+        hpChain.stages.push_back (Biquad::highPass (fs, 0.5));
+        const double g05 = hpChain.gainAt (fs, 0.5), g01 = hpChain.gainAt (fs, 0.1);
+        check (std::fabs (hpMean) < 0.5 && std::fabs (hpRms - 50.0 / std::sqrt (2.0)) < 2.0 &&
+                std::fabs (g05 - std::sqrt (0.5)) < 0.01 && g01 < 0.05,
+            fmt ("high-pass 0.5 Hz: -35000 uV DC removed (mean %.3f), 5 Hz kept (rms %.2f of 35.36), 0.1 Hz gain %.3f",
+                hpMean, hpRms, g01));
+
+        Biquad lp = Biquad::lowPass (fs, 40.0);
+        for (std::size_t i = 0; i < N; ++i)
+            y[i] = lp.process (100.0 * std::sin (2.0 * M_PI * 10.0 * i / fs));
+        const double lpPass = rmsOfTail (y, tail) / (100.0 / std::sqrt (2.0));
+        Biquad lp2 = Biquad::lowPass (fs, 40.0);
+        for (std::size_t i = 0; i < N; ++i)
+            y[i] = lp2.process (100.0 * std::sin (2.0 * M_PI * 100.0 * i / fs));
+        const double lpStop = 20.0 * std::log10 (rmsOfTail (y, tail) / (100.0 / std::sqrt (2.0)));
+        FilterChain lpChain;
+        lpChain.stages.push_back (Biquad::lowPass (fs, 40.0));
+        check (std::fabs (lpPass - 1.0) < 0.03 && lpStop < -12.0 && std::fabs (lpChain.gainAt (fs, 40.0) - std::sqrt (0.5)) < 0.01,
+            fmt ("low-pass 40 Hz: 10 Hz gain %.3f, 100 Hz attenuated %.1f dB, -3 dB at 40 Hz", lpPass, lpStop));
 
         Biquad nt = Biquad::notch (fs, 60.0, 30.0);
         for (std::size_t i = 0; i < N; ++i)
@@ -493,6 +646,7 @@ void unitChecks (Checker &check)
         check (att < -30.0 && std::fabs (pass - 1.0) < 0.02,
             fmt ("notch 60 Hz: 60 Hz attenuated %.1f dB, 10 Hz gain %.3f", att, pass));
     }
+    heartRateChecks (check);
     // Signal resolution on the real board descriptors (no hardware needed)
     {
         std::vector<std::string> problems;
