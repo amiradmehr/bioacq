@@ -3,6 +3,7 @@
 #include "BuildConfig.h"
 #include "DeviceWorker.h"
 #include "EmotiBitDiscovery.h"
+#include "HeartRate.h"
 #include "PlotWidget.h"
 #include "RingBuffer.h"
 #include "Theme.h"
@@ -17,11 +18,13 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHostAddress>
 #include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QNetworkInterface>
 #include <QPainter>
 #include <QSettings>
@@ -43,16 +46,32 @@ namespace
 {
 
 // QSettings keys
-const char *kKeyPort = "cyton/port";
-const char *kKeyIp = "emotibit/ip";
+const char *kKeyPort = "cyton/port";                 // last port that connected (auto-detect prefers it)
+const char *kKeyPortOverride = "cyton/portOverride"; // the rail's port choice, "" = auto-detect
+const char *kKeyIp = "emotibit/ip";                  // the IP field ("" = last IP, then broadcast)
+const char *kKeyLastIp = "emotibit/lastIp";          // the last EmotiBit that answered
 const char *kKeyTimeout = "emotibit/timeout";
 const char *kKeyWindow = "display/windowSec";
-const char *kKeyDc = "cyton/removeDc";
-const char *kKeyHp = "cyton/highPass";
-const char *kKeyNotch = "cyton/notch";
+// ECG display filters. New keys (the old cyton/* ones are ignored) because the
+// defaults changed to all-on and the high-pass corner moved from 1 to 0.5 Hz.
+const char *kKeyDc = "ecg/removeDc";
+const char *kKeyHp = "ecg/highPass0p5Hz";
+const char *kKeyNotch = "ecg/notch60Hz";
+const char *kKeyLp = "ecg/lowPass40Hz";
 const char *kKeyRecord = "record/enabled";
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN ();
+constexpr double kEcgHighPassHz = 0.5;
+constexpr double kEcgNotchHz = 60.0;
+constexpr double kEcgLowPassHz = 40.0;
+
+const QKeySequence kConnectKey (Qt::CTRL | Qt::Key_K);
+const QKeySequence kRescanKey (Qt::CTRL | Qt::Key_R);
+
+QString keyText (const QKeySequence &k)
+{
+    return k.toString (QKeySequence::NativeText); // "⌘K" on macOS, "Ctrl+K" elsewhere
+}
 
 QString shortDeviceName (DeviceKind kind)
 {
@@ -113,11 +132,15 @@ QPushButton *makeButton (const QString &text, const char *variant, const char *s
     return b;
 }
 
-// Single-line label that elides instead of growing (folder paths).
+// Single-line label that elides instead of growing (folder paths: middle;
+// detail lines: right).
 class ElideLabel : public QLabel
 {
 public:
-    using QLabel::QLabel;
+    explicit ElideLabel (const QString &text = QString (), Qt::TextElideMode mode = Qt::ElideMiddle)
+        : QLabel (text), mode_ (mode)
+    {
+    }
     QSize minimumSizeHint () const override
     {
         return QSize (12, QLabel::minimumSizeHint ().height ());
@@ -134,8 +157,11 @@ protected:
         p.setFont (font ());
         p.setPen (palette ().color (QPalette::WindowText));
         p.drawText (rect (), static_cast<int> (alignment ()) | Qt::AlignVCenter,
-            fontMetrics ().elidedText (text (), Qt::ElideMiddle, width ()));
+            fontMetrics ().elidedText (text (), mode_, width ()));
     }
+
+private:
+    Qt::TextElideMode mode_;
 };
 
 // 12 px warning triangle from the design's error module.
@@ -195,6 +221,11 @@ QString b (const QString &s, const QColor &c)
     return QStringLiteral ("<b style=\"color:%1; font-weight:600;\">%2</b>").arg (c.name (), s.toHtmlEscaped ());
 }
 
+bool isAuto (const QString &port)
+{
+    return port.isEmpty () || port.compare (QStringLiteral ("Auto"), Qt::CaseInsensitive) == 0;
+}
+
 } // namespace
 
 // =============================================================================
@@ -202,6 +233,8 @@ MainWindow::MainWindow (const LaunchOptions &opts, QWidget *parent) : QMainWindo
 {
     if (opts_.recordDir.isEmpty ())
         opts_.recordDir = QString::fromUtf8 (BIOACQ_RECORD_DIR);
+    if (opts_.portSet)
+        portOverride_ = opts_.cytonPort; // an explicit --port is the rail's override
     if (opts_.useSettings)
         loadSettings ();
     opts_.emotibitTimeoutSec = std::clamp (opts_.emotibitTimeoutSec, 2, kMaxDiscoveryTimeoutSec);
@@ -239,16 +272,19 @@ MainWindow::MainWindow (const LaunchOptions &opts, QWidget *parent) : QMainWindo
     updateRecordUi ();
     updateWindowTitle ();
 
-    // Keyboard: Cmd+R rescans serial ports, Cmd+Shift+D connects / discovers the EmotiBit.
-    auto *rescan = new QShortcut (QKeySequence (Qt::CTRL | Qt::Key_R), this);
+    // Keyboard: Cmd/Ctrl+K connects (or cancels a pending connect; never
+    // disconnects), Cmd/Ctrl+R rescans serial ports.
+    auto *connectKey = new QShortcut (kConnectKey, this);
+    connect (connectKey, &QShortcut::activated, this, [this] {
+        if (anyConnecting ())
+            cancelPending ();
+        else if (!anyActive ())
+            connectAll ();
+    });
+    auto *rescan = new QShortcut (kRescanKey, this);
     connect (rescan, &QShortcut::activated, this, [this] {
         if (!portCombo_->isLocked () && portCombo_->isEnabled ())
             refreshPorts ();
-    });
-    auto *disc = new QShortcut (QKeySequence (Qt::CTRL | Qt::SHIFT | Qt::Key_D), this);
-    connect (disc, &QShortcut::activated, this, [this] {
-        if (!emotibit_.worker->isActive ())
-            connectDevice (DeviceKind::EmotiBit);
     });
 
     frameTimer_ = new QTimer (this);
@@ -285,10 +321,15 @@ MainWindow::~MainWindow ()
 void MainWindow::loadSettings ()
 {
     QSettings st;
-    if (!opts_.portSet && !st.value (kKeyPort).toString ().isEmpty ())
-        opts_.cytonPort = st.value (kKeyPort).toString ();
+    if (!opts_.portSet)
+    {
+        if (!st.value (kKeyPort).toString ().isEmpty ())
+            opts_.cytonPort = st.value (kKeyPort).toString ();
+        portOverride_ = st.value (kKeyPortOverride).toString ();
+    }
     if (!opts_.ipSet && st.contains (kKeyIp))
-        opts_.emotibitIp = st.value (kKeyIp).toString (); // may be "" = broadcast discovery
+        opts_.emotibitIp = st.value (kKeyIp).toString (); // may be "" = last IP, then broadcast
+    lastEmotibitIp_ = st.value (kKeyLastIp).toString ();
     if (!opts_.timeoutSet)
         opts_.emotibitTimeoutSec = st.value (kKeyTimeout, opts_.emotibitTimeoutSec).toInt ();
     if (!opts_.windowSet)
@@ -298,6 +339,7 @@ void MainWindow::loadSettings ()
     opts_.removeDc = st.value (kKeyDc, opts_.removeDc).toBool ();
     opts_.highPass = st.value (kKeyHp, opts_.highPass).toBool ();
     opts_.notch = st.value (kKeyNotch, opts_.notch).toBool ();
+    opts_.lowPass = st.value (kKeyLp, opts_.lowPass).toBool ();
 }
 
 void MainWindow::saveSettings ()
@@ -310,7 +352,9 @@ void MainWindow::saveSettings ()
     st.setValue (kKeyDc, dcToggle_->isChecked ());
     st.setValue (kKeyHp, hpToggle_->isChecked ());
     st.setValue (kKeyNotch, notchToggle_->isChecked ());
+    st.setValue (kKeyLp, lpToggle_->isChecked ());
     st.setValue (kKeyRecord, recordWanted_);
+    st.setValue (kKeyPortOverride, portOverride ());
 }
 
 void MainWindow::saveDeviceAddress (DeviceKind kind, const QString &address)
@@ -318,7 +362,13 @@ void MainWindow::saveDeviceAddress (DeviceKind kind, const QString &address)
     if (!opts_.useSettings || address.isEmpty ())
         return;
     QSettings st;
-    st.setValue (kind == DeviceKind::Cyton ? kKeyPort : kKeyIp, address);
+    if (kind == DeviceKind::Cyton)
+        st.setValue (kKeyPort, address);
+    else
+    {
+        st.setValue (kKeyIp, ipEdit_->text ().trimmed ());
+        st.setValue (kKeyLastIp, address);
+    }
 }
 
 // =============================================================== rail
@@ -382,6 +432,7 @@ QWidget *MainWindow::buildRail ()
     auto *cl = new QVBoxLayout (content);
     cl->setContentsMargins (0, 0, 0, 0);
     cl->setSpacing (0);
+    cl->addWidget (buildConnectModule ());
     cl->addWidget (buildCytonModule ());
     cl->addWidget (buildEmotibitModule ());
     cl->addWidget (buildDisplayModule ());
@@ -390,6 +441,18 @@ QWidget *MainWindow::buildRail ()
     rv->addWidget (scroll, 1);
     rv->addWidget (buildRecordModule ());
     return rail;
+}
+
+QWidget *MainWindow::buildConnectModule ()
+{
+    // Just the one button (its tooltip says what it does right now): the
+    // rail must fit 1280 x 800 with the discovery module open.
+    QVBoxLayout *v = nullptr;
+    QFrame *f = moduleFrame (v, "module", 11);
+    connectBtn_ = makeButton (QStringLiteral ("[ connect ]"), "primary", "lg", 32);
+    v->addWidget (connectBtn_);
+    connect (connectBtn_, &QPushButton::clicked, this, &MainWindow::onConnectButton);
+    return f;
 }
 
 QWidget *MainWindow::buildErrorBox (Slot &s)
@@ -438,7 +501,7 @@ QWidget *MainWindow::buildCytonModule ()
     QVBoxLayout *v = nullptr;
     QFrame *f = moduleFrame (v);
     cyton_.chip = new StatusChip;
-    v->addLayout (headerRow (QStringLiteral ("// CYTON · OPENBCI"), cyton_.chip));
+    v->addLayout (headerRow (QStringLiteral ("// CYTON · ECG"), cyton_.chip));
     v->addSpacing (9);
     v->addWidget (kicker (QStringLiteral ("// SERIAL PORT")));
     v->addSpacing (5);
@@ -449,62 +512,72 @@ QWidget *MainWindow::buildCytonModule ()
     portCombo_->setEditable (true);
     portCombo_->setSizeAdjustPolicy (QComboBox::AdjustToMinimumContentsLengthWithIcon);
     portCombo_->setMinimumContentsLength (8);
-    portCombo_->setToolTip (QStringLiteral ("Serial port of the Cyton dongle (/dev/cu.usbserial-*). Editable.\n"
-                                            "Close the OpenBCI GUI first: only one program can use the dongle."));
+    portCombo_->setToolTip (QStringLiteral ("Auto finds the Cyton's USB dongle (preferring the last port that connected).\n"
+                                            "Pick or type a port to override it. Close the OpenBCI GUI first:\n"
+                                            "only one program can use the dongle."));
     refreshBtn_ = new RescanButton;
-    refreshBtn_->setToolTip (QStringLiteral ("Rescan /dev/cu.usbserial-*  (⌘R)"));
+    refreshBtn_->setToolTip (QStringLiteral ("Rescan serial ports  (%1)").arg (keyText (kRescanKey)));
     row->addWidget (portCombo_, 1);
     row->addWidget (refreshBtn_, 0, Qt::AlignTop); // 28 px button top-aligned with the 30 px field (design)
     v->addLayout (row);
-    v->addSpacing (8);
-    cyton_.button = makeButton (QStringLiteral ("[ connect cyton ]"), "primary", nullptr, 30);
-    v->addWidget (cyton_.button);
     v->addSpacing (7);
-    cyton_.meta = makeLabel (QString (), Theme::mono (10, 400, 0.02), Theme::textDim);
-    cyton_.meta->setWordWrap (true);
+    cyton_.meta = new ElideLabel (QString (), Qt::ElideRight);
+    cyton_.meta->setFont (Theme::mono (10, 400, 0.02));
+    Theme::setTextColor (cyton_.meta, Theme::textDim);
     v->addWidget (cyton_.meta);
     v->addWidget (buildErrorBox (cyton_));
 
     v->addSpacing (12);
-    v->addWidget (kicker (QStringLiteral ("// CH1 DISPLAY FILTERS")));
+    v->addWidget (kicker (QStringLiteral ("// ECG DISPLAY FILTERS")));
     v->addSpacing (6);
-    dcToggle_ = new ToggleSwitch (QStringLiteral ("Remove DC offset"));
+    dcToggle_ = new ToggleSwitch (QStringLiteral ("Remove DC"));
     dcToggle_->setChecked (opts_.removeDc);
     dcToggle_->setToolTip (QStringLiteral ("Display only: subtracts the mean of the visible window. The rail headroom\n"
                                            "below still measures the raw value, so a DC offset near the rail shows."));
-    hpToggle_ = new ToggleSwitch (QStringLiteral ("High-pass 1 Hz"));
+    hpToggle_ = new ToggleSwitch (QStringLiteral ("HP 0.5 Hz"));
     hpToggle_->setChecked (opts_.highPass);
-    hpToggle_->setToolTip (QStringLiteral ("2nd-order RBJ high-pass (IIR) applied sample-by-sample in the worker thread.\n"
+    hpToggle_->setToolTip (QStringLiteral ("High-pass 0.5 Hz: 2nd-order RBJ biquad (IIR) applied sample-by-sample in the\n"
+                                           "worker thread; removes baseline wander, keeps the ECG's P and T waves.\n"
                                            "Filter state resets on toggle."));
     notchToggle_ = new ToggleSwitch (QStringLiteral ("Notch 60 Hz"));
     notchToggle_->setChecked (opts_.notch);
     notchToggle_->setToolTip (QStringLiteral ("RBJ notch at 60 Hz (IIR, Q = 30), streaming, in the worker thread."));
-    v->addWidget (dcToggle_);
-    v->addSpacing (6);
-    v->addWidget (hpToggle_);
-    v->addSpacing (6);
-    v->addWidget (notchToggle_);
+    lpToggle_ = new ToggleSwitch (QStringLiteral ("LP 40 Hz"));
+    lpToggle_->setChecked (opts_.lowPass);
+    lpToggle_->setToolTip (QStringLiteral ("Low-pass 40 Hz: 2nd-order RBJ biquad (IIR) after the notch, in the worker\n"
+                                           "thread; removes EMG and high-frequency noise."));
+    auto *grid = new QGridLayout;
+    grid->setContentsMargins (0, 0, 0, 0);
+    grid->setHorizontalSpacing (6);
+    grid->setVerticalSpacing (6);
+    grid->addWidget (dcToggle_, 0, 0);
+    grid->addWidget (notchToggle_, 0, 1);
+    grid->addWidget (hpToggle_, 1, 0);
+    grid->addWidget (lpToggle_, 1, 1);
+    grid->setColumnStretch (0, 0); // "Remove DC" / "HP 0.5 Hz" at their size, the rest to "Notch 60 Hz"
+    grid->setColumnStretch (1, 1);
+    v->addLayout (grid);
 
     v->addSpacing (12);
     auto *hrow = new QHBoxLayout;
     hrow->setContentsMargins (0, 0, 0, 0);
-    hrow->addWidget (kicker (QStringLiteral ("// RAIL HEADROOM")), 0, Qt::AlignBottom);
+    hrow->addWidget (kicker (QStringLiteral ("// RAIL HEADROOM · 2 s")), 0, Qt::AlignBottom);
     hrow->addStretch (1);
     railPct_ = makeLabel (QStringLiteral ("—"), Theme::mono (10.5), Theme::controlEdge);
     hrow->addWidget (railPct_, 0, Qt::AlignBottom);
     v->addLayout (hrow);
     v->addSpacing (4);
     railBar_ = new MeterBar (12, Theme::edge); // content-box 8 + padding 1 + border 1 (design)
-    railBar_->setToolTip (QStringLiteral ("1 − max|raw Ch1| / 187,500 µV over the visible window (before filters)."));
+    railBar_->setToolTip (QStringLiteral ("1 − max|raw ECG| / 187,500 µV over the last 2 s (before filters)."));
     v->addWidget (railBar_);
     v->addSpacing (4);
     railNote_ = makeLabel (QStringLiteral ("No signal"), Theme::mono (10), Theme::textDim);
     v->addWidget (railNote_);
 
     connect (refreshBtn_, &QPushButton::clicked, this, [this] { refreshPorts (); });
-    connect (cyton_.button, &QPushButton::clicked, this, [this] { onButton (DeviceKind::Cyton); });
-    for (ToggleSwitch *t : {dcToggle_, hpToggle_, notchToggle_})
+    for (ToggleSwitch *t : {dcToggle_, hpToggle_, notchToggle_, lpToggle_})
         connect (t, &QAbstractButton::toggled, this, [this] (bool) { applyFilterSettings (); });
+    connect (portCombo_, &QComboBox::currentTextChanged, this, [this] (const QString &) { updateSlotUi (cyton_); });
     return f;
 }
 
@@ -524,12 +597,11 @@ QWidget *MainWindow::buildEmotibitModule ()
     c1->addWidget (kicker (QStringLiteral ("// IP ADDRESS")));
     ipEdit_ = new QLineEdit (opts_.emotibitIp);
     ipEdit_->setFixedHeight (30); // content-box 28 + 1 px border (design)
-    ipEdit_->setPlaceholderText (QStringLiteral ("auto-discover"));
+    ipEdit_->setPlaceholderText (QStringLiteral ("auto"));
     ipEdit_->setToolTip (QStringLiteral (
         "EmotiBit IP address (shown in its serial boot log and in EmotiBit Oscilloscope).\n"
-        "A typed IP works across subnets (unicast). Leave blank for broadcast discovery,\n"
-        "which only works when this Mac and the EmotiBit are on the same subnet.\n"
-        "The last IP that connected successfully is remembered."));
+        "A typed IP works across subnets (unicast). Blank: the last EmotiBit that answered,\n"
+        "then broadcast discovery, which only works when this computer and the EmotiBit share a subnet."));
     c1->addWidget (ipEdit_);
     auto *c2 = new QVBoxLayout;
     c2->setSpacing (5);
@@ -547,17 +619,13 @@ QWidget *MainWindow::buildEmotibitModule ()
     row->addLayout (c1, 1);
     row->addLayout (c2);
     v->addLayout (row);
-    v->addSpacing (6);
-    ipHint_ = makeLabel (QStringLiteral ("Blank = auto-discover on this subnet"), Theme::mono (10), Theme::textDim);
-    ipHint_->setWordWrap (true);
-    v->addWidget (ipHint_);
-    v->addSpacing (8);
-    emotibit_.button = makeButton (QStringLiteral ("[ connect emotibit ]"), "primary", nullptr, 30);
-    emotibit_.button->setToolTip (QStringLiteral ("Connect / discover the EmotiBit  (⌘⇧D)\n"
-                                                  "Close EmotiBit Oscilloscope first: only one host can own the stream."));
-    v->addWidget (emotibit_.button);
+    v->addSpacing (7);
+    emotibit_.meta = new ElideLabel (QString (), Qt::ElideRight);
+    emotibit_.meta->setFont (Theme::mono (10, 400, 0.02));
+    Theme::setTextColor (emotibit_.meta, Theme::textDim);
+    v->addWidget (emotibit_.meta);
 
-    // discovering module
+    // discovering module (cancelled with the Connect button)
     discoverWrap_ = new QWidget;
     auto *dwl = new QVBoxLayout (discoverWrap_);
     dwl->setContentsMargins (0, 9, 0, 0);
@@ -582,24 +650,16 @@ QWidget *MainWindow::buildEmotibitModule ()
     discoverDetail_ = makeLabel (QString (), Theme::mono (10), Theme::textMuted);
     discoverDetail_->setWordWrap (true);
     bl->addWidget (discoverDetail_);
-    bl->addSpacing (8);
-    cancelDiscoveryBtn_ = makeButton (QStringLiteral ("[ cancel discovery ]"), "secondary", "sm", 26);
-    bl->addWidget (cancelDiscoveryBtn_);
     dwl->addWidget (box);
     discoverWrap_->hide ();
     v->addWidget (discoverWrap_);
 
     v->addWidget (buildErrorBox (emotibit_));
-    emotibit_.meta = makeLabel (QString (), Theme::mono (10, 400, 0.02), Theme::textDim);
-    emotibit_.meta->setWordWrap (true);
-    emotibit_.meta->setContentsMargins (0, 7, 0, 0); // its 7 px gap hides with it
-    v->addWidget (emotibit_.meta);
 
-    connect (emotibit_.button, &QPushButton::clicked, this, [this] { onButton (DeviceKind::EmotiBit); });
-    connect (cancelDiscoveryBtn_, &QPushButton::clicked, this, [this] { disconnectDevice (DeviceKind::EmotiBit); });
     connect (ipEdit_, &QLineEdit::textChanged, this, [this] (const QString &t) {
         const QString s = t.trimmed ();
         setFlag (ipEdit_, "invalid", !s.isEmpty () && !validIpv4 (s));
+        updateSlotUi (emotibit_);
     });
     setFlag (ipEdit_, "invalid", !ipEdit_->text ().trimmed ().isEmpty () && !validIpv4 (ipEdit_->text ().trimmed ()));
     return f;
@@ -621,12 +681,11 @@ QWidget *MainWindow::buildDisplayModule ()
     v->addLayout (row);
     v->addSpacing (9);
     pauseToggle_ = new ToggleSwitch (QStringLiteral ("Pause display"), true);
+    pauseToggle_->setToolTip (QStringLiteral ("Freezes the plots only: streams, recording, heart rate and the\n"
+                                              "rail-headroom warning keep running."));
     v->addWidget (pauseToggle_);
-    v->addSpacing (5);
-    v->addWidget (makeLabel (QStringLiteral ("Streams keep running while paused"), Theme::mono (10), Theme::textDim));
     // ("Simulate devices" lives in the idle call to action over the hero plot:
-    // it can only change while nothing is connected, and the rail then fits
-    // a 1280 x 800 window like the design.)
+    // it can only change while nothing is connected.)
 
     QString ver;
     try
@@ -661,9 +720,10 @@ QWidget *MainWindow::buildRecordModule ()
     v->addSpacing (9);
     recordBtn_ = new RecordButton;
     recordBtn_->setToolTip (QStringLiteral (
-        "Record every BrainFlow preset of each streaming device to CSV (tab-separated rows, no header;\n"
-        "a *_columns.json next to each file describes the rows). Starts and stops at any time while\n"
-        "streaming; pressed with nothing connected it arms the recording for the next connect.\nFolder: %1")
+        "Record every BrainFlow preset of each streaming device to CSV (tab-separated raw rows, no header;\n"
+        "a *_columns.json next to each file describes the rows). Filters and heart rate are display-only and\n"
+        "not recorded. Starts and stops at any time while streaming; pressed with nothing connected it arms\n"
+        "the recording for the next connect.\nFolder: %1")
                                 .arg (opts_.recordDir));
     v->addWidget (recordBtn_);
     v->addSpacing (8);
@@ -708,39 +768,56 @@ QWidget *MainWindow::buildMain ()
     v->addWidget (banner_);
 
     using Dash = PlotWidget::Dash;
+    using Kind = PlotWidget::Kind;
     const QVector<PlotWidget::Trace> xyz = {{QStringLiteral ("X"), Theme::traceX, Dash::Solid},
         {QStringLiteral ("Y"), Theme::traceY, Dash::Dashed}, {QStringLiteral ("Z"), Theme::traceZ, Dash::Dotted}};
-    cytonPlot_ = new PlotWidget (PlotWidget::Kind::Hero, QStringLiteral ("CYTON CH1"), QStringLiteral ("µV"),
-        {{QStringLiteral ("ch1"), Theme::traceHero, Dash::Solid}});
+    cytonPlot_ = new PlotWidget (Kind::Hero, QStringLiteral ("ECG · CYTON CH1"), QStringLiteral ("µV"),
+        {{QStringLiteral ("ECG"), Theme::traceHero, Dash::Solid}});
     cytonPlot_->setSubtitle (QStringLiteral ("single-ended · SRB / AGND / N1P"));
     cytonPlot_->setFullScale (Readouts::kCytonFullScaleUv);
-    tempPlot_ = new PlotWidget (PlotWidget::Kind::Scalar, QStringLiteral ("TEMPERATURE"), QStringLiteral ("°C"),
+    ppgGreenPlot_ = new PlotWidget (Kind::Scalar, QStringLiteral ("PPG GREEN"), QStringLiteral ("a.u."),
+        {{QStringLiteral ("green"), Theme::tracePpgGreen, Dash::Solid}});
+    ppgRedPlot_ = new PlotWidget (Kind::Scalar, QStringLiteral ("PPG RED"), QStringLiteral ("a.u."),
+        {{QStringLiteral ("red"), Theme::tracePpgRed, Dash::Solid}});
+    ppgIrPlot_ = new PlotWidget (Kind::Scalar, QStringLiteral ("PPG IR"), QStringLiteral ("a.u."),
+        {{QStringLiteral ("IR"), Theme::tracePpgIr, Dash::Solid}});
+    hrPlot_ = new PlotWidget (Kind::Vital, QStringLiteral ("HEART RATE"),
+        QVector<PlotWidget::LaneSpec> {
+            {QString (), QStringLiteral ("bpm"), {{QStringLiteral ("HR"), Theme::traceHeartRate, Dash::Solid}}, 20.0}});
+    imuPlot_ = new PlotWidget (Kind::Lanes, QStringLiteral ("IMU"),
+        QVector<PlotWidget::LaneSpec> {{QStringLiteral ("ACC"), QStringLiteral ("g"), xyz, 0.02},
+            {QStringLiteral ("GYR"), QStringLiteral ("°/s"), xyz, 1.0},
+            {QStringLiteral ("MAG"), QStringLiteral ("µT"), xyz, 1.0}});
+    tempPlot_ = new PlotWidget (Kind::Scalar, QStringLiteral ("TEMPERATURE"), QStringLiteral ("°C"),
         {{QStringLiteral ("T"), Theme::traceTemp, Dash::Solid}});
-    ppgPlot_ = new PlotWidget (PlotWidget::Kind::Scalar, QStringLiteral ("PPG GREEN"), QStringLiteral ("a.u."),
-        {{QStringLiteral ("green"), Theme::tracePpg, Dash::Solid}});
-    accelPlot_ = new PlotWidget (PlotWidget::Kind::Triple, QStringLiteral ("ACCEL"), QStringLiteral ("g"), xyz);
-    gyroPlot_ = new PlotWidget (PlotWidget::Kind::Triple, QStringLiteral ("GYRO"), QStringLiteral ("°/s"), xyz);
-    magPlot_ = new PlotWidget (PlotWidget::Kind::Triple, QStringLiteral ("MAG"), QStringLiteral ("µT"), xyz);
 
-    v->addWidget (cytonPlot_, 135);
-    auto *r1 = new QHBoxLayout;
-    r1->setSpacing (Theme::gutter);
-    r1->addWidget (tempPlot_, 1);
-    r1->addWidget (ppgPlot_, 1);
-    v->addLayout (r1, 100);
-    auto *r2 = new QHBoxLayout;
-    r2->setSpacing (Theme::gutter);
-    r2->addWidget (accelPlot_, 1);
-    r2->addWidget (gyroPlot_, 1);
-    r2->addWidget (magPlot_, 1);
-    v->addLayout (r2, 100);
+    // Hero ECG across the top; PPG green | red | IR, then the heart rate they
+    // produce; the IMU's three lanes need the width and height, temperature
+    // (slow, sample-and-hold) takes the remaining column.
+    auto *grid = new QGridLayout;
+    grid->setContentsMargins (0, 0, 0, 0);
+    grid->setSpacing (Theme::gutter);
+    grid->addWidget (cytonPlot_, 0, 0, 1, 4);
+    grid->addWidget (ppgGreenPlot_, 1, 0);
+    grid->addWidget (ppgRedPlot_, 1, 1);
+    grid->addWidget (ppgIrPlot_, 1, 2);
+    grid->addWidget (hrPlot_, 1, 3);
+    grid->addWidget (imuPlot_, 2, 0, 1, 3);
+    grid->addWidget (tempPlot_, 2, 3);
+    for (int c = 0; c < 4; ++c)
+        grid->setColumnStretch (c, 1);
+    grid->setRowStretch (0, 125);
+    grid->setRowStretch (1, 95);
+    grid->setRowStretch (2, 130);
+    v->addLayout (grid, 1);
 
     for (PlotWidget *p : allPlots ())
     {
         p->setWindowSeconds (windowStepper_->value ());
         p->setPlaceholder (QStringLiteral ("NO SIGNAL"));
-        p->setRate (Readouts::rateText (false, 0.0, p == cytonPlot_ ? 250.0 : (p == tempPlot_ ? 15.0 : 25.0)),
-            Theme::textDim);
+        if (p != hrPlot_)
+            p->setRate (Readouts::rateText (false, 0.0, p == cytonPlot_ ? 250.0 : (p == tempPlot_ ? 15.0 : 25.0)),
+                Theme::textDim);
     }
     idleOverlay_ = buildIdleOverlay ();
     cytonPlot_->setOverlay (idleOverlay_);
@@ -765,15 +842,15 @@ QWidget *MainWindow::buildIdleOverlay ()
     k->setAlignment (Qt::AlignCenter);
     v->addWidget (k);
     gap (14);
-    auto *t = makeLabel (QStringLiteral ("Connect a device to start streaming"), Theme::mono (19, 400, -0.01),
-        Theme::textStrong);
+    auto *t = makeLabel (QStringLiteral ("Connect to start streaming"), Theme::mono (19, 400, -0.01), Theme::textStrong);
     t->setAlignment (Qt::AlignCenter);
     v->addWidget (t);
     gap (14);
     auto *para = makeLabel (richPara (QStringLiteral (
-                                          "Pick the Cyton dongle's serial port in the left rail, or give the "
-                                          "EmotiBit's IP address — leave it blank to auto-discover on this "
-                                          "subnet. Plots arm themselves as soon as samples arrive."),
+                                          "One button opens every available device at once: the Cyton on its USB "
+                                          "dongle and the EmotiBit at the address in the left rail (blank: the last "
+                                          "address that answered, then broadcast discovery). Plots arm themselves "
+                                          "as soon as samples arrive."),
                                 20), // 12.5 px x 1.6
         Theme::sans (12.5), Theme::textMuted);
     para->setWordWrap (true);
@@ -785,12 +862,10 @@ QWidget *MainWindow::buildIdleOverlay ()
     auto *btns = new QHBoxLayout;
     btns->setSpacing (10);
     btns->addStretch (1);
-    auto *bc = makeButton (QStringLiteral ("[ connect cyton ]"), "primary", "lg", 32);
-    auto *be = makeButton (QStringLiteral ("[ connect emotibit ]"), "secondary", "lg", 32);
-    for (QPushButton *b : {bc, be})
-        b->setStyleSheet (QStringLiteral ("padding: 0 16px;"));
+    auto *bc = makeButton (QStringLiteral ("[ connect ]"), "primary", "lg", 32);
+    bc->setStyleSheet (QStringLiteral ("padding: 0 16px;"));
+    bc->setToolTip (QStringLiteral ("Connect every available device at once (%1).").arg (keyText (kConnectKey)));
     btns->addWidget (bc);
-    btns->addWidget (be);
     btns->addStretch (1);
     v->addLayout (btns);
     gap (18);
@@ -811,14 +886,14 @@ QWidget *MainWindow::buildIdleOverlay ()
         sep->setPalette (sp);
         return sep;
     };
-    hints->addWidget (keycap (QStringLiteral ("⌘R")));
+    hints->addWidget (keycap (keyText (kConnectKey)));
+    hints->addWidget (makeLabel (QStringLiteral ("connect"), Theme::mono (10), Theme::textDim));
+    hints->addWidget (vsep ());
+    hints->addWidget (keycap (keyText (kRescanKey)));
     hints->addWidget (makeLabel (QStringLiteral ("rescan serial ports"), Theme::mono (10), Theme::textDim));
     hints->addWidget (vsep ());
-    hints->addWidget (keycap (QStringLiteral ("⌘⇧D")));
-    hints->addWidget (makeLabel (QStringLiteral ("discover EmotiBit"), Theme::mono (10), Theme::textDim));
-    hints->addWidget (vsep ());
     // Only changeable while nothing is connected -- exactly when this overlay
-    // shows; afterwards the session label / meta line say "synthetic".
+    // shows; afterwards the session label / detail lines say "synthetic".
     synthToggle_ = new ToggleSwitch (QStringLiteral ("simulate devices"));
     synthToggle_->setFont (Theme::mono (10));
     synthToggle_->setChecked (opts_.synthetic);
@@ -828,31 +903,43 @@ QWidget *MainWindow::buildIdleOverlay ()
     hints->addStretch (1);
     v->addLayout (hints);
     v->addStretch (1);
-    connect (bc, &QPushButton::clicked, this, [this] { connectDevice (DeviceKind::Cyton); });
-    connect (be, &QPushButton::clicked, this, [this] { connectDevice (DeviceKind::EmotiBit); });
-    connect (synthToggle_, &QAbstractButton::toggled, this, [this] (bool) { updateWindowTitle (); });
+    connect (bc, &QPushButton::clicked, this, &MainWindow::connectAll);
+    connect (synthToggle_, &QAbstractButton::toggled, this, [this] (bool) {
+        updateWindowTitle ();
+        updateSlotUi (cyton_);
+        updateSlotUi (emotibit_);
+    });
     return ov;
 }
 
-std::array<PlotWidget *, 6> MainWindow::allPlots () const
+std::array<PlotWidget *, 7> MainWindow::allPlots () const
 {
-    return {cytonPlot_, tempPlot_, ppgPlot_, accelPlot_, gyroPlot_, magPlot_};
+    return {cytonPlot_, ppgGreenPlot_, ppgRedPlot_, ppgIrPlot_, hrPlot_, imuPlot_, tempPlot_};
 }
 
-PlotWidget *MainWindow::plotForKey (const std::string &key) const
+PlotWidget *MainWindow::plotForKey (const std::string &key, int *lane) const
 {
-    if (key == SignalKeys::CytonCh1)
+    if (lane)
+        *lane = 0;
+    if (key == SignalKeys::CytonEcg)
         return cytonPlot_;
+    if (key == SignalKeys::EmotiPpgGreen)
+        return ppgGreenPlot_;
+    if (key == SignalKeys::EmotiPpgRed)
+        return ppgRedPlot_;
+    if (key == SignalKeys::EmotiPpgIr)
+        return ppgIrPlot_;
+    if (key == SignalKeys::EmotiHeartRate)
+        return hrPlot_;
     if (key == SignalKeys::EmotiTemp)
         return tempPlot_;
-    if (key == SignalKeys::EmotiPpgGreen)
-        return ppgPlot_;
-    if (key == SignalKeys::EmotiAccel)
-        return accelPlot_;
-    if (key == SignalKeys::EmotiGyro)
-        return gyroPlot_;
-    if (key == SignalKeys::EmotiMag)
-        return magPlot_;
+    const int imuLane = key == SignalKeys::EmotiAccel ? 0 : (key == SignalKeys::EmotiGyro ? 1 : (key == SignalKeys::EmotiMag ? 2 : -1));
+    if (imuLane >= 0)
+    {
+        if (lane)
+            *lane = imuLane;
+        return imuPlot_;
+    }
     return nullptr;
 }
 
@@ -892,7 +979,10 @@ void MainWindow::wireWorker (DeviceKind kind)
     DeviceWorker *w = slot (kind).worker;
     const QString name = QString::fromLatin1 (deviceDisplayName (kind));
 
-    connect (w, &DeviceWorker::stateChanged, this, [this, kind] (int) { updateSlotUi (slot (kind)); });
+    connect (w, &DeviceWorker::stateChanged, this, [this, kind] (int) {
+        updateSlotUi (slot (kind));
+        updateConnectUi ();
+    });
 
     connect (w, &DeviceWorker::progress, this, [this, kind] (const QString &text) {
         Slot &s = slot (kind);
@@ -907,13 +997,6 @@ void MainWindow::wireWorker (DeviceKind kind)
         Slot &s = slot (kind);
         s.address = ip;
         s.serial = serial;
-        if (kind == DeviceKind::EmotiBit && s.autoDiscovery)
-        {
-            // Show (and, once connected, remember) the address discovery found,
-            // so the next connect can go straight to it.
-            ipEdit_->setText (ip);
-            s.autoDiscovery = false;
-        }
         showMessage (QStringLiteral ("EmotiBit%1 found at %2")
                          .arg (serial.isEmpty () ? QString () : QStringLiteral (" ") + serial, ip));
     });
@@ -927,9 +1010,16 @@ void MainWindow::wireWorker (DeviceKind kind)
             sessionStartWall_ = wallClockSeconds ();
         showMessage (QStringLiteral ("%1 connected in %2 s").arg (name).arg (s.linkSeconds, 0, 'f', 1), 5000);
         if (!s.synthetic)
+        {
             saveDeviceAddress (kind, s.address);
+            if (kind == DeviceKind::Cyton)
+                opts_.cytonPort = s.address; // auto-detect prefers it next time
+            else if (validIpv4 (s.address))
+                lastEmotibitIp_ = s.address;
+        }
         saveSettings ();
         updateSlotUi (s);
+        updateConnectUi ();
     });
 
     connect (w, &DeviceWorker::failed, this, [this, kind, name] (const QString &err) {
@@ -941,6 +1031,9 @@ void MainWindow::wireWorker (DeviceKind kind)
         s.failTimeout = s.worker->discoveryTimeout ();
         showMessage (QStringLiteral ("%1: %2").arg (name, err.section ('\n', 0, 0)), 10000, Theme::fault);
         updateSlotUi (s);
+        // A modal only for errors that need the user to act outside this app.
+        if (s.failKind == DeviceWorker::FailPortBusy || s.failKind == DeviceWorker::FailNoSend)
+            showErrorDialog (s);
     });
 
     connect (w, &DeviceWorker::disconnected, this, [this, kind] (const QString &info) {
@@ -958,6 +1051,7 @@ void MainWindow::wireWorker (DeviceKind kind)
             sessionStartWall_ = kNaN;
         updateSlotUi (cyton_);
         updateSlotUi (emotibit_);
+        updateConnectUi ();
         updateRecordUi ();
         refreshChrome (wallClockSeconds ());
         if (closing_ && !anyActive ())
@@ -1005,24 +1099,90 @@ bool MainWindow::anyActive () const
     return cyton_.worker->isActive () || emotibit_.worker->isActive ();
 }
 
+bool MainWindow::anyConnecting () const
+{
+    for (const Slot *s : {&cyton_, &emotibit_})
+        if (s->worker->isActive () && s->worker->state () == DeviceWorker::Connecting && !s->stopRequested)
+            return true;
+    return false;
+}
+
+bool MainWindow::anyStreaming () const
+{
+    for (const Slot *s : {&cyton_, &emotibit_})
+        if (s->worker->isActive () && s->worker->state () == DeviceWorker::Streaming && !s->stopRequested)
+            return true;
+    return false;
+}
+
 bool MainWindow::isRecording () const
 {
     return cyton_.worker->isRecording () || emotibit_.worker->isRecording ();
 }
 
-void MainWindow::onButton (DeviceKind kind)
+void MainWindow::onConnectButton ()
 {
-    Slot &s = slot (kind);
-    if (!s.worker->isActive ())
-        connectDevice (kind);
-    else if (!s.stopRequested && (s.worker->state () == DeviceWorker::Connecting ||
-                                     s.worker->state () == DeviceWorker::Streaming))
-        disconnectDevice (kind); // Cancel (connecting) or Disconnect (streaming)
+    if (anyConnecting ())
+        cancelPending (); // [ cancel ]: the attempts still in progress
+    else if (anyStreaming ())
+        disconnectAll (); // [ disconnect ]: everything
+    else if (!anyActive ())
+        connectAll (); // [ connect ]
 }
 
-void MainWindow::connectDevice (DeviceKind kind)
+void MainWindow::connectAll ()
 {
-    connectDeviceWith (kind, synthToggle_->isChecked ());
+    connectAllWith (synthToggle_->isChecked (), synthToggle_->isChecked ());
+}
+
+void MainWindow::connectAllWith (bool cytonSynthetic, bool emotibitSynthetic)
+{
+    if (closing_ || anyActive ())
+        return;
+    if (errorDialog_)
+        errorDialog_->close ();
+    connectDeviceWith (DeviceKind::Cyton, cytonSynthetic);
+    connectDeviceWith (DeviceKind::EmotiBit, emotibitSynthetic);
+    updateConnectUi ();
+    refreshChrome (wallClockSeconds ());
+}
+
+void MainWindow::cancelPending ()
+{
+    for (Slot *s : {&cyton_, &emotibit_})
+        if (s->worker->isActive () && s->worker->state () == DeviceWorker::Connecting && !s->stopRequested)
+            disconnectDevice (s->kind);
+    updateConnectUi ();
+}
+
+void MainWindow::disconnectAll ()
+{
+    for (Slot *s : {&cyton_, &emotibit_})
+        if (s->worker->isActive () && !s->stopRequested)
+            disconnectDevice (s->kind);
+    updateConnectUi ();
+}
+
+// INTEGRATE: SerialPorts::findCytonDongle
+// The Cyton dongle's serial port for a connect: the override if that device
+// exists; otherwise (auto) the preferred port (the last one that connected) if
+// it exists, else the first /dev/cu.usbserial-* (FTDI). "" = no dongle.
+QString MainWindow::cytonPortFor (const QString &override) const
+{
+    if (!override.isEmpty ())
+        return QFileInfo::exists (override) ? override : QString ();
+    if (!opts_.cytonPort.isEmpty () && QFileInfo::exists (opts_.cytonPort))
+        return opts_.cytonPort;
+    const QStringList e = QDir (QStringLiteral ("/dev"))
+                              .entryList (QStringList {QStringLiteral ("cu.usbserial-*")},
+                                  QDir::System | QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
+    return e.isEmpty () ? QString () : QStringLiteral ("/dev/") + e.front ();
+}
+
+QString MainWindow::portOverride () const
+{
+    const QString t = portCombo_ ? portCombo_->currentText ().trimmed () : portOverride_;
+    return isAuto (t) ? QString () : t;
 }
 
 void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
@@ -1036,71 +1196,92 @@ void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
     cfg.displayName = deviceDisplayName (kind);
     cfg.boardId = synth ? static_cast<int> (BoardIds::SYNTHETIC_BOARD) : realBoardIdFor (kind);
     s.synthetic = synth;
-    s.autoDiscovery = false;
+    s.fieldBlank = false;
     s.address.clear ();
     s.serial.clear ();
     s.typedIp.clear ();
     s.targets.clear ();
     s.failed = false;
     s.streamingSinceWall = kNaN;
-    auto failNow = [&] (const QString &text) {
+    auto failNow = [&] (int failKind, const QString &text) {
         s.failed = true;
-        s.failKind = DeviceWorker::FailOther;
+        s.failKind = failKind;
         s.failText = text;
         s.failAfter = 0.0;
+        for (const SignalDef &d : signalDefsFor (kind))
+        {
+            int lane = 0;
+            if (PlotWidget *p = plotForKey (d.key, &lane))
+                p->setSource (lane, nullptr, -1, 0.0, 2);
+        }
         updateSlotUi (s);
     };
     if (synth)
     {
         // distinct params -> distinct BrainFlow session keys for the two slots
         cfg.params.other_info = "bioacq:" + cfg.slot;
-        s.progressText = QStringLiteral ("Opening the BrainFlow synthetic board…");
+        s.progressText = QStringLiteral ("opening the BrainFlow synthetic board…");
     }
     else if (kind == DeviceKind::Cyton)
     {
-        const QString port = portCombo_->currentText ().trimmed ();
+        const QString over = portOverride ();
+        const QString port = cytonPortFor (over);
         if (port.isEmpty ())
         {
-            failNow (QStringLiteral ("Choose a serial port first."));
+            // not available: marked inline (chip + detail), never a dialog
+            failNow (DeviceWorker::FailNotFound, over.isEmpty () ? QStringLiteral ("no dongle")
+                                                                 : QStringLiteral ("no device at %1").arg (over));
             return;
         }
         cfg.params.serial_port = port.toStdString ();
         s.address = port;
-        s.progressText = QStringLiteral ("Opening %1 (the soft reset takes a few s)…").arg (port);
+        s.progressText = QStringLiteral ("opening %1 · soft reset takes a few s…").arg (port);
     }
     else
     {
-        const QString ip = ipEdit_->text ().trimmed ();
-        cfg.params.ip_address = ip.toStdString ();
-        cfg.params.timeout = timeoutSpin_->value ();
-        cfg.ownDiscovery = !opts_.brainflowDiscovery;
-        s.address = ip;
-        s.typedIp = ip;
-        s.autoDiscovery = ip.isEmpty ();
-        if (ip.isEmpty ())
+        const QString field = ipEdit_->text ().trimmed ();
+        if (!field.isEmpty () && !validIpv4 (field))
         {
-            QStringList t;
-            for (const std::string &a : emotibit::ipv4BroadcastAddresses ())
-                t << QString::fromStdString (a);
-            s.targets = t.isEmpty () ? QStringLiteral ("no interface") : t.join (QStringLiteral (", "));
+            failNow (DeviceWorker::FailOther, QStringLiteral ("'%1' is not an IPv4 address").arg (field));
+            return;
         }
-        else
-            s.targets = ip;
+        // Blank field: the last EmotiBit that answered (unicast), then broadcast.
+        QString target = field;
+        s.fieldBlank = field.isEmpty ();
+        cfg.ownDiscovery = !opts_.brainflowDiscovery;
+        if (s.fieldBlank && validIpv4 (lastEmotibitIp_) && cfg.ownDiscovery)
+        {
+            target = lastEmotibitIp_;
+            cfg.broadcastFallback = true;
+        }
+        cfg.params.ip_address = target.toStdString ();
+        cfg.params.timeout = timeoutSpin_->value ();
+        s.address = target;
+        s.typedIp = target;
+        QStringList bc;
+        for (const std::string &a : emotibit::ipv4BroadcastAddresses ())
+            bc << QString::fromStdString (a);
+        s.targets = target.isEmpty () ? (bc.isEmpty () ? QStringLiteral ("no interface") : bc.join (QStringLiteral (", ")))
+                                      : target;
         s.progressText = cfg.ownDiscovery ? QString ()
                                           : QStringLiteral ("BrainFlow is discovering the EmotiBit (holds its lock)…");
     }
     cfg.countPackageGaps = kind == DeviceKind::Cyton;
     if (kind == DeviceKind::EmotiBit && opts_.testFreezeEmotibitSec >= 0.0)
         cfg.testFreezeAfterSec = opts_.testFreezeEmotibitSec;
+    if (kind == DeviceKind::EmotiBit && opts_.testPpgBpm > 0.0)
+        cfg.testPpgBpm = opts_.testPpgBpm;
     if (kind == DeviceKind::Cyton && opts_.testRailOffsetUv != 0.0)
         cfg.testRawOffset = opts_.testRailOffsetUv;
+    if (kind == DeviceKind::Cyton && opts_.testCytonPrepareDelayMs > 0)
+        cfg.testPrepareDelayMs = opts_.testCytonPrepareDelayMs;
 
     const std::vector<SignalDef> defs = signalDefsFor (kind);
     std::vector<std::string> problems;
     cfg.signalSpecs = resolveSignals (cfg.boardId, defs, &problems);
     if (cfg.signalSpecs.empty ())
     {
-        failNow (QStringLiteral ("Cannot map any signal on this board."));
+        failNow (DeviceWorker::FailOther, QStringLiteral ("Cannot map any signal on this board."));
         return;
     }
     cfg.record = recordWanted_;
@@ -1118,31 +1299,51 @@ void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
 
     // Plots of this device that the board cannot provide
     for (const SignalDef &d : defs)
-        if (PlotWidget *p = plotForKey (d.key))
+    {
+        int lane = 0;
+        if (PlotWidget *p = plotForKey (d.key, &lane))
         {
-            p->setSource (nullptr, -1, 0.0, 2);
+            p->setSource (lane, nullptr, -1, 0.0, 2);
             p->setNote (QString ());
             p->setPlaceholder (QStringLiteral ("NOT PROVIDED BY THIS BOARD"));
         }
+    }
 
     s.plots.clear ();
+    s.lanes.clear ();
     s.meters.clear ();
+    std::vector<std::pair<PlotWidget *, QStringList>> notes;
+    std::vector<PlotWidget *> flagged;
     for (const SignalChannel &ch : s.worker->channels ())
     {
-        PlotWidget *p = plotForKey (ch.spec.key);
+        int lane = 0;
+        PlotWidget *p = plotForKey (ch.spec.key, &lane);
         s.plots.push_back (p);
+        s.lanes.push_back (lane);
         s.meters.emplace_back (2.0);
         if (!p)
             continue;
-        p->setSource (ch.ring, ch.rawChannel, ch.spec.nominalRate, ch.spec.valueDecimals);
-        p->setUnits (QString::fromStdString (ch.spec.units));
+        // heart rate: ~1 sample per beat (the rate only sizes gaps / window margins)
+        p->setSource (lane, ch.ring, ch.rawChannel, ch.spec.derived ? 1.0 : ch.spec.nominalRate, ch.spec.valueDecimals);
+        p->setLaneUnits (lane, QString::fromStdString (ch.spec.units));
         // Source in the plot's tooltip; a REAL channel resolved through a
         // fallback is also flagged in the header (SUBST). The synthetic
         // board's stand-ins are expected: the session reads "synthetic".
-        p->setNote (QStringLiteral ("source: %1").arg (QString::fromStdString (ch.spec.source)),
-            !synth && ch.spec.substituted);
+        auto it = std::find_if (notes.begin (), notes.end (), [p] (const auto &n) { return n.first == p; });
+        if (it == notes.end ())
+        {
+            notes.push_back ({p, QStringList ()});
+            it = notes.end () - 1;
+        }
+        it->second << QStringLiteral ("%1: %2").arg (QString::fromStdString (ch.spec.title),
+            QString::fromStdString (ch.spec.source));
+        if (!synth && ch.spec.substituted)
+            flagged.push_back (p);
         p->setPlaceholder (QStringLiteral ("AWAITING STREAM"));
     }
+    for (const auto &n : notes)
+        n.first->setNote (QStringLiteral ("source · ") + n.second.join (QStringLiteral ("\nsource · ")),
+            std::find (flagged.begin (), flagged.end (), n.first) != flagged.end ());
     if (kind == DeviceKind::Cyton)
         cytonPlot_->setSubtitle (synth ? QStringLiteral ("synthetic board · exg[0]")
                                        : QStringLiteral ("single-ended · SRB / AGND / N1P"));
@@ -1159,9 +1360,9 @@ void MainWindow::disconnectDevice (DeviceKind kind)
     s.stopRequested = true;
     s.worker->requestStop ();
     s.progressText = connecting ? (s.worker->inBrainFlowSetup ()
-                                          ? QStringLiteral ("Cancelling… waiting for BrainFlow to finish opening the session")
-                                          : QStringLiteral ("Cancelling…"))
-                                : QStringLiteral ("Stopping the stream and releasing the session…");
+                                          ? QStringLiteral ("cancelling… waiting for BrainFlow to finish opening")
+                                          : QStringLiteral ("cancelling…"))
+                                : QStringLiteral ("stopping the stream, releasing the session…");
     updateSlotUi (s);
 }
 
@@ -1190,37 +1391,106 @@ void MainWindow::setRecording (bool on)
 }
 
 // =============================================================== UI state
+void MainWindow::updateConnectUi ()
+{
+    QString text, hint;
+    const char *variant = "primary";
+    bool enabled = !closing_;
+    if (anyConnecting ())
+    {
+        text = QStringLiteral ("[ cancel ]");
+        variant = "secondary";
+        hint = QStringLiteral ("Cancel the connection attempts still in progress (%1).\n"
+                               "Devices that already stream keep streaming.")
+                   .arg (keyText (kConnectKey));
+    }
+    else if (anyStreaming ())
+    {
+        text = QStringLiteral ("[ disconnect ]");
+        variant = "secondary";
+        hint = QStringLiteral ("Stop every device and release the sessions.");
+    }
+    else if (anyActive ())
+    {
+        text = QStringLiteral ("[ stopping… ]");
+        variant = "busy";
+        enabled = false;
+        hint = QStringLiteral ("Releasing the devices…");
+    }
+    else
+    {
+        text = QStringLiteral ("[ connect ]");
+        hint = QStringLiteral ("Connect every available device at once (%1): the Cyton on its USB dongle and the "
+                               "EmotiBit over WiFi.\nClose the OpenBCI GUI and EmotiBit Oscilloscope first: only one "
+                               "program can own each device.")
+                   .arg (keyText (kConnectKey));
+    }
+    if (connectBtn_->text () != text)
+        connectBtn_->setText (text);
+    setVariant (connectBtn_, variant);
+    connectBtn_->setEnabled (enabled);
+    if (connectBtn_->toolTip () != hint)
+        connectBtn_->setToolTip (hint);
+}
+
 QString MainWindow::metaText (const Slot &s) const
 {
     const bool active = s.worker->isActive ();
     const DeviceWorker::State st = s.worker->state ();
+    const bool cy = s.kind == DeviceKind::Cyton;
     if (!active)
     {
         if (s.failed)
-            return s.failAfter > 0.0 ? QStringLiteral ("Failed after %1 s").arg (s.failAfter, 0, 'f', 1)
-                                     : QStringLiteral ("Not connected");
-        if (std::isfinite (s.linkSeconds))
-            return QStringLiteral ("Not connected · last link %1 s").arg (s.linkSeconds, 0, 'f', 1);
-        return QStringLiteral ("Not connected");
+        {
+            if (cy && s.failKind == DeviceWorker::FailNotFound)
+                return s.failText.startsWith (QStringLiteral ("no dongle"))
+                    ? QStringLiteral ("no dongle on USB · plug it in, then connect")
+                    : s.failText.section ('\n', 0, 0);
+            if (cy && s.failKind == DeviceWorker::FailPortBusy)
+                return QStringLiteral ("%1 busy or board silent").arg (s.address);
+            if (!cy && s.failKind == DeviceWorker::FailNotFound)
+                return s.typedIp.isEmpty () || s.fieldBlank
+                    ? QStringLiteral ("no answer%1 · broadcast failed")
+                          .arg (s.typedIp.isEmpty () ? QString () : QStringLiteral (" at ") + s.typedIp)
+                    : QStringLiteral ("no answer at %1 within %2 s").arg (s.typedIp).arg (s.failTimeout, 0, 'f', 0);
+            if (!cy && s.failKind == DeviceWorker::FailNoSend)
+                return QStringLiteral ("discovery blocked · see the dialog");
+            return s.failText.section ('\n', 0, 0);
+        }
+        const bool synth = synthToggle_ && synthToggle_->isChecked ();
+        if (synth)
+            return QStringLiteral ("synthetic board");
+        if (cy)
+        {
+            const QString over = portOverride ();
+            if (!over.isEmpty ())
+                return QStringLiteral ("port %1").arg (over);
+            return detectedPort_.isEmpty () ? QStringLiteral ("auto · no dongle detected")
+                                            : QStringLiteral ("auto · %1").arg (detectedPort_);
+        }
+        const QString field = ipEdit_->text ().trimmed ();
+        if (!field.isEmpty ())
+            return validIpv4 (field) ? QStringLiteral ("unicast to %1").arg (field) : QStringLiteral ("not an IPv4 address");
+        return validIpv4 (lastEmotibitIp_) ? QStringLiteral ("auto · %1, then broadcast").arg (lastEmotibitIp_)
+                                           : QStringLiteral ("auto · broadcast (same subnet)");
     }
     if (st == DeviceWorker::Streaming && !s.stopRequested)
     {
-        QString t = QStringLiteral ("Linked in %1 s").arg (s.linkSeconds, 0, 'f', 1);
-        if (s.kind == DeviceKind::Cyton)
+        QStringList t;
+        if (s.synthetic)
+            t << QStringLiteral ("synthetic");
+        else
+            t << s.address;
+        if (!s.synthetic && !s.serial.isEmpty ())
+            t << s.serial;
+        if (cy)
         {
             const auto &ch = s.worker->channels ();
             if (!ch.empty ())
-                t += QStringLiteral (" · %1 Hz").arg (ch.front ().spec.nominalRate, 0, 'g', 4);
+                t << QStringLiteral ("%1 Hz").arg (ch.front ().spec.nominalRate, 0, 'g', 4);
         }
-        if (s.synthetic)
-            t += QStringLiteral (" · synthetic");
-        else if (s.kind == DeviceKind::EmotiBit)
-        {
-            t += QStringLiteral (" · ") + s.address;
-            if (!s.serial.isEmpty ())
-                t += QStringLiteral (" · ") + s.serial;
-        }
-        return t;
+        t << QStringLiteral ("linked %1 s").arg (s.linkSeconds, 0, 'f', 1);
+        return t.join (QStringLiteral (" · "));
     }
     return s.progressText;
 }
@@ -1271,45 +1541,6 @@ void MainWindow::updateSlotUi (Slot &s)
     }
     s.chip->setState (chipText, chipC);
 
-    // main button
-    const QString dev = s.kind == DeviceKind::Cyton ? QStringLiteral ("cyton") : QStringLiteral ("emotibit");
-    QString text;
-    const char *variant = "primary";
-    bool enabled = !closing_;
-    if (!active)
-        text = s.failed ? QStringLiteral ("[ retry connect ]") : QStringLiteral ("[ connect %1 ]").arg (dev);
-    else if (st == DeviceWorker::Connecting && !s.stopRequested)
-    {
-        if (s.kind == DeviceKind::Cyton || s.synthetic)
-        {
-            text = QStringLiteral ("[ cancel ]");
-            variant = "secondary";
-        }
-        else
-        {
-            // the EmotiBit's cancel sits in the discovery module
-            text = QStringLiteral ("[ connecting… ]");
-            variant = "busy";
-            enabled = false;
-        }
-    }
-    else if (st == DeviceWorker::Streaming && !s.stopRequested)
-    {
-        text = QStringLiteral ("[ disconnect ]");
-        variant = "secondary";
-    }
-    else
-    {
-        text = st == DeviceWorker::Connecting ? QStringLiteral ("[ cancelling… ]")
-                                              : QStringLiteral ("[ disconnecting… ]");
-        variant = "busy";
-        enabled = false;
-    }
-    if (s.button->text () != text)
-        s.button->setText (text);
-    setVariant (s.button, variant);
-    s.button->setEnabled (enabled);
-
     // Inputs are locked while the device is in use: read-only and inert, but
     // drawn at rest (the design's live screen shows them undimmed).
     const bool editable = !active && !closing_;
@@ -1323,40 +1554,22 @@ void MainWindow::updateSlotUi (Slot &s)
         ipEdit_->setReadOnly (!editable);
         timeoutSpin_->setReadOnly (!editable);
         const bool nf = s.failed && s.failKind == DeviceWorker::FailNotFound;
-        QString hint = QStringLiteral ("Blank = auto-discover on this subnet");
-        QColor hc = Theme::textDim;
-        if (nf && s.typedIp.isEmpty ())
-        {
-            hint = QStringLiteral ("Blank — auto-discovery was used. Type an address here.");
-            hc = Theme::textBody;
-        }
-        else if (nf)
-        {
-            hint = QStringLiteral ("No answer here. Check the address."); // one line; details below
-            hc = Theme::textBody;
-        }
-        if (ipHint_->text () != hint)
-            ipHint_->setText (hint);
-        Theme::setTextColor (ipHint_, hc);
         setFlag (ipEdit_, "attention", nf && editable);
         updateDiscoverBox (s);
     }
-    synthToggle_->setEnabled (!anyActive () && !closing_);
+    if (synthToggle_)
+        synthToggle_->setEnabled (!anyActive () && !closing_);
 
     const QString meta = metaText (s);
     if (s.meta->text () != meta)
         s.meta->setText (meta);
     Theme::setTextColor (s.meta, s.failed && !active ? Theme::fault : Theme::textDim);
     const bool discovering = s.kind == DeviceKind::EmotiBit && discoverWrap_->isVisibleTo (discoverWrap_->parentWidget ());
-    bool showMeta = !meta.isEmpty () && !discovering;
-    // The design's EmotiBit module has no meta line: it shows only while a
-    // connect / stop is in progress; otherwise the text is the chip's tooltip
-    // (keeps the rail inside a 1280 x 800 window).
-    if (s.kind == DeviceKind::EmotiBit)
-        showMeta = showMeta && active && !(st == DeviceWorker::Streaming && !s.stopRequested);
-    s.meta->setVisible (showMeta);
+    s.meta->setVisible (!meta.isEmpty () && !discovering);
     if (s.chip->toolTip () != meta)
         s.chip->setToolTip (meta);
+    if (s.meta->toolTip () != meta)
+        s.meta->setToolTip (meta);
     updateErrorBox (s);
 }
 
@@ -1370,13 +1583,12 @@ void MainWindow::updateDiscoverBox (Slot &s)
     const DeviceWorker::Phase ph = s.worker->phase ();
     const double since = ph == DeviceWorker::PhaseIdle ? s.connectStarted : s.worker->phaseSince ();
     const double el = std::max (0.0, DeviceWorker::steadyNow () - since);
-    QString title, time, detail, cancel;
+    QString title, time, detail;
     double frac = kNaN;
     if (s.stopRequested)
     {
         title = QStringLiteral ("CANCELLING…");
         detail = s.progressText;
-        cancel = QStringLiteral ("[ cancelling… ]");
     }
     else if (ph == DeviceWorker::PhaseIdle || ph == DeviceWorker::PhaseDiscovering)
     {
@@ -1386,9 +1598,11 @@ void MainWindow::updateDiscoverBox (Slot &s)
         frac = to > 0.0 ? el / to : kNaN;
         const int n = s.worker->probesSent ();
         const QString probes = n == 1 ? QStringLiteral ("1 probe sent") : QStringLiteral ("%1 probes sent").arg (n);
-        detail = s.typedIp.isEmpty () ? QStringLiteral ("Broadcast on %1 · %2").arg (s.targets, probes)
-                                      : QStringLiteral ("Unicast to %1 · %2").arg (s.typedIp, probes);
-        cancel = QStringLiteral ("[ cancel discovery ]");
+        const bool broadcast = s.typedIp.isEmpty () || s.progressText.contains (QStringLiteral ("broadcast discovery on"));
+        detail = broadcast ? QStringLiteral ("Broadcast · %1").arg (probes)
+                           : QStringLiteral ("Unicast to %1 · %2").arg (s.typedIp, probes);
+        if (broadcast && !s.typedIp.isEmpty ())
+            detail = QStringLiteral ("No answer at %1 · broadcast · %2").arg (s.typedIp, probes);
     }
     else
     {
@@ -1396,20 +1610,23 @@ void MainWindow::updateDiscoverBox (Slot &s)
         time = QStringLiteral ("%1 s").arg (el, 0, 'f', 1);
         frac = 1.0;
         detail = s.progressText.isEmpty () ? QStringLiteral ("BrainFlow prepare_session…") : s.progressText;
-        cancel = QStringLiteral ("[ cancel ]");
     }
     discoverTitle_->setText (title);
     discoverTime_->setText (time);
     discoverBar_->setValue (frac, Theme::warn);
     if (discoverDetail_->text () != detail)
         discoverDetail_->setText (detail);
-    cancelDiscoveryBtn_->setText (cancel);
-    cancelDiscoveryBtn_->setEnabled (!s.stopRequested && !closing_);
+}
+
+bool MainWindow::showsErrorBox (const Slot &s) const
+{
+    // A missing Cyton dongle is "not available", not an error: chip + detail only.
+    return s.failed && !s.worker->isActive () && !(s.kind == DeviceKind::Cyton && s.failKind == DeviceWorker::FailNotFound);
 }
 
 void MainWindow::updateErrorBox (Slot &s)
 {
-    const bool show = s.failed && !s.worker->isActive ();
+    const bool show = showsErrorBox (s);
     s.errorWrap->setVisible (show);
     if (!show)
         return;
@@ -1419,10 +1636,10 @@ void MainWindow::updateErrorBox (Slot &s)
     if (s.kind == DeviceKind::EmotiBit && s.failKind == DeviceWorker::FailNotFound)
     {
         title = QStringLiteral ("EMOTIBIT NOT FOUND");
-        if (s.typedIp.isEmpty ())
+        if (s.fieldBlank || s.typedIp.isEmpty ())
         {
             text = QStringLiteral ("Auto-discovery is a UDP broadcast — it only reaches devices on the %1 as "
-                                   "this Mac. This Mac is on %2.")
+                                   "this computer. This computer is on %2.")
                        .arg (b (QStringLiteral ("same subnet"), Theme::textStrong), subnets ().toHtmlEscaped ());
             hint = QStringLiteral ("Enter the EmotiBit's address in the %1 field above (it is printed on the serial "
                                    "monitor at boot), then connect again.")
@@ -1430,7 +1647,7 @@ void MainWindow::updateErrorBox (Slot &s)
         }
         else
         {
-            text = QStringLiteral ("No answer from %1 within %2&nbsp;s (unicast, across subnets). This Mac is on %3.")
+            text = QStringLiteral ("No answer from %1 within %2&nbsp;s (unicast, across subnets). This computer is on %3.")
                        .arg (b (s.typedIp, Theme::textStrong))
                        .arg (s.failTimeout, 0, 'f', 1)
                        .arg (subnets ().toHtmlEscaped ());
@@ -1441,10 +1658,12 @@ void MainWindow::updateErrorBox (Slot &s)
     }
     else
     {
-        title = s.failKind == DeviceWorker::FailNoSend ? QStringLiteral ("DISCOVERY BLOCKED")
-                                                        : QStringLiteral ("CONNECTION FAILED");
+        title = s.failKind == DeviceWorker::FailNoSend
+            ? QStringLiteral ("DISCOVERY BLOCKED")
+            : (s.failKind == DeviceWorker::FailPortBusy ? QStringLiteral ("CYTON PORT BUSY") : QStringLiteral ("CONNECTION FAILED"));
         text = first.toHtmlEscaped ();
-        hint = rest.isEmpty () ? QStringLiteral ("Check the device and connect again.") : rest.toHtmlEscaped ().replace ('\n', QStringLiteral ("<br>"));
+        hint = rest.isEmpty () ? QStringLiteral ("Check the device and connect again.")
+                               : rest.toHtmlEscaped ().replace ('\n', QStringLiteral ("<br>"));
     }
     s.errorTitle->setText (title);
     const QString t = richPara (text, 17), h = richPara (hint, 17); // 11.5 px x 1.5
@@ -1452,6 +1671,25 @@ void MainWindow::updateErrorBox (Slot &s)
         s.errorText->setText (t);
     if (s.errorHint->text () != h)
         s.errorHint->setText (h);
+}
+
+void MainWindow::showErrorDialog (const Slot &s)
+{
+    if (!opts_.interactive || closing_)
+        return;
+    if (errorDialog_)
+        errorDialog_->close ();
+    const bool cy = s.kind == DeviceKind::Cyton;
+    auto *mb = new QMessageBox (QMessageBox::Warning,
+        cy ? QStringLiteral ("Cyton port busy") : QStringLiteral ("EmotiBit discovery blocked"),
+        cy ? QStringLiteral ("The Cyton on %1 could not be opened.").arg (s.address)
+           : QStringLiteral ("The EmotiBit discovery packet could not be sent."),
+        QMessageBox::Ok, this);
+    mb->setInformativeText (s.failText);
+    mb->setAttribute (Qt::WA_DeleteOnClose);
+    mb->setWindowModality (Qt::WindowModal);
+    errorDialog_ = mb;
+    mb->open ();
 }
 
 void MainWindow::updateStreamHealth (Slot &s, double now)
@@ -1474,11 +1712,33 @@ void MainWindow::updateStreamHealth (Slot &s, double now)
     s.lowRate.clear ();
     s.partialText.clear ();
     const std::size_t nch = std::min ({chans.size (), s.meters.size (), s.plots.size ()});
-    QStringList stallTexts; // per channel; applied below (one label per device-wide stall)
+
+    // Several channels can share one plot (the IMU's lanes): collect per plot,
+    // apply once. Rank: the worst state wins (stale > low > ok > none).
+    struct PlotState
+    {
+        PlotWidget *plot = nullptr;
+        int rateRank = -1;
+        QString rate;
+        QColor rateColor;
+        int tone = 0; // 0 off, 1 normal, 2 warn
+        bool ledWarn = false;
+        QString stall;
+    };
+    std::vector<PlotState> states;
+    auto stateFor = [&states] (PlotWidget *p) -> PlotState & {
+        for (PlotState &ps : states)
+            if (ps.plot == p)
+                return ps;
+        states.push_back (PlotState ());
+        states.back ().plot = p;
+        return states.back ();
+    };
+
     for (std::size_t i = 0; i < nch; ++i)
     {
-        const int si = static_cast<int> (stallTexts.size ());
-        stallTexts << QString ();
+        if (chans[i].spec.derived)
+            continue; // heart rate: updateHeartRate()
         RateMeter &m = s.meters[i];
         const std::uint64_t count = chans[i].ring->totalWritten ();
         if (active)
@@ -1514,22 +1774,32 @@ void MainWindow::updateStreamHealth (Slot &s, double now)
             p->setLed (active ? Theme::warn : (s.failed ? Theme::fault : Theme::textDim));
             p->setPlaceholder (active ? QStringLiteral ("AWAITING STREAM")
                                       : (s.failed ? QStringLiteral ("NO DATA") : QStringLiteral ("NO SIGNAL")));
+            p->setStallText (QString ());
             continue;
         }
         p->setPlaceholder (QStringLiteral ("AWAITING STREAM"));
+        PlotState &ps = stateFor (p);
         if (isStale)
         {
             // stalled: the measured rate is 0 by definition (the 2 s rate
             // window would otherwise still be decaying for another second)
-            p->setRate (Readouts::rateText (true, 0.0, nominal), Theme::warn);
+            if (ps.rateRank < 3)
+            {
+                ps.rateRank = 3;
+                ps.rate = Readouts::rateText (true, 0.0, nominal);
+                ps.rateColor = Theme::warn;
+            }
+            QString text;
             if (heldNow)
-                stallTexts[si] = QStringLiteral ("HELD · BRAINFLOW OPENING %1").arg (upperName (o.kind));
+                text = QStringLiteral ("HELD · BRAINFLOW OPENING %1").arg (upperName (o.kind));
             else if (have)
-                stallTexts[si] = QStringLiteral ("LAST SAMPLE %1 s AGO").arg (age, 0, 'f', 1);
+                text = QStringLiteral ("LAST SAMPLE %1 s AGO").arg (age, 0, 'f', 1);
             else
-                stallTexts[si] = QStringLiteral ("NO SAMPLES SINCE CONNECT · %1 s").arg (silent, 0, 'f', 1);
-            p->setTone (PlotWidget::Tone::Warn);
-            p->setLed (Theme::warn);
+                text = QStringLiteral ("NO SAMPLES SINCE CONNECT · %1 s").arg (silent, 0, 'f', 1);
+            if (ps.stall.isEmpty ())
+                ps.stall = text;
+            ps.tone = 2;
+            ps.ledWarn = true;
             if (s.partialText.isEmpty ())
             {
                 const QString title = QString::fromStdString (chans[i].spec.title);
@@ -1541,36 +1811,42 @@ void MainWindow::updateStreamHealth (Slot &s, double now)
         {
             const bool haveRate = have && rate > 0.0;
             const Readouts::RateTone rt = Readouts::rateTone (haveRate, rate, nominal);
-            const QColor rc = rt == Readouts::RateTone::None
-                ? Theme::textDim
-                : (rt == Readouts::RateTone::Low ? Theme::warn : Theme::textMuted);
-            p->setRate (Readouts::rateText (haveRate, rate, nominal), rc);
+            const int rank = rt == Readouts::RateTone::None ? 0 : (rt == Readouts::RateTone::Low ? 2 : 1);
+            if (rank > ps.rateRank)
+            {
+                ps.rateRank = rank;
+                ps.rate = Readouts::rateText (haveRate, rate, nominal);
+                ps.rateColor = rank == 0 ? Theme::textDim : (rank == 2 ? Theme::warn : Theme::textMuted);
+            }
             if (rt == Readouts::RateTone::Low && s.lowRate.isEmpty ())
                 s.lowRate = QStringLiteral ("%1 %2").arg (QString::fromStdString (chans[i].spec.title),
                     Readouts::rateText (true, rate, nominal));
             // The hero's LED stays the Cyton link state; near-rail is carried by
             // LATEST (amber), the headroom module and the banner.
             const bool warnHero = p == cytonPlot_ && nearRail_;
-            p->setTone (!have ? PlotWidget::Tone::Off : (warnHero ? PlotWidget::Tone::Warn : PlotWidget::Tone::Normal));
-            p->setLed (have ? Theme::ok : Theme::warn);
+            ps.tone = std::max (ps.tone, !have ? 0 : (warnHero ? 2 : 1));
+            ps.ledWarn = ps.ledWarn || !have;
         }
     }
+
     const bool allStale = streaming && total > 0 && stale == total;
-    // A device-wide stall is labelled once, on the device's last plot (MAG for
-    // the EmotiBit, as in the design); a partial stall labels each stale plot.
+    // A device-wide stall is labelled once, on the device's largest panel (the
+    // IMU for the EmotiBit); a partial stall labels each stale plot.
     PlotWidget *labelPlot = nullptr;
-    if (allStale && total > 1)
+    if (allStale && states.size () > 1)
     {
-        for (std::size_t i = 0; i < nch; ++i)
-            if (s.plots[i])
-                labelPlot = s.plots[i]; // the device's last plot ...
-        if (std::find (s.plots.begin (), s.plots.begin () + static_cast<std::ptrdiff_t> (nch), magPlot_) !=
-            s.plots.begin () + static_cast<std::ptrdiff_t> (nch))
-            labelPlot = magPlot_; // ... MAG when present, as in the design
+        labelPlot = states.back ().plot;
+        for (const PlotState &ps : states)
+            if (ps.plot == imuPlot_)
+                labelPlot = imuPlot_;
     }
-    for (std::size_t i = 0; i < nch; ++i)
-        if (PlotWidget *p = s.plots[i])
-            p->setStallText ((labelPlot && p != labelPlot) ? QString () : stallTexts[static_cast<int> (i)]);
+    for (const PlotState &ps : states)
+    {
+        ps.plot->setRate (ps.rate, ps.rateColor);
+        ps.plot->setTone (ps.tone == 2 ? PlotWidget::Tone::Warn : (ps.tone == 1 ? PlotWidget::Tone::Normal : PlotWidget::Tone::Off));
+        ps.plot->setLed (ps.ledWarn ? Theme::warn : Theme::ok);
+        ps.plot->setStallText ((labelPlot && ps.plot != labelPlot) ? QString () : ps.stall);
+    }
     const bool devStall = allStale && !heldNow;
     if (devStall && !s.stalled)
         s.stallSince = now - (std::isfinite (minAge) ? minAge : 0.0);
@@ -1583,25 +1859,53 @@ void MainWindow::updateStreamHealth (Slot &s, double now)
     s.pending = streaming && pending > 0;
 }
 
+void MainWindow::updateHeartRate (double now)
+{
+    const Slot &s = emotibit_;
+    const bool active = s.worker->isActive ();
+    const bool streaming = s.worker->state () == DeviceWorker::Streaming && !s.stopRequested;
+    const SignalChannel *hr = nullptr;
+    for (const SignalChannel &ch : s.worker->channels ())
+        if (ch.spec.derived && ch.spec.key == SignalKeys::EmotiHeartRate)
+            hr = &ch;
+    if (!streaming || !hr)
+    {
+        hrPlot_->setTone (PlotWidget::Tone::Off);
+        hrPlot_->setLed (active ? Theme::warn : (s.failed ? Theme::fault : Theme::textDim));
+        hrPlot_->setValueText (QString ());
+        hrPlot_->setStripChips ({{QStringLiteral ("SOURCE —"), false}, {QStringLiteral ("QUALITY —"), false}});
+        hrPlot_->setPlaceholder (active ? QStringLiteral ("AWAITING STREAM")
+                                        : (s.failed ? QStringLiteral ("NO DATA") : QStringLiteral ("NO SIGNAL")));
+        return;
+    }
+    double ts = kNaN;
+    std::vector<double> v;
+    const bool have = hr->ring->latest (ts, v) && static_cast<int> (v.size ()) >= HeartRateRing::Count;
+    const double age = have ? now - ts : kNaN;
+    const double sinceStream = std::isfinite (s.streamingSinceWall) ? now - s.streamingSinceWall : 0.0;
+    const Readouts::HeartRateView view = Readouts::heartRateView (true, have, age,
+        have ? v[HeartRateRing::Bpm] : kNaN, have ? v[HeartRateRing::Quality] : 0.0,
+        have ? static_cast<int> (v[HeartRateRing::Source]) : HeartRate::SourceNone,
+        have ? static_cast<int> (v[HeartRateRing::Beats]) : 0, have ? v[HeartRateRing::Periodicity] : 0.0, sinceStream);
+    hrPlot_->setValueText (view.value);
+    hrPlot_->setTone (view.warn ? PlotWidget::Tone::Warn : PlotWidget::Tone::Normal);
+    hrPlot_->setLed (view.valid ? Theme::ok : Theme::warn);
+    hrPlot_->setStripChips (
+        {{QStringLiteral ("SOURCE ") + view.source, view.valid}, {view.chip, view.valid, view.warn}});
+    hrPlot_->setPlaceholder (view.warn ? QStringLiteral ("NO HEART RATE") : QStringLiteral ("ACQUIRING HEART RATE"));
+}
+
 double MainWindow::cytonRawPeak (double now)
 {
     for (const SignalChannel &ch : cyton_.worker->channels ())
     {
-        if (ch.spec.key != SignalKeys::CytonCh1 || !ch.ring || ch.rawChannel < 0)
+        if (ch.spec.key != SignalKeys::CytonEcg || !ch.ring || ch.rawChannel < 0)
             continue;
         double ref = now;
         const double latest = ch.ring->latestTimestamp ();
         if (std::isfinite (latest) && std::fabs (latest - now) > 30.0)
             ref = latest; // timestamps far from the host clock: same anchor as the plot
-        const std::size_t n = ch.ring->copySince (ref - windowStepper_->value (), peakT_, peakV_);
-        if (ch.rawChannel >= static_cast<int> (peakV_.size ()))
-            return kNaN;
-        const std::vector<double> &raw = peakV_[static_cast<std::size_t> (ch.rawChannel)];
-        double peak = -1.0;
-        for (std::size_t k = 0; k < n; ++k)
-            if (std::isfinite (raw[k]))
-                peak = std::max (peak, std::fabs (raw[k]));
-        return peak >= 0.0 ? peak : kNaN;
+        return Readouts::ringPeakAbs (*ch.ring, ch.rawChannel, ref, Readouts::kRailWindowSec, peakT_, peakV_);
     }
     return kNaN;
 }
@@ -1609,15 +1913,19 @@ double MainWindow::cytonRawPeak (double now)
 void MainWindow::updateHeadroom (double now)
 {
     const bool streaming = isStreaming (DeviceKind::Cyton) && !cyton_.stopRequested;
-    // Straight from the Cyton ring over the window, not from the plot: it
-    // keeps following the live data while the display is paused.
+    // Straight from the Cyton ring over the last 2 s, not from the plot: it
+    // keeps following the live data while the display is paused, and clears
+    // within ~2 s once the input recovers.
     rawPeak_ = streaming ? cytonRawPeak (now) : kNaN;
     headroom_ = Readouts::railHeadroom (rawPeak_);
     const bool near = streaming && Readouts::nearRail (headroom_, nearRail_);
     if (near && !nearRail_)
         railSinceWall_ = now;
+    const bool changed = near != nearRail_;
     nearRail_ = near;
     cytonPlot_->setRailMode (near);
+    if (changed)
+        applyEcgChips ();
     if (!std::isfinite (headroom_))
     {
         railPct_->setText (QStringLiteral ("—"));
@@ -1630,11 +1938,29 @@ void MainWindow::updateHeadroom (double now)
     // colour follows the (hysteretic) near-rail state; the number is floored
     // so it never reads "10 %" while below the 10 % threshold
     const QColor c = near ? Theme::warn : Theme::ok;
-    railPct_->setText (Readouts::headroomPercent (headroom_));
+    railPct_->setText (Readouts::saturated (rawPeak_) ? QStringLiteral ("SATURATED") : Readouts::headroomPercent (headroom_));
     Theme::setTextColor (railPct_, c);
     railBar_->setValue (headroom_, c);
-    railNote_->setText (near ? QStringLiteral ("Near rail · check electrode contact") : peakText (rawPeak_));
+    railNote_->setText (Readouts::saturated (rawPeak_)
+            ? QStringLiteral ("At ±187,500 µV · check electrode contact")
+            : (near ? QStringLiteral ("Near rail · check electrode contact") : peakText (rawPeak_)));
     Theme::setTextColor (railNote_, near ? Theme::warn : Theme::textDim);
+}
+
+void MainWindow::applyEcgChips ()
+{
+    if (nearRail_)
+    {
+        // raw near-rail view: none of the display filters apply
+        cytonPlot_->setChips ({{QStringLiteral ("RAW"), true, true}});
+        return;
+    }
+    const bool dc = dcToggle_->isChecked (), hp = hpToggle_->isChecked (), notch = notchToggle_->isChecked (),
+               lp = lpToggle_->isChecked ();
+    cytonPlot_->setChips ({{dc ? QStringLiteral ("DC REMOVED") : QStringLiteral ("DC REMOVAL OFF"), dc},
+        {hp ? QStringLiteral ("HP 0.5 Hz") : QStringLiteral ("HP 0.5 Hz OFF"), hp},
+        {notch ? QStringLiteral ("NOTCH 60 Hz") : QStringLiteral ("NOTCH 60 Hz OFF"), notch},
+        {lp ? QStringLiteral ("LP 40 Hz") : QStringLiteral ("LP 40 Hz OFF"), lp}});
 }
 
 void MainWindow::updateRecordUi ()
@@ -1680,7 +2006,7 @@ void MainWindow::refreshChrome (double now)
     for (const Slot *s : {&cyton_, &emotibit_})
         if (s->worker->state () == DeviceWorker::Streaming)
         {
-            devs << (s->kind == DeviceKind::Cyton ? QStringLiteral ("ch1") : QStringLiteral ("emotibit"));
+            devs << (s->kind == DeviceKind::Cyton ? QStringLiteral ("ecg") : QStringLiteral ("emotibit"));
             allSynth = allSynth && s->synthetic;
         }
     if (std::isfinite (sessionStartWall_) && !devs.isEmpty ())
@@ -1783,22 +2109,27 @@ void MainWindow::refreshChrome (double now)
     statusStrip_->setRight (right);
 
     // ---- derived message / banner
+    // A missing Cyton dongle is only reported while nothing streams (the
+    // EmotiBit may be the only device in use); every other failure is a fault.
     const Slot *failedSlot = nullptr;
     for (const Slot *s : {&emotibit_, &cyton_})
-        if (s->failed && !s->worker->isActive ())
+        if (s->failed && !s->worker->isActive () &&
+            !(s->kind == DeviceKind::Cyton && s->failKind == DeviceWorker::FailNotFound && (cyOn || emOn || anyActive ())))
         {
             failedSlot = s;
             break;
         }
     const bool emDiscovering = emotibit_.worker->isActive () && emotibit_.worker->state () == DeviceWorker::Connecting &&
         !emotibit_.stopRequested && !emotibit_.synthetic;
-    const bool cyConnecting = cyton_.worker->isActive () && cyton_.worker->state () == DeviceWorker::Connecting;
+    const bool cyConnecting = cyton_.worker->isActive () && cyton_.worker->state () == DeviceWorker::Connecting &&
+        !cyton_.stopRequested;
     const Slot *stallSlot = emotibit_.stalled ? &emotibit_ : (cyton_.stalled ? &cyton_ : nullptr);
     const bool warn = stallSlot || nearRail_;
     if (warn && !std::isfinite (warnSinceWall_))
         warnSinceWall_ = stallSlot ? stallSlot->stallSince : railSinceWall_;
     if (!warn)
         warnSinceWall_ = kNaN;
+    const bool saturated = nearRail_ && Readouts::saturated (rawPeak_);
 
     QString dmsg;
     QColor dcol = Theme::textMuted;
@@ -1810,7 +2141,7 @@ void MainWindow::refreshChrome (double now)
         if (stallSlot)
             parts << QStringLiteral ("%1 stalled %2 s").arg (shortDeviceName (stallSlot->kind)).arg (stallSlot->stallAge, 0, 'f', 1);
         if (nearRail_)
-            parts << QStringLiteral ("Cyton Ch1 near rail");
+            parts << (saturated ? QStringLiteral ("ECG saturated") : QStringLiteral ("ECG near rail"));
         dmsg = parts.join (QStringLiteral (" · "));
         dcol = Theme::warn;
     }
@@ -1819,7 +2150,8 @@ void MainWindow::refreshChrome (double now)
         const double el = std::max (0.0, DeviceWorker::steadyNow () -
                 (emotibit_.worker->phase () == DeviceWorker::PhaseIdle ? emotibit_.connectStarted
                                                                          : emotibit_.worker->phaseSince ()));
-        dmsg = QStringLiteral ("Discovering EmotiBit — %1 s of %2 s elapsed")
+        dmsg = QStringLiteral ("%1Discovering EmotiBit — %2 s of %3 s elapsed")
+                   .arg (cyConnecting ? QStringLiteral ("Connecting Cyton · ") : QString ())
                    .arg (el, 0, 'f', 1)
                    .arg (emotibit_.worker->discoveryTimeout (), 0, 'f', 1);
         dcol = Theme::warn;
@@ -1827,9 +2159,11 @@ void MainWindow::refreshChrome (double now)
     else if (failedSlot)
     {
         if (failedSlot->kind == DeviceKind::EmotiBit && failedSlot->failKind == DeviceWorker::FailNotFound)
-            dmsg = failedSlot->typedIp.isEmpty ()
+            dmsg = (failedSlot->fieldBlank || failedSlot->typedIp.isEmpty ())
                 ? QStringLiteral ("EmotiBit not found on %1 — enter IP manually").arg (subnets ())
                 : QStringLiteral ("EmotiBit not found at %1 — check the IP address").arg (failedSlot->typedIp);
+        else if (failedSlot->kind == DeviceKind::Cyton && failedSlot->failKind == DeviceWorker::FailNotFound)
+            dmsg = QStringLiteral ("Cyton not found — no dongle on USB");
         else
             dmsg = QStringLiteral ("%1 connection failed — see the left rail").arg (shortDeviceName (failedSlot->kind));
         dcol = Theme::fault;
@@ -1868,12 +2202,14 @@ void MainWindow::refreshChrome (double now)
         }
         else if (wait)
             dmsg = QStringLiteral ("Waiting for the first %1 samples…").arg (shortDeviceName (wait->kind));
+        else if (cyton_.failed && cyton_.failKind == DeviceWorker::FailNotFound && !cyOn)
+            dmsg = QStringLiteral ("EmotiBit streams nominal · no Cyton dongle");
         else // every channel of every streaming device has data at a nominal rate
             dmsg = QStringLiteral ("All streams nominal");
     }
     else
     {
-        dmsg = QStringLiteral ("Select a serial port or an EmotiBit address to begin");
+        dmsg = QStringLiteral ("Press connect (%1) to start streaming").arg (keyText (kConnectKey));
         dcol = Theme::textDim;
     }
     // transient messages never hide a warning / fault / discovery status
@@ -1899,8 +2235,7 @@ void MainWindow::refreshChrome (double now)
             else
             {
                 const QString streams = stallSlot->staleCount == n
-                    ? (n == 5 ? QStringLiteral ("all five streams are frozen")
-                              : QStringLiteral ("all %1 streams are frozen").arg (n))
+                    ? QStringLiteral ("all %1 streams are frozen").arg (n)
                     : QStringLiteral ("%1 of %2 streams are frozen").arg (stallSlot->staleCount).arg (n);
                 sentences << QStringLiteral ("No %1 samples for %2 s — %3.")
                                  .arg (shortDeviceName (stallSlot->kind))
@@ -1909,36 +2244,39 @@ void MainWindow::refreshChrome (double now)
             }
         }
         if (nearRail_)
-            sentences << (stallSlot ? QStringLiteral ("Cyton Ch1 is also within %1 of the rail; reseat the electrode.")
-                                    : QStringLiteral ("Cyton Ch1 is within %1 of the ±187,500 µV rail; reseat the electrode or check contact."))
-                             .arg (Readouts::headroomPercent (headroom_));
+            sentences << Readouts::nearRailSentence (headroom_, rawPeak_, stallSlot != nullptr);
         const QDateTime since = QDateTime::fromMSecsSinceEpoch (static_cast<qint64> (
             (std::isfinite (warnSinceWall_) ? warnSinceWall_ : now) * 1000.0));
         banner_->setContent (Theme::warn, Theme::warnBack,
-            stallSlot ? QStringLiteral ("STREAM STALLED") : QStringLiteral ("NEAR RAIL"),
+            stallSlot ? QStringLiteral ("STREAM STALLED") : (saturated ? QStringLiteral ("SATURATED") : QStringLiteral ("NEAR RAIL")),
             sentences.join (QStringLiteral (" ")), QStringLiteral ("since %1").arg (since.toString (QStringLiteral ("HH:mm:ss"))));
     }
     else if (failedSlot)
     {
-        const bool nf = failedSlot->kind == DeviceKind::EmotiBit && failedSlot->failKind == DeviceWorker::FailNotFound;
+        const bool nf = failedSlot->failKind == DeviceWorker::FailNotFound;
         QString text;
-        if (nf)
-            text = failedSlot->typedIp.isEmpty ()
-                ? QStringLiteral ("EmotiBit did not answer the discovery broadcast. Enter its IP address in the left rail and connect again.")
+        if (nf && failedSlot->kind == DeviceKind::EmotiBit)
+            text = (failedSlot->fieldBlank || failedSlot->typedIp.isEmpty ())
+                ? QStringLiteral ("EmotiBit did not answer the discovery. Enter its IP address in the left rail and connect again.")
                 : QStringLiteral ("EmotiBit did not answer at %1. Check the address in the left rail and connect again.").arg (failedSlot->typedIp);
+        else if (nf)
+            text = QStringLiteral ("No Cyton dongle on USB. Plug it in, then connect again.");
         else
             text = QStringLiteral ("%1: %2").arg (shortDeviceName (failedSlot->kind), failedSlot->failText.section ('\n', 0, 0));
+        QString meta = QStringLiteral ("after %1 s").arg (failedSlot->failAfter, 0, 'f', 1);
+        if (nf && failedSlot->kind == DeviceKind::EmotiBit)
+            meta = QStringLiteral ("timeout after %1 s").arg (failedSlot->failTimeout, 0, 'f', 1);
+        else if (nf)
+            meta = QStringLiteral ("rescan: %1").arg (keyText (kRescanKey));
         banner_->setContent (Theme::fault, Theme::faultBack,
-            nf ? QStringLiteral ("DEVICE NOT FOUND") : QStringLiteral ("CONNECTION FAILED"), text,
-            nf ? QStringLiteral ("timeout after %1 s").arg (failedSlot->failTimeout, 0, 'f', 1)
-               : QStringLiteral ("after %1 s").arg (failedSlot->failAfter, 0, 'f', 1));
+            nf ? QStringLiteral ("DEVICE NOT FOUND") : QStringLiteral ("CONNECTION FAILED"), text, meta);
     }
     else if (recordWanted_ && isRecording ())
     {
         const int n = recFiles_.size ();
         banner_->setContent (Theme::fault, Theme::faultBack, QStringLiteral ("RECORDING"),
-            QStringLiteral ("Writing %1 CSV file%2 (BrainFlow rows). Streams and plots are unaffected; stop from the "
-                            "left rail when the block is finished.")
+            QStringLiteral ("Writing %1 CSV file%2 (raw BrainFlow rows; filters and heart rate are display-only). "
+                            "Stop from the left rail when the block is finished.")
                 .arg (n)
                 .arg (n == 1 ? QString () : QStringLiteral ("s")),
             QStringLiteral ("%1 · %2").arg (homeAbbrev (opts_.recordDir), Readouts::bytes (recBytes_)));
@@ -1965,44 +2303,50 @@ void MainWindow::refreshPorts (bool announce)
     const QStringList entries = QDir (QStringLiteral ("/dev"))
                                     .entryList (QStringList {QStringLiteral ("cu.usbserial-*")},
                                         QDir::System | QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
+    ports << QStringLiteral ("Auto");
     for (const QString &e : entries)
         ports << QStringLiteral ("/dev/") + e;
-    if (!opts_.cytonPort.isEmpty () && !ports.contains (opts_.cytonPort))
-        ports << opts_.cytonPort; // keep the default selectable even when unplugged
+    const QString keep = current.isEmpty () ? portOverride_ : current;
+    if (!isAuto (keep) && !ports.contains (keep))
+        ports << keep; // keep a chosen override selectable even when unplugged
+    portCombo_->blockSignals (true);
     portCombo_->clear ();
     portCombo_->addItems (ports);
-    if (ports.size () <= 1)
+    if (entries.isEmpty ())
     {
-        portCombo_->addItem (entries.isEmpty () ? QStringLiteral ("no USB serial ports found")
-                                                : QStringLiteral ("no other ports found"));
+        portCombo_->addItem (QStringLiteral ("no USB serial ports found"));
         if (auto *m = qobject_cast<QStandardItemModel *> (portCombo_->model ()))
             m->item (portCombo_->count () - 1)->setEnabled (false);
     }
-    const QString want = current.isEmpty () ? opts_.cytonPort : current;
-    portCombo_->setCurrentText (want);
+    portCombo_->setCurrentText (isAuto (keep) ? QStringLiteral ("Auto") : keep);
+    portCombo_->blockSignals (false);
     if (portCombo_->lineEdit ())
         portCombo_->lineEdit ()->setCursorPosition (0); // show the start of the path
+    detectedPort_ = cytonPortFor (QString ());
     if (statusStrip_ && announce)
         showMessage (QStringLiteral ("Found %1 USB serial port(s)").arg (entries.size ()), 3000);
+    if (cyton_.meta)
+        updateSlotUi (cyton_);
 }
 
 void MainWindow::applyFilterSettings ()
 {
-    const bool dc = dcToggle_->isChecked (), hp = hpToggle_->isChecked (), notch = notchToggle_->isChecked ();
+    const bool dc = dcToggle_->isChecked (), hp = hpToggle_->isChecked (), notch = notchToggle_->isChecked (),
+               lp = lpToggle_->isChecked ();
     cytonPlot_->setRemoveMean (dc);
     cytonPlot_->setSymmetric (dc || hp);
-    cytonPlot_->setChips ({{dc ? QStringLiteral ("DC REMOVED") : QStringLiteral ("DC REMOVAL OFF"), dc},
-        {hp ? QStringLiteral ("HP 1 Hz") : QStringLiteral ("HP 1 Hz OFF"), hp},
-        {notch ? QStringLiteral ("NOTCH 60 Hz") : QStringLiteral ("NOTCH 60 Hz OFF"), notch}});
-    cyton_.worker->setHighPass (hp, 1.0);
-    cyton_.worker->setNotch (notch, 60.0);
+    applyEcgChips ();
+    cyton_.worker->setHighPass (hp, kEcgHighPassHz);
+    cyton_.worker->setNotch (notch, kEcgNotchHz);
+    cyton_.worker->setLowPass (lp, kEcgLowPassHz);
     emotibit_.worker->setHighPass (false);
     emotibit_.worker->setNotch (false);
+    emotibit_.worker->setLowPass (false);
 }
 
 void MainWindow::updateWindowTitle ()
 {
-    setWindowTitle (QStringLiteral ("Cyton + EmotiBit live stream%1")
+    setWindowTitle (QStringLiteral ("bioacq · Cyton ECG + EmotiBit%1")
                         .arg (synthToggle_->isChecked () ? QStringLiteral ("  [SYNTHETIC]") : QString ()));
 }
 
@@ -2021,8 +2365,10 @@ void MainWindow::onRateTimer ()
     updateHeadroom (now);
     for (Slot *s : {&cyton_, &emotibit_})
         updateStreamHealth (*s, now);
+    updateHeartRate (now);
     for (Slot *s : {&cyton_, &emotibit_})
         updateSlotUi (*s);
+    updateConnectUi ();
     updateRecordUi ();
     refreshChrome (now);
 }
@@ -2031,6 +2377,8 @@ void MainWindow::onSlowTimer ()
 {
     cpu_.sample (); // only here: every CPU reading covers the last ~1 s
     pollRecordingSizes ();
+    if (!cyton_.worker->isActive ())
+        detectedPort_ = cytonPortFor (QString ()); // the idle detail line follows plugging / unplugging
 }
 
 void MainWindow::pollRecordingSizes ()
@@ -2065,6 +2413,8 @@ void MainWindow::closeEvent (QCloseEvent *event)
     if (closing_)
         return;
     closing_ = true;
+    if (errorDialog_)
+        errorDialog_->close ();
 
     // Forced-exit deadline from the actual configuration. Each worker may first
     // have to wait for the other one's BrainFlow call (one global lock), so
@@ -2078,6 +2428,7 @@ void MainWindow::closeEvent (QCloseEvent *event)
             s->worker->requestStop ();
             updateSlotUi (*s);
         }
+    updateConnectUi ();
     centralWidget ()->setEnabled (false);
     showMessage (QStringLiteral ("Closing — stopping streams and releasing devices…"), 600000);
     hide (); // the close takes effect at once; the release finishes in the background

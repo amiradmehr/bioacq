@@ -54,7 +54,12 @@ inline const QColor traceY {0x6F, 0xA8, 0xA8};  // dashed 7 4
 inline const QColor traceZ {0xD9, 0xD5, 0xC7};  // dotted 2 4
 inline const QColor traceHero {0xBF, 0xA0, 0x5A};
 inline const QColor traceTemp {0xBF, 0xA0, 0x5A};
-inline const QColor tracePpg {0x7F, 0xBF, 0x7F};
+// PPG ink follows the LED colour, as the design's PPG GREEN panel does with
+// #7FBF7F; infrared has no colour, so it takes the design's teal trace ink.
+inline const QColor tracePpgGreen {0x7F, 0xBF, 0x7F};
+inline const QColor tracePpgRed {0xC0, 0x7A, 0x6E};
+inline const QColor tracePpgIr {0x6F, 0xA8, 0xA8};
+inline const QColor traceHeartRate {0xD9, 0xD5, 0xC7};
 inline const QColor zeroLine {0x30, 0x31, 0x30};
 
 // ---- geometry ---------------------------------------------------------------

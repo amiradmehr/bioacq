@@ -5,6 +5,7 @@
 #include "SignalSpec.h"
 
 #include <QMainWindow>
+#include <QPointer>
 #include <QString>
 #include <QStringList>
 
@@ -18,6 +19,7 @@ class QCloseEvent;
 class QFrame;
 class QLabel;
 class QLineEdit;
+class QMessageBox;
 class QPushButton;
 class QSpinBox;
 class QTimer;
@@ -41,15 +43,20 @@ inline constexpr int kMaxDiscoveryTimeoutSec = 20;
 struct LaunchOptions
 {
     bool synthetic = false;
-    QString cytonPort; // empty = auto-detect (main.cpp preselects findCytonDongle ())
-    QString emotibitIp = QStringLiteral ("192.168.1.12"); // blank = broadcast discovery
+    // Cyton: the port auto-detect prefers (the last port that connected, or the
+    // dongle main.cpp detected); an explicit --port (portSet) becomes the rail's
+    // port override instead.
+    QString cytonPort;
+    QString emotibitIp = QStringLiteral ("192.168.1.12"); // blank = last IP that answered, then broadcast
     int emotibitTimeoutSec = 5;
     QString recordDir;
     bool record = false; // arm recording: every device records from its first sample
     int windowSec = 10;
+    // ECG display filters (all on by default)
     bool removeDc = true;
-    bool highPass = false;
-    bool notch = false;
+    bool highPass = true; // 0.5 Hz
+    bool notch = true;    // 60 Hz
+    bool lowPass = true;  // 40 Hz
     bool brainflowDiscovery = false; // --bf-discovery: let BrainFlow search (holds its lock)
 
     // QSettings: restore the last used values at start, save them on a
@@ -64,9 +71,13 @@ struct LaunchOptions
     bool recordSet = false;
 
     // Test hooks (command line only; no UI): freeze EmotiBit polling after N s
-    // of streaming, add a DC offset to the Cyton's raw display value.
+    // of streaming, add a DC offset to the Cyton's raw display value, replace
+    // the EmotiBit PPG display values with a synthetic pulse at N bpm.
     double testFreezeEmotibitSec = -1.0;
     double testRailOffsetUv = 0.0;
+    double testPpgBpm = 0.0;
+    // --screenshot "connecting" only: hold the Cyton before prepare_session.
+    int testCytonPrepareDelayMs = 0;
 };
 
 class MainWindow : public QMainWindow
@@ -77,17 +88,22 @@ public:
     explicit MainWindow (const LaunchOptions &opts, QWidget *parent = nullptr);
     ~MainWindow () override;
 
-    // Connect with the rail's settings (the "Simulate devices" toggle picks
-    // the synthetic board) / with an explicit board choice.
-    void connectDevice (DeviceKind kind);
-    void connectDeviceWith (DeviceKind kind, bool synthetic);
-    void disconnectDevice (DeviceKind kind);
+    // The Connect button: starts both devices at once with the rail's
+    // settings (the "simulate devices" switch picks the synthetic board).
+    void connectAll ();
+    // Same, with an explicit board choice per device (--screenshot states).
+    void connectAllWith (bool cytonSynthetic, bool emotibitSynthetic);
+    // Cancel the attempts still in progress (streaming devices keep streaming).
+    void cancelPending ();
+    void disconnectAll ();
     // Same as pressing the record button: start / stop recording on every
     // streaming device (and arm it for devices that connect later).
     void setRecording (bool on);
     bool isRecording () const;
     bool isStreaming (DeviceKind kind) const;
     bool anyActive () const;
+    bool anyConnecting () const;
+    bool anyStreaming () const;
 
 protected:
     void closeEvent (QCloseEvent *event) override;
@@ -99,8 +115,7 @@ private:
         DeviceWorker *worker = nullptr;
         // rail widgets
         StatusChip *chip = nullptr;
-        QPushButton *button = nullptr;
-        QLabel *meta = nullptr;
+        QLabel *meta = nullptr; // one-line detail: port / IP + device id / failure reason
         QWidget *errorWrap = nullptr;
         QLabel *errorTitle = nullptr;
         QLabel *errorText = nullptr;
@@ -108,14 +123,15 @@ private:
 
         std::vector<RateMeter> meters;   // parallel to worker->channels()
         std::vector<PlotWidget *> plots; // parallel to worker->channels()
+        std::vector<int> lanes;          // the plot lane of each channel
         bool stopRequested = false;
-        bool synthetic = false;     // current/last session runs on the synthetic board
-        bool autoDiscovery = false; // EmotiBit: blank IP, broadcast discovery pending
-        QString address;            // serial port / EmotiBit IP of the session
-        QString typedIp;            // EmotiBit: the IP field at connect ("" = broadcast)
-        QString serial;             // EmotiBit serial from discovery
-        QString targets;            // EmotiBit: discovery targets (display)
-        QString progressText;       // latest connecting-phase text
+        bool synthetic = false;      // current/last session runs on the synthetic board
+        bool fieldBlank = false;     // EmotiBit: the IP field was blank at connect
+        QString address;             // serial port / EmotiBit IP of the session
+        QString typedIp;             // EmotiBit: unicast target at connect ("" = broadcast)
+        QString serial;              // EmotiBit serial from discovery
+        QString targets;             // EmotiBit: discovery targets (display)
+        QString progressText;        // latest connecting-phase text
         double connectStarted = 0.0; // DeviceWorker::steadyNow() at connect
         double linkSeconds = std::numeric_limits<double>::quiet_NaN ();
         double streamingSinceWall = std::numeric_limits<double>::quiet_NaN (); // wall clock at Streaming
@@ -133,7 +149,7 @@ private:
         double stallAge = 0.0;
         int staleCount = 0;  // channels without a new sample past their threshold
         int neverCount = 0;  // ... of which never delivered one since streaming began
-        int dataCount = 0;   // channels of the session
+        int dataCount = 0;   // BrainFlow channels of the session (derived ones excluded)
         bool pending = false; // streaming, some channel still inside its first-sample grace
         double rateSum = 0.0;
         QString lowRate;     // "PPG green 18.1 / 25 Hz" when below tolerance
@@ -154,6 +170,7 @@ private:
     }
 
     QWidget *buildRail ();
+    QWidget *buildConnectModule ();
     QWidget *buildCytonModule ();
     QWidget *buildEmotibitModule ();
     QWidget *buildDisplayModule ();
@@ -163,18 +180,27 @@ private:
     QWidget *buildIdleOverlay ();
 
     void wireWorker (DeviceKind kind);
-    void onButton (DeviceKind kind);
+    void onConnectButton ();
+    void connectDeviceWith (DeviceKind kind, bool synthetic);
+    void disconnectDevice (DeviceKind kind);
+    void updateConnectUi ();
     void updateSlotUi (Slot &s);
     void updateDiscoverBox (Slot &s);
     void updateErrorBox (Slot &s);
+    bool showsErrorBox (const Slot &s) const;
+    void showErrorDialog (const Slot &s);
     void updateStreamHealth (Slot &s, double now);
+    void updateHeartRate (double now);
     void updateHeadroom (double now);
-    double cytonRawPeak (double now); // max |raw Ch1| over the window, from the ring
+    double cytonRawPeak (double now); // max |raw ECG| over the last Readouts::kRailWindowSec
+    void applyEcgChips ();
     void updateRecordUi ();
     void pollRecordingSizes ();
     void refreshChrome (double now);
     QString metaText (const Slot &s) const;
     void refreshPorts (bool announce = true); // announce: "Found N USB serial port(s)"
+    QString portOverride () const;            // the rail's port choice, "" = auto-detect
+    QString cytonPortFor (const QString &override) const;
     void applyFilterSettings ();
     void updateWindowTitle ();
     void onFrame ();
@@ -184,8 +210,8 @@ private:
     void loadSettings ();
     void saveSettings ();
     void saveDeviceAddress (DeviceKind kind, const QString &address);
-    PlotWidget *plotForKey (const std::string &key) const;
-    std::array<PlotWidget *, 6> allPlots () const;
+    PlotWidget *plotForKey (const std::string &key, int *lane = nullptr) const;
+    std::array<PlotWidget *, 7> allPlots () const;
     const QString &subnets ();
 
     LaunchOptions opts_;
@@ -193,25 +219,29 @@ private:
     Slot emotibit_;
     bool closing_ = false;
 
+    // rail: connect
+    QPushButton *connectBtn_ = nullptr;
     // rail: Cyton
     PortCombo *portCombo_ = nullptr;
     RescanButton *refreshBtn_ = nullptr;
+    QString portOverride_;  // restored / --port; "" = auto-detect
+    QString detectedPort_;  // auto-detect result, refreshed at 1 Hz while idle
     ToggleSwitch *dcToggle_ = nullptr;
     ToggleSwitch *hpToggle_ = nullptr;
     ToggleSwitch *notchToggle_ = nullptr;
+    ToggleSwitch *lpToggle_ = nullptr;
     QLabel *railPct_ = nullptr;
     MeterBar *railBar_ = nullptr;
     QLabel *railNote_ = nullptr;
     // rail: EmotiBit
     QLineEdit *ipEdit_ = nullptr;
     QSpinBox *timeoutSpin_ = nullptr;
-    QLabel *ipHint_ = nullptr;
+    QString lastEmotibitIp_; // the last EmotiBit that answered (blank field: tried first)
     QWidget *discoverWrap_ = nullptr;
     QLabel *discoverTitle_ = nullptr;
     QLabel *discoverTime_ = nullptr;
     MeterBar *discoverBar_ = nullptr;
     QLabel *discoverDetail_ = nullptr;
-    QPushButton *cancelDiscoveryBtn_ = nullptr;
     // rail: display
     Stepper *windowStepper_ = nullptr;
     ToggleSwitch *pauseToggle_ = nullptr;
@@ -227,14 +257,16 @@ private:
     StatusStrip *statusStrip_ = nullptr;
     Banner *banner_ = nullptr;
     QWidget *idleOverlay_ = nullptr;
+    QPointer<QMessageBox> errorDialog_;
 
     // plots
     PlotWidget *cytonPlot_ = nullptr;
+    PlotWidget *ppgGreenPlot_ = nullptr;
+    PlotWidget *ppgRedPlot_ = nullptr;
+    PlotWidget *ppgIrPlot_ = nullptr;
+    PlotWidget *hrPlot_ = nullptr;
+    PlotWidget *imuPlot_ = nullptr;
     PlotWidget *tempPlot_ = nullptr;
-    PlotWidget *ppgPlot_ = nullptr;
-    PlotWidget *accelPlot_ = nullptr;
-    PlotWidget *gyroPlot_ = nullptr;
-    PlotWidget *magPlot_ = nullptr;
 
     QTimer *frameTimer_ = nullptr;
     QTimer *rateTimer_ = nullptr;

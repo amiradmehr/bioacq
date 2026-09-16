@@ -29,12 +29,17 @@ struct ChannelCandidate
 struct SignalDef
 {
     std::string key;
-    std::string title;
+    std::string title; // short name for status text ("PPG green")
     std::string units;
     std::vector<std::string> traceNames;
     std::vector<ChannelCandidate> candidates; // tried in order; first match wins
-    bool filterable = false;                  // HP/notch filters may be applied in the worker
+    bool filterable = false;                  // HP / notch / LP filters may be applied in the worker
     int valueDecimals = 2;
+    // PPG channel index for HeartRate::Tracker (HeartRate::Source), -1 = none.
+    int heartRateInput = -1;
+    // Non-empty: no BrainFlow rows; the worker computes this signal from the
+    // listed signals (resolved when at least one of them is).
+    std::vector<std::string> derivedFrom;
 };
 
 struct ResolvedSignal
@@ -49,6 +54,8 @@ struct ResolvedSignal
     double nominalRate = 0.0;
     bool filterable = false;
     int valueDecimals = 2;
+    int heartRateInput = -1;
+    bool derived = false;     // computed in the worker (rows empty, timestampRow -1)
     std::string source;       // e.g. "ppg_channels[2] @ auxiliary, row 3"
     bool substituted = false; // resolved through a fallback candidate / clamped index
 };
@@ -61,13 +68,28 @@ enum class DeviceKind
 
 namespace SignalKeys
 {
-inline constexpr char CytonCh1[] = "cyton.ch1";
-inline constexpr char EmotiTemp[] = "emotibit.temp";
+inline constexpr char CytonEcg[] = "cyton.ecg"; // EXG channel 1
 inline constexpr char EmotiPpgGreen[] = "emotibit.ppg_green";
+inline constexpr char EmotiPpgRed[] = "emotibit.ppg_red";
+inline constexpr char EmotiPpgIr[] = "emotibit.ppg_ir";
+inline constexpr char EmotiTemp[] = "emotibit.temp";
 inline constexpr char EmotiAccel[] = "emotibit.accel";
 inline constexpr char EmotiGyro[] = "emotibit.gyro";
 inline constexpr char EmotiMag[] = "emotibit.mag";
+inline constexpr char EmotiHeartRate[] = "emotibit.hr"; // derived from the three PPG channels
 } // namespace SignalKeys
+
+// Ring channels of the derived heart-rate signal: one sample per beat of the
+// source channel (bpm), or a status sample while there is no valid HR (bpm NaN).
+namespace HeartRateRing
+{
+inline constexpr int Bpm = 0;
+inline constexpr int Quality = 1;     // 0..1
+inline constexpr int Source = 2;      // HeartRate::Source, -1 = none
+inline constexpr int Beats = 3;       // beats in the estimate window
+inline constexpr int Periodicity = 4; // autocorrelation at the beat interval
+inline constexpr int Count = 5;
+} // namespace HeartRateRing
 
 const char *channelKindName (ChannelKind kind);
 std::string presetName (int preset);

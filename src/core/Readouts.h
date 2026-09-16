@@ -1,28 +1,41 @@
 #pragma once
 
 // Pure readout logic behind the instrument panel: rail headroom, rate tone,
-// stall detection, package-number gaps, number formatting, CPU meter.
-// Header-only and free of widgets so --selftest can check every rule.
+// stall detection, package-number gaps, heart-rate readout, number
+// formatting, CPU meter. Header-only and free of widgets so --selftest can
+// check every rule.
+
+#include "HeartRate.h"
+#include "RingBuffer.h"
 
 #include <QString>
 #include <QStringList>
 
 #include <sys/resource.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 namespace Readouts
 {
 
 // OpenBCI Cyton (ADS1299, gain 24): +-4.5 V / 24 = +-187,500 uV full scale.
 inline constexpr double kCytonFullScaleUv = 187500.0;
+// |raw| at or above this is the ADC's full-scale code: the input is saturated.
+inline constexpr double kCytonSaturatedUv = 187499.0;
 // Headroom below which Ch1 counts as "near rail" (enter / leave, hysteresis).
 inline constexpr double kNearRailEnter = 0.10;
 inline constexpr double kNearRailLeave = 0.12;
+// Headroom and the near-rail state are judged on raw Ch1 over this trailing
+// window only, so the warning clears within about this long after the input
+// recovers (a whole-plot window kept it up for as long as the old peak stayed
+// on screen).
+inline constexpr double kRailWindowSec = 2.0;
 // A stream with no new samples for longer than this is "stalled".
 inline constexpr double kStallSeconds = 1.0;
 // Rate readout turns amber when more than this fraction below nominal.
@@ -42,6 +55,27 @@ inline bool nearRail (double headroom, bool wasNear)
     if (!std::isfinite (headroom))
         return false;
     return wasNear ? headroom < kNearRailLeave : headroom < kNearRailEnter;
+}
+
+inline bool saturated (double peakAbs)
+{
+    return std::isfinite (peakAbs) && std::fabs (peakAbs) >= kCytonSaturatedUv;
+}
+
+// Largest |value| of ring channel `channel` over samples stamped at or after
+// tEnd - seconds (NaN if there are none). t / v are reused copy buffers.
+inline double ringPeakAbs (const SignalRing &ring, int channel, double tEnd, double seconds, std::vector<double> &t,
+    std::vector<std::vector<double>> &v)
+{
+    const std::size_t n = ring.copySince (tEnd - seconds, t, v);
+    if (channel < 0 || channel >= static_cast<int> (v.size ()))
+        return std::numeric_limits<double>::quiet_NaN ();
+    const std::vector<double> &c = v[static_cast<std::size_t> (channel)];
+    double peak = -1.0;
+    for (std::size_t k = 0; k < n; ++k)
+        if (std::isfinite (c[k]))
+            peak = std::max (peak, std::fabs (c[k]));
+    return peak >= 0.0 ? peak : std::numeric_limits<double>::quiet_NaN ();
 }
 
 enum class RateTone
@@ -95,6 +129,20 @@ inline QString headroomPercent (double headroom)
     return QString::number (p, 'f', 1) + QStringLiteral (" %");
 }
 
+// Banner sentence for the near-rail warning. At full scale the percentage is
+// meaningless ("within 0.0 %"), so the input is called saturated instead.
+inline QString nearRailSentence (double headroom, double peakAbs, bool afterStall)
+{
+    if (saturated (peakAbs))
+        return afterStall
+            ? QStringLiteral ("ECG is also saturated at ±187,500 µV — reseat the electrode or check contact.")
+            : QStringLiteral ("ECG saturated at ±187,500 µV — reseat the electrode or check contact.");
+    return afterStall
+        ? QStringLiteral ("ECG is also within %1 of the rail; reseat the electrode.").arg (headroomPercent (headroom))
+        : QStringLiteral ("ECG is within %1 of the ±187,500 µV rail; reseat the electrode or check contact.")
+              .arg (headroomPercent (headroom));
+}
+
 // Counts packets missing from a wrapping package-number sequence (Cyton and
 // BrainFlow's synthetic board: 0..255). `last` carries the previous number
 // across calls (-1 = none yet). Returns the number of missing packets.
@@ -119,6 +167,61 @@ inline std::uint64_t packageGaps (int &last, const double *v, std::size_t n, int
         last = cur;
     }
     return missing;
+}
+
+// ---------------------------------------------------------------- heart rate
+// A heart-rate sample older than this is stale (the worker publishes one per
+// beat, or a status sample every second while there is no valid HR).
+inline double heartRateMaxAge (double bpm)
+{
+    return std::isfinite (bpm) && bpm > 0.0 ? std::max (3.0, 1.0 + 1.5 * 60.0 / bpm) : 3.0;
+}
+
+struct HeartRateView
+{
+    QString value = QStringLiteral ("—");  // "72" or "—"
+    QString source = QStringLiteral ("—"); // "GREEN" / "RED" / "IR" / "—"
+    // status chip: "QUALITY 95 %" with an HR; otherwise why there is none:
+    // "ACQUIRING", "NO PULSE", "IRREGULAR · Q 45 %", "NO DATA"
+    QString chip = QStringLiteral ("QUALITY —");
+    bool valid = false;
+    bool warn = false; // streaming for a while, but no heart rate
+};
+
+// Latest sample of the derived heart-rate ring -> readout. No value is shown
+// unless the newest sample is fresh and carries a valid HR. For the first
+// estimate window after the stream starts, a missing HR reads ACQUIRING.
+inline HeartRateView heartRateView (bool streaming, bool haveSample, double ageSec, double bpm, double quality,
+    int source, int beats, double periodicity, double sinceStreamSec)
+{
+    HeartRateView v;
+    if (!streaming)
+        return v;
+    const bool acquiring = !(sinceStreamSec >= HeartRate::kWindowSec);
+    const QString q = QString::number (std::floor (std::clamp (quality, 0.0, 1.0) * 100.0 + 1e-9), 'f', 0) +
+        QStringLiteral (" %");
+    if (haveSample && std::isfinite (ageSec) && ageSec <= heartRateMaxAge (bpm) && std::isfinite (bpm))
+    {
+        v.value = QString::number (std::lround (bpm));
+        v.source = QString::fromUtf8 (HeartRate::sourceName (source));
+        v.chip = QStringLiteral ("QUALITY ") + q;
+        v.valid = true;
+        return v;
+    }
+    if (haveSample && (!std::isfinite (ageSec) || ageSec > heartRateMaxAge (bpm)))
+    {
+        v.chip = QStringLiteral ("NO DATA"); // the PPG stopped arriving
+        v.warn = true;
+        return v;
+    }
+    if (!haveSample || acquiring)
+        v.chip = acquiring ? QStringLiteral ("ACQUIRING") : QStringLiteral ("NO DATA");
+    else if (beats < HeartRate::kMinBeats || periodicity < HeartRate::kMinPeriodicity || quality >= HeartRate::kMinQuality)
+        v.chip = QStringLiteral ("NO PULSE");
+    else
+        v.chip = QStringLiteral ("IRREGULAR · Q ") + q;
+    v.warn = !acquiring;
+    return v;
 }
 
 // ---------------------------------------------------------------- formatting

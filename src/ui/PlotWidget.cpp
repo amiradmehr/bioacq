@@ -81,14 +81,48 @@ double baselineFor (const QFontMetricsF &fm, double cy)
     return cy + (fm.ascent () - fm.descent ()) / 2.0;
 }
 
+// 14 x 6 legend line in the trace's colour and dash pattern (4 2.5 / 1 2.5).
+void legendGlyph (QPainter &p, const PlotWidget::Trace &tr, double x0, double cy)
+{
+    QPen pen (tr.color, 2.0);
+    pen.setCapStyle (Qt::FlatCap);
+    if (tr.dash == PlotWidget::Dash::Dashed)
+        pen.setDashPattern ({4.0 / 2.0, 2.5 / 2.0});
+    else if (tr.dash == PlotWidget::Dash::Dotted)
+        pen.setDashPattern ({1.0 / 2.0, 2.5 / 2.0});
+    p.save ();
+    p.setRenderHint (QPainter::Antialiasing);
+    p.setPen (pen);
+    p.drawLine (QPointF (x0, std::round (cy)), QPointF (x0 + 14.0, std::round (cy)));
+    p.restore ();
+}
+
 const QString kNoValue = QStringLiteral ("——");
 
 } // namespace
 
+PlotWidget::PlotWidget (Kind kind, const QString &title, const QVector<LaneSpec> &lanes, QWidget *parent)
+    : QWidget (parent), kind_ (kind), title_ (title), led_ (Theme::controlEdge), rateColor_ (Theme::textDim),
+      placeholder_ (QStringLiteral ("NO SIGNAL"))
+{
+    for (const LaneSpec &s : lanes)
+    {
+        Lane L;
+        L.spec = s;
+        lanes_.push_back (L);
+    }
+    if (lanes_.empty ())
+        lanes_.push_back (Lane ());
+    init ();
+}
+
 PlotWidget::PlotWidget (
     Kind kind, const QString &title, const QString &units, const QVector<Trace> &traces, QWidget *parent)
-    : QWidget (parent), kind_ (kind), title_ (title), units_ (units), led_ (Theme::controlEdge),
-      rateColor_ (Theme::textDim), placeholder_ (QStringLiteral ("NO SIGNAL")), traces_ (traces)
+    : PlotWidget (kind, title, QVector<LaneSpec> {{QString (), units, traces, 0.0}}, parent)
+{
+}
+
+void PlotWidget::init ()
 {
     setAttribute (Qt::WA_OpaquePaintEvent);
     setSizePolicy (QSizePolicy::Expanding, QSizePolicy::Expanding);
@@ -99,7 +133,7 @@ PlotWidget::PlotWidget (
     fSub_ = Theme::sans (11);
     fChip_ = Theme::mono (9.5, 400, 0.1);
     fKicker_ = Theme::mono (9, 400, 0.12);
-    fValue_ = hero ? Theme::mono (19, 600) : Theme::mono (14, 600);
+    fValue_ = (hero || kind_ == Kind::Vital) ? Theme::mono (19, 600) : Theme::mono (14, 600);
     fValueUnit_ = Theme::mono (11);
     fRate_ = Theme::mono (hero ? 12.0 : 10.0);
     fLetter_ = Theme::mono (9.5);
@@ -108,15 +142,18 @@ PlotWidget::PlotWidget (
     fEmpty_ = Theme::mono (hero ? 11.0 : 10.0, 400, 0.16);
     fStall_ = Theme::mono (10, 400, 0.14);
 
-    const std::size_t nTr = static_cast<std::size_t> (traces_.size ());
-    polys_.resize (nTr);
-    segCount_.assign (nTr, 0);
-    means_.assign (nTr, 0.0);
-    denseFlags_.resize (nTr);
-    denseMode_.assign (nTr, 0);
-    for (int i = 0; i < traces_.size (); ++i)
-        valueText_ << kNoValue;
-    ppText_ = QStringLiteral ("— ") + units_;
+    for (Lane &L : lanes_)
+    {
+        const std::size_t nTr = static_cast<std::size_t> (L.spec.traces.size ());
+        L.polys.resize (nTr);
+        L.segCount.assign (nTr, 0);
+        L.means.assign (nTr, 0.0);
+        L.denseFlags.resize (nTr);
+        L.denseMode.assign (nTr, 0);
+        for (int i = 0; i < L.spec.traces.size (); ++i)
+            valueText_ << kNoValue;
+    }
+    ppText_ = QStringLiteral ("— ") + units ();
 }
 
 // ------------------------------------------------------------------ setters
@@ -130,9 +167,14 @@ void PlotWidget::setTitle (const QString &title)
 
 void PlotWidget::setUnits (const QString &units)
 {
-    if (units == units_)
+    setLaneUnits (0, units);
+}
+
+void PlotWidget::setLaneUnits (int lane, const QString &units)
+{
+    if (lane < 0 || lane >= laneCount () || units == lanes_[static_cast<std::size_t> (lane)].spec.units)
         return;
-    units_ = units;
+    lanes_[static_cast<std::size_t> (lane)].spec.units = units;
     cacheValid_ = false;
     refreshHeaderText ();
     update ();
@@ -152,6 +194,23 @@ void PlotWidget::setChips (const QVector<Chip> &chips)
         return;
     chips_ = chips;
     updateHeader ();
+}
+
+void PlotWidget::setStripChips (const QVector<Chip> &chips)
+{
+    if (chips == stripChips_)
+        return;
+    stripChips_ = chips;
+    updateHeader ();
+}
+
+void PlotWidget::setValueText (const QString &text)
+{
+    if (text == valueOverride_)
+        return;
+    valueOverride_ = text;
+    if (refreshHeaderText ())
+        updateHeader ();
 }
 
 void PlotWidget::setLed (const QColor &c)
@@ -212,7 +271,7 @@ void PlotWidget::setRailMode (bool on)
         return;
     railMode_ = on;
     dirty_ = true;
-    yValid_ = false; // the autoscale restarts from the displayed data afterwards
+    lanes_.front ().yValid = false; // the autoscale restarts from the displayed data afterwards
     cacheValid_ = false;
     refreshHeaderText ();
     rebuild ();
@@ -238,21 +297,24 @@ void PlotWidget::setOverlay (QWidget *w)
 }
 
 void PlotWidget::setSource (
-    std::shared_ptr<SignalRing> ring, int rawChannel, double nominalRate, int valueDecimals)
+    int lane, std::shared_ptr<SignalRing> ring, int rawChannel, double nominalRate, int valueDecimals)
 {
-    ring_ = std::move (ring);
-    rawChannel_ = rawChannel;
-    nominalRate_ = nominalRate;
-    decimals_ = valueDecimals;
-    lastWritten_ = UINT64_MAX;
-    n_ = 0;
-    haveLatest_ = false;
-    yValid_ = false;
+    if (lane < 0 || lane >= laneCount ())
+        return;
+    Lane &L = lanes_[static_cast<std::size_t> (lane)];
+    L.ring = std::move (ring);
+    L.rawChannel = rawChannel;
+    L.nominalRate = nominalRate;
+    L.decimals = valueDecimals;
+    L.lastWritten = UINT64_MAX;
+    L.n = 0;
+    L.finite = false;
+    L.haveLatest = false;
+    L.yValid = false;
+    std::fill (L.segCount.begin (), L.segCount.end (), 0);
+    std::fill (L.denseMode.begin (), L.denseMode.end (), 0);
     dirty_ = true;
     pp_ = std::numeric_limits<double>::quiet_NaN ();
-    for (auto &s : segCount_)
-        s = 0;
-    std::fill (denseMode_.begin (), denseMode_.end (), 0);
     refreshHeaderText ();
     update ();
 }
@@ -260,7 +322,8 @@ void PlotWidget::setSource (
 void PlotWidget::setWindowSeconds (double seconds)
 {
     windowSec_ = std::max (0.5, seconds);
-    yValid_ = false;
+    for (Lane &L : lanes_)
+        L.yValid = false;
     dirty_ = true;
 }
 
@@ -269,7 +332,8 @@ void PlotWidget::setRemoveMean (bool on)
     if (removeMean_ == on)
         return;
     removeMean_ = on;
-    yValid_ = false;
+    for (Lane &L : lanes_)
+        L.yValid = false;
     dirty_ = true;
 }
 
@@ -280,19 +344,33 @@ void PlotWidget::setPaused (bool on)
     update (recessRect_);
 }
 
+bool PlotWidget::hasSamples () const
+{
+    for (const Lane &L : lanes_)
+        if (L.n > 0)
+            return true;
+    return false;
+}
+
 // ------------------------------------------------------------------ data
 void PlotWidget::tick (double now)
 {
-    if (!ring_)
+    bool anyRing = false;
+    for (const Lane &L : lanes_)
+        anyRing = anyRing || L.ring;
+    if (!anyRing)
     {
-        if (n_ != 0 || dirty_)
+        if (hasSamples () || dirty_)
         {
-            n_ = 0;
-            haveLatest_ = false;
+            for (Lane &L : lanes_)
+            {
+                L.n = 0;
+                L.finite = false;
+                L.haveLatest = false;
+                std::fill (L.segCount.begin (), L.segCount.end (), 0);
+            }
             dirty_ = false;
             pp_ = std::numeric_limits<double>::quiet_NaN ();
-            for (auto &s : segCount_)
-                s = 0;
             if (refreshHeaderText ())
                 updateHeader ();
             update (recessRect_);
@@ -302,8 +380,17 @@ void PlotWidget::tick (double now)
 
     if (!paused_)
     {
-        const std::uint64_t written = ring_->totalWritten ();
-        const bool newData = written != lastWritten_;
+        bool newData = false;
+        double latestTs = std::numeric_limits<double>::quiet_NaN ();
+        for (const Lane &L : lanes_)
+        {
+            if (!L.ring)
+                continue;
+            newData = newData || L.ring->totalWritten () != L.lastWritten;
+            const double ts = L.ring->latestTimestamp ();
+            if (std::isfinite (ts) && !(ts <= latestTs))
+                latestTs = ts;
+        }
         if (newData)
             lastChangeWall_ = now;
 
@@ -312,9 +399,7 @@ void PlotWidget::tick (double now)
         // arriving but its timestamps are far from the host clock, anchor to
         // the newest sample instead of showing an empty plot.
         double ref = now;
-        const double latestTs = ring_->latestTimestamp ();
-        clockMismatch_ = std::isfinite (latestTs) && (now - lastChangeWall_) < 2.0 &&
-            std::fabs (latestTs - now) > 30.0;
+        clockMismatch_ = std::isfinite (latestTs) && (now - lastChangeWall_) < 2.0 && std::fabs (latestTs - now) > 30.0;
         if (clockMismatch_)
             ref = latestTs;
 
@@ -327,14 +412,25 @@ void PlotWidget::tick (double now)
             if (!newData || now - lastRebuildWall_ < 1.0 / 30.0)
                 return;
         }
-        lastWritten_ = written; // consumed only when we actually rebuild
         refTime_ = ref;
 
-        const std::size_t prevN = n_;
-        const double tmin = ref - windowSec_ * 1.02 - 1.0 / std::max (1.0, nominalRate_);
-        n_ = ring_->copySince (tmin, t_, v_);
-        haveLatest_ = ring_->latest (latestTs_, latestVals_);
-        if (n_ == 0 && prevN == 0 && !dirty_ && !newData)
+        std::size_t prevTotal = 0, total = 0;
+        for (Lane &L : lanes_)
+        {
+            prevTotal += L.n;
+            if (!L.ring)
+            {
+                L.n = 0;
+                L.haveLatest = false;
+                continue;
+            }
+            L.lastWritten = L.ring->totalWritten (); // consumed only when we actually rebuild
+            const double tmin = ref - windowSec_ * 1.02 - 1.0 / std::max (1.0, L.nominalRate);
+            L.n = L.ring->copySince (tmin, L.t, L.v);
+            L.haveLatest = L.ring->latest (L.latestTs, L.latestVals);
+            total += L.n;
+        }
+        if (total == 0 && prevTotal == 0 && !dirty_ && !newData)
             return;
     }
     else if (!dirty_)
@@ -353,10 +449,11 @@ void PlotWidget::tick (double now)
     }
 }
 
-void PlotWidget::updateYRange (double lo, double hi)
+void PlotWidget::updateYRange (Lane &L, double lo, double hi)
 {
-    // Smallest span worth resolving: one unit of the displayed precision.
-    const double floorSpan = std::pow (10.0, -std::clamp (decimals_, 0, 6));
+    // Smallest span worth resolving: one unit of the displayed precision
+    // (or the lane's minimum span).
+    const double floorSpan = std::max (std::pow (10.0, -std::clamp (L.decimals, 0, 6)), L.spec.minSpan);
     double span = hi - lo;
     if (!(span > 0.0))
     {
@@ -378,59 +475,59 @@ void PlotWidget::updateYRange (double lo, double hi)
     const double tHi = hi + pad;
 
     const double now = steadySeconds ();
-    const double dt = std::clamp (now - lastYUpdate_, 0.0, 0.25);
-    lastYUpdate_ = now;
+    const double dt = std::clamp (now - L.lastYUpdate, 0.0, 0.25);
+    L.lastYUpdate = now;
 
-    if (!yValid_)
+    if (!L.yValid)
     {
-        yLo_ = tLo;
-        yHi_ = tHi;
-        yValid_ = true;
-        shrinking_ = false;
+        L.yLo = tLo;
+        L.yHi = tHi;
+        L.yValid = true;
+        L.shrinking = false;
         return;
     }
-    if (tLo < yLo_)
-        yLo_ = tLo;
-    if (tHi > yHi_)
-        yHi_ = tHi;
-    const double cur = yHi_ - yLo_;
+    if (tLo < L.yLo)
+        L.yLo = tLo;
+    if (tHi > L.yHi)
+        L.yHi = tHi;
+    const double cur = L.yHi - L.yLo;
     const double tgt = tHi - tLo;
-    if (!shrinking_ && cur > 1.6 * tgt)
-        shrinking_ = true;
-    if (shrinking_)
+    if (!L.shrinking && cur > 1.6 * tgt)
+        L.shrinking = true;
+    if (L.shrinking)
     {
         const double k = 1.0 - std::exp (-dt / 0.6);
-        yLo_ += (tLo - yLo_) * k;
-        yHi_ += (tHi - yHi_) * k;
-        if (yHi_ - yLo_ <= 1.05 * tgt)
-            shrinking_ = false;
+        L.yLo += (tLo - L.yLo) * k;
+        L.yHi += (tHi - L.yHi) * k;
+        if (L.yHi - L.yLo <= 1.05 * tgt)
+            L.shrinking = false;
     }
 }
 
 bool PlotWidget::rawView () const
 {
-    return railMode_ && kind_ == Kind::Hero && rawChannel_ >= 0;
+    return railMode_ && kind_ == Kind::Hero && lanes_.front ().rawChannel >= 0;
 }
 
-void PlotWidget::computeDisplayRange ()
+void PlotWidget::computeDisplayRange (Lane &L)
 {
     if (railMode_ && kind_ == Kind::Hero)
     {
         // Near-rail view: the raw value on a fixed +-full-scale range. The
         // rails sit near the recess top / bottom as in the design's artboard
         // (22 / 300 and 278 / 300 of the recess), 0 in the middle.
-        dLo_ = -fullScale_;
-        dHi_ = fullScale_;
-        dStep_ = fullScale_;
+        L.dLo = -fullScale_;
+        L.dHi = fullScale_;
+        L.dStep = fullScale_;
         const double h = plotRect_.height ();
-        yTop_ = plotRect_.top () + h * 22.0 / 300.0;
-        yBot_ = plotRect_.top () + h * 278.0 / 300.0;
+        L.yTop = plotRect_.top () + h * 22.0 / 300.0;
+        L.yBot = plotRect_.top () + h * 278.0 / 300.0;
         return;
     }
-    yTop_ = mapTop_;
-    yBot_ = mapBottom_;
-    double lo = yLo_, hi = yHi_;
-    if (symmetric_)
+    L.yTop = L.mapTop;
+    L.yBot = L.mapBottom;
+    double lo = L.yLo, hi = L.yHi;
+    if (symmetric_ && kind_ == Kind::Hero)
     {
         double m = std::max (std::fabs (lo), std::fabs (hi));
         if (!(m > 0.0))
@@ -445,39 +542,44 @@ void PlotWidget::computeDisplayRange ()
     double sh = std::ceil (hi / step - 1e-9) * step;
     if (!(sh > sl))
         sh = sl + step;
-    dLo_ = sl;
-    dHi_ = sh;
-    dStep_ = step;
+    L.dLo = sl;
+    L.dHi = sh;
+    L.dStep = step;
 }
 
 void PlotWidget::rebuild ()
 {
     dirty_ = false;
-    const int nTr = std::min (static_cast<int> (traces_.size ()), static_cast<int> (v_.size ()));
+    pp_ = std::numeric_limits<double>::quiet_NaN ();
+    lastPoints_ = 0;
+    for (std::size_t i = 0; i < lanes_.size (); ++i)
+        rebuildLane (lanes_[i], i == 0);
+}
 
+void PlotWidget::rebuildLane (Lane &L, bool first)
+{
+    const int nTr = std::min (static_cast<int> (L.spec.traces.size ()), static_cast<int> (L.v.size ()));
     double lo = std::numeric_limits<double>::infinity ();
     double hi = -std::numeric_limits<double>::infinity ();
-    for (double &m : means_)
-        m = 0.0;
-    pp_ = std::numeric_limits<double>::quiet_NaN ();
+    std::fill (L.means.begin (), L.means.end (), 0.0);
     // Near-rail view plots the raw channel (no mean removal) as trace 0.
-    const bool raw = rawView () && rawChannel_ < static_cast<int> (v_.size ());
+    const bool raw = first && rawView () && L.rawChannel < static_cast<int> (L.v.size ());
     auto series = [&] (int tr) -> const std::vector<double> & {
-        return v_[static_cast<std::size_t> (raw && tr == 0 ? rawChannel_ : tr)];
+        return L.v[static_cast<std::size_t> (raw && tr == 0 ? L.rawChannel : tr)];
     };
 
-    if (n_ > 0)
+    if (L.n > 0)
     {
         const double tWin = refTime_ - windowSec_;
         for (int tr = 0; tr < nTr; ++tr)
         {
             const std::vector<double> &vv = series (tr);
             double off = 0.0;
-            if (removeMean_ && !(raw && tr == 0))
+            if (removeMean_ && kind_ == Kind::Hero && !(raw && tr == 0))
             {
                 double sum = 0.0;
                 std::size_t cnt = 0;
-                for (std::size_t k = 0; k < n_; ++k)
+                for (std::size_t k = 0; k < L.n; ++k)
                     if (std::isfinite (vv[k]))
                     {
                         sum += vv[k];
@@ -485,66 +587,65 @@ void PlotWidget::rebuild ()
                     }
                 off = cnt ? sum / static_cast<double> (cnt) : 0.0;
             }
-            means_[static_cast<std::size_t> (tr)] = off;
+            L.means[static_cast<std::size_t> (tr)] = off;
             double wLo = std::numeric_limits<double>::infinity ();
             double wHi = -std::numeric_limits<double>::infinity ();
-            for (std::size_t k = 0; k < n_; ++k)
+            for (std::size_t k = 0; k < L.n; ++k)
             {
                 const double x = vv[k] - off;
                 if (!std::isfinite (x))
                     continue;
                 lo = std::min (lo, x);
                 hi = std::max (hi, x);
-                if (tr == 0 && t_[k] >= tWin)
+                if (first && tr == 0 && L.t[k] >= tWin)
                 {
                     wLo = std::min (wLo, x);
                     wHi = std::max (wHi, x);
                 }
             }
-            if (tr == 0 && std::isfinite (wLo))
+            if (first && tr == 0 && std::isfinite (wLo))
                 pp_ = wHi - wLo;
         }
     }
+    L.finite = std::isfinite (lo) && std::isfinite (hi);
     if (raw)
     {
         // fixed range (computeDisplayRange); the autoscale state is left alone
     }
     else if (std::isfinite (lo) && std::isfinite (hi))
-        updateYRange (lo, hi);
-    else if (!yValid_)
+        updateYRange (L, lo, hi);
+    else if (!L.yValid)
     {
-        yLo_ = -1.0;
-        yHi_ = 1.0;
+        L.yLo = -1.0;
+        L.yHi = 1.0;
     }
-    computeDisplayRange ();
+    computeDisplayRange (L);
 
     PixelMap m;
     m.tStart = refTime_ - windowSec_;
     m.tSpan = windowSec_;
     m.left = plotRect_.left ();
     m.width = std::max (1, plotRect_.width ());
-    m.vLo = dLo_;
-    m.vSpan = std::max (1e-12, dHi_ - dLo_);
-    m.top = yTop_;
-    m.height = std::max (1.0, yBot_ - yTop_);
-    const double gapSec = std::max (1.0, 10.0 / std::max (0.1, nominalRate_));
+    m.vLo = L.dLo;
+    m.vSpan = std::max (1e-12, L.dHi - L.dLo);
+    m.top = L.yTop;
+    m.height = std::max (1.0, L.yBot - L.yTop);
+    const double gapSec = std::max (1.0, 10.0 / std::max (0.1, L.nominalRate));
 
-    lastPoints_ = 0;
-    for (int tr = 0; tr < static_cast<int> (segCount_.size ()); ++tr)
+    for (int tr = 0; tr < static_cast<int> (L.segCount.size ()); ++tr)
     {
         const std::size_t ti = static_cast<std::size_t> (tr);
-        auto &segs = polys_[ti];
-        if (tr >= nTr || n_ == 0)
+        if (tr >= nTr || L.n == 0)
         {
-            segCount_[ti] = 0;
-            denseFlags_[ti].clear ();
+            L.segCount[ti] = 0;
+            L.denseFlags[ti].clear ();
             continue;
         }
         std::size_t pts = 0;
-        bool dense = denseMode_[ti] != 0;
-        segCount_[ti] = buildPolylines (t_.data (), series (tr).data (), n_, means_[ti], m, gapSec, segs, &pts,
-            &denseFlags_[ti], &dense);
-        denseMode_[ti] = dense ? 1 : 0;
+        bool dense = L.denseMode[ti] != 0;
+        L.segCount[ti] = buildPolylines (L.t.data (), series (tr).data (), L.n, L.means[ti], m, gapSec, L.polys[ti],
+            &pts, &L.denseFlags[ti], &dense);
+        L.denseMode[ti] = dense ? 1 : 0;
         lastPoints_ += pts;
     }
 }
@@ -553,27 +654,34 @@ bool PlotWidget::refreshHeaderText ()
 {
     const bool raw = rawView ();
     QStringList vals;
-    const bool have = tone_ != Tone::Off && haveLatest_;
-    for (int i = 0; i < traces_.size (); ++i)
+    const bool withPlus = kind_ == Kind::Hero || kind_ == Kind::Lanes;
+    for (std::size_t li = 0; li < lanes_.size (); ++li)
     {
-        if (!have || i >= static_cast<int> (latestVals_.size ()))
+        const Lane &L = lanes_[li];
+        const bool have = tone_ != Tone::Off && L.haveLatest;
+        for (int i = 0; i < L.spec.traces.size (); ++i)
         {
-            vals << kNoValue;
-            continue;
+            if (!have || i >= static_cast<int> (L.latestVals.size ()))
+            {
+                vals << kNoValue;
+                continue;
+            }
+            double val = L.latestVals[static_cast<std::size_t> (i)];
+            if (kind_ == Kind::Hero && li == 0)
+            {
+                if (raw && L.rawChannel < static_cast<int> (L.latestVals.size ()))
+                    val = L.latestVals[static_cast<std::size_t> (L.rawChannel)];
+                else if (removeMean_ && i < static_cast<int> (L.means.size ()))
+                    val -= L.means[static_cast<std::size_t> (i)];
+            }
+            vals << Readouts::number (val, L.decimals, withPlus, true);
         }
-        double val = latestVals_[static_cast<std::size_t> (i)];
-        if (kind_ == Kind::Hero)
-        {
-            if (raw && rawChannel_ < static_cast<int> (latestVals_.size ()))
-                val = latestVals_[static_cast<std::size_t> (rawChannel_)];
-            else if (removeMean_ && i < static_cast<int> (means_.size ()))
-                val -= means_[static_cast<std::size_t> (i)];
-        }
-        vals << Readouts::number (val, decimals_, kind_ != Kind::Scalar, true);
     }
-    QString pp = QStringLiteral ("— ") + units_;
+    if (kind_ == Kind::Vital && !vals.isEmpty ())
+        vals[0] = (tone_ == Tone::Off || valueOverride_.isEmpty ()) ? kNoValue : valueOverride_;
+    QString pp = QStringLiteral ("— ") + units ();
     if (tone_ != Tone::Off && std::isfinite (pp_))
-        pp = Readouts::number (pp_, decimals_, false, true) + QStringLiteral (" ") + units_;
+        pp = Readouts::number (pp_, lanes_.front ().decimals, false, true) + QStringLiteral (" ") + units ();
     const bool changed = vals != valueText_ || pp != ppText_ || raw != latestIsRaw_;
     valueText_ = vals;
     ppText_ = pp;
@@ -584,8 +692,8 @@ bool PlotWidget::refreshHeaderText ()
 void PlotWidget::updateHeader ()
 {
     QRegion r (headerRect_);
-    if (!legendRect_.isNull ())
-        r += legendRect_;
+    if (!stripRect_.isNull ())
+        r += stripRect_;
     update (r);
 }
 
@@ -598,51 +706,66 @@ void PlotWidget::layoutRects ()
         headerH = 8 + 33 + 8;
     else if (kind_ == Kind::Scalar)
         headerH = 6 + 19 + 6;
+    else if (kind_ == Kind::Vital)
+        headerH = 6 + 25 + 6;
     headerRect_ = QRect (1, 1, std::max (0, w - 2), headerH);
     int y = 1 + headerH + 1; // divider under the header
-    if (kind_ == Kind::Triple)
+    if (hasStrip ())
     {
-        legendRect_ = QRect (1, y, std::max (0, w - 2), 5 + 16 + 5);
-        y += legendRect_.height () + 1;
+        stripRect_ = QRect (1, y, std::max (0, w - 2), 5 + 16 + 5);
+        y += stripRect_.height () + 1;
     }
     else
-        legendRect_ = QRect ();
+        stripRect_ = QRect ();
     const int m = kind_ == Kind::Hero ? 8 : 6;
     recessRect_ = QRect (1 + m, y + m, std::max (12, w - 2 - 2 * m), std::max (12, h - 1 - m - (y + m)));
     plotRect_ = recessRect_.adjusted (1, 1, -1, -1);
-    if (kind_ == Kind::Hero)
+
+    // Lanes share the plot's width and split its height, 1 px divider between.
+    const int nL = laneCount ();
+    const int avail = std::max (nL, plotRect_.height () - (nL - 1));
+    int top = plotRect_.top ();
+    for (int i = 0; i < nL; ++i)
     {
-        mapTop_ = plotRect_.top () + 11.0;
-        mapBottom_ = plotRect_.top () + plotRect_.height () - 24.0;
+        Lane &L = lanes_[static_cast<std::size_t> (i)];
+        const int bh = avail / nL + (i < avail % nL ? 1 : 0);
+        L.band = QRect (plotRect_.left (), top, plotRect_.width (), bh);
+        top += bh + 1;
+        if (kind_ == Kind::Hero)
+        {
+            L.mapTop = plotRect_.top () + 11.0;
+            L.mapBottom = plotRect_.top () + plotRect_.height () - 24.0;
+        }
+        else
+        {
+            const double pad = kind_ == Kind::Lanes && bh < 48 ? 5.0 : 8.0;
+            L.mapTop = L.band.top () + pad;
+            L.mapBottom = L.band.top () + L.band.height () - pad;
+        }
+        if (L.mapBottom - L.mapTop < 8.0)
+        {
+            L.mapTop = L.band.top ();
+            L.mapBottom = L.band.top () + L.band.height ();
+        }
+        L.yTop = L.mapTop;
+        L.yBot = L.mapBottom;
     }
-    else
-    {
-        mapTop_ = plotRect_.top () + 8.0;
-        mapBottom_ = plotRect_.top () + plotRect_.height () - 8.0;
-    }
-    if (mapBottom_ - mapTop_ < 8.0)
-    {
-        mapTop_ = plotRect_.top ();
-        mapBottom_ = plotRect_.top () + plotRect_.height ();
-    }
-    yTop_ = mapTop_;
-    yBot_ = mapBottom_;
     if (overlay_)
         overlay_->setGeometry (plotRect_);
     cacheValid_ = false;
 }
 
-double PlotWidget::mapY (double v) const
+double PlotWidget::mapY (const Lane &L, double v) const
 {
-    return yBot_ - (v - dLo_) / std::max (1e-12, dHi_ - dLo_) * (yBot_ - yTop_);
+    return L.yBot - (v - L.dLo) / std::max (1e-12, L.dHi - L.dLo) * (L.yBot - L.yTop);
 }
 
-QString PlotWidget::axisLabel (double v, bool withUnits) const
+QString PlotWidget::axisLabel (const Lane &L, double v, bool withUnits) const
 {
     // explicit '+' only on axes that also show negative values
-    QString s = Readouts::number (v, decimalsForStep (dStep_), dLo_ < 0.0, true);
-    if (withUnits && !units_.isEmpty ())
-        s += QStringLiteral (" ") + units_;
+    QString s = Readouts::number (v, decimalsForStep (L.dStep), L.dLo < 0.0, true);
+    if (withUnits && !L.spec.units.isEmpty ())
+        s += QStringLiteral (" ") + L.spec.units;
     return s;
 }
 
@@ -669,15 +792,17 @@ void PlotWidget::paintChrome (QPainter &p)
     p.fillRect (rect (), Theme::panel);
     outline (p, rect (), Theme::edge);
     p.fillRect (QRect (1, headerRect_.bottom () + 1, width () - 2, 1), Theme::divider);
-    if (kind_ == Kind::Triple)
-        p.fillRect (QRect (1, legendRect_.bottom () + 1, width () - 2, 1), Theme::divider);
+    if (hasStrip ())
+        p.fillRect (QRect (1, stripRect_.bottom () + 1, width () - 2, 1), Theme::divider);
     p.setRenderHint (QPainter::TextAntialiasing);
     if (kind_ == Kind::Hero)
         paintHeroHeader (p);
     else
         paintPanelHeader (p);
-    if (kind_ == Kind::Triple)
-        paintLegend (p);
+    if (kind_ == Kind::Lanes)
+        paintLaneStrip (p);
+    else if (kind_ == Kind::Vital)
+        paintChipStrip (p);
 }
 
 void PlotWidget::paintHeroHeader (QPainter &p)
@@ -706,13 +831,13 @@ void PlotWidget::paintHeroHeader (QPainter &p)
 
     // LATEST (or LATEST RAW when near the rail): 19 / 600 + unit 11 / 400
     const QString latest = valueText_.value (0, kNoValue);
-    const double uw = fu.horizontalAdvance (units_);
+    const double uw = fu.horizontalAdvance (units ());
     const double vw = fv.horizontalAdvance (latest);
     column (latestIsRaw_ ? QStringLiteral ("LATEST RAW") : QStringLiteral ("LATEST"), 104.0,
         [&] (double r) {
             p.setFont (fValueUnit_);
             p.setPen (Theme::textMuted);
-            p.drawText (QPointF (r - uw, bigBase), units_);
+            p.drawText (QPointF (r - uw, bigBase), units ());
             p.setFont (fValue_);
             p.setPen (valC);
             p.drawText (QPointF (r - uw - 4.0 - vw, bigBase), latest);
@@ -788,8 +913,8 @@ void PlotWidget::paintHeroHeader (QPainter &p)
         const Chip &c = chips[i];
         const int w = static_cast<int> (chipW[static_cast<std::size_t> (i)]);
         const QRect r (static_cast<int> (std::round (x)), static_cast<int> (std::round (cy - chipH / 2.0)), w, chipH);
-        outline (p, r, c.on ? Theme::controlEdge : Theme::divider);
-        p.setPen (c.on ? Theme::textMuted : Theme::textFainter);
+        outline (p, r, c.warn ? Theme::warn : (c.on ? Theme::controlEdge : Theme::divider));
+        p.setPen (c.warn ? Theme::warn : (c.on ? Theme::textMuted : Theme::textFainter));
         p.drawText (QPointF (r.left () + 6.0, baselineFor (fc, r.top () + chipH / 2.0)), c.text);
         x += w + 6.0;
     }
@@ -799,83 +924,182 @@ void PlotWidget::paintPanelHeader (QPainter &p)
 {
     const QRect hr = headerRect_;
     const double cy = hr.top () + hr.height () / 2.0;
-    const double gap = kind_ == Kind::Scalar ? 9.0 : 8.0;
-    const QFontMetricsF ft (fTitle_), fu (fUnits_), fr (fRate_), fv (fValue_);
+    const bool valued = kind_ == Kind::Scalar || kind_ == Kind::Vital;
+    const double gap = valued ? 9.0 : 8.0;
+    const QFontMetricsF ft (fTitle_), fu (fUnits_), fr (fRate_), fv (fValue_), fvu (fValueUnit_), fc (fChip_);
     const QColor valC = tone_ == Tone::Off ? Theme::textDim : (tone_ == Tone::Warn ? Theme::warn : Theme::textStrong);
+    const QString v = valueText_.value (0, kNoValue);
+    const double vw = fv.horizontalAdvance (v);
+
+    // Widths first, then what fits: the title and the value always show; a
+    // narrow panel drops the units, then the rate, then elides the title.
+    const double left = hr.left () + 9.0 + 7.0 + gap;
     double right = hr.left () + hr.width () - 9.0;
+    double valueW = 0.0;
+    if (kind_ == Kind::Scalar)
+        valueW = std::max (62.0, vw) + 9.0;
+    else if (kind_ == Kind::Vital)
+        valueW = std::max (58.0, vw + 4.0 + fvu.horizontalAdvance (units ())) + 12.0;
+    const QString u = kind_ == Kind::Scalar ? units () : QString (); // Lanes: in the strip; Vital: by the value
+    const QString tag = QStringLiteral ("SUBST");
+    const double titleW = ft.horizontalAdvance (title_);
+    const double rateW = rateText_.isEmpty () ? 0.0 : fr.horizontalAdvance (rateText_) + gap;
+    const double unitsW = u.isEmpty () ? 0.0 : fu.horizontalAdvance (u) + gap;
+    const double tagW = noteFlag_ ? fc.horizontalAdvance (tag) + gap : 0.0;
+    double room = right - valueW - left;
+    if (kind_ == Kind::Scalar && titleW + unitsW + tagW + rateW > room)
+    {
+        valueW = vw + 9.0; // the value's 62 px minimum gives way first
+        room = right - valueW - left;
+    }
+    const bool showUnits = titleW + unitsW + tagW + rateW <= room;
+    const bool showTag = noteFlag_ && titleW + (showUnits ? unitsW : 0.0) + tagW + rateW <= room;
+    const bool showRate = rateW > 0.0 && titleW + rateW <= room;
+
     if (kind_ == Kind::Scalar)
     {
-        const QString v = valueText_.value (0, kNoValue);
-        const double vw = fv.horizontalAdvance (v);
         p.setFont (fValue_);
         p.setPen (valC);
         p.drawText (QPointF (right - vw, baselineFor (fv, cy)), v);
-        right -= std::max (62.0, vw) + 9.0;
     }
-    const double rw = fr.horizontalAdvance (rateText_);
-    p.setFont (fRate_);
-    p.setPen (rateColor_);
-    p.drawText (QPointF (right - rw, baselineFor (fr, cy)), rateText_);
-    right -= rw + gap;
+    else if (kind_ == Kind::Vital)
+    {
+        // large readout: 19 / 600 value + 11 / 400 unit, as the hero's LATEST
+        const double uw = fvu.horizontalAdvance (units ());
+        const double base = baselineFor (fv, cy);
+        p.setFont (fValueUnit_);
+        p.setPen (Theme::textMuted);
+        p.drawText (QPointF (right - uw, base), units ());
+        p.setFont (fValue_);
+        p.setPen (valC);
+        p.drawText (QPointF (right - uw - 4.0 - vw, base), v);
+    }
+    right -= valueW;
+    if (showRate)
+    {
+        p.setFont (fRate_);
+        p.setPen (rateColor_);
+        p.drawText (QPointF (right - fr.horizontalAdvance (rateText_), baselineFor (fr, cy)), rateText_);
+        right -= rateW;
+    }
 
-    double x = hr.left () + 9.0;
-    p.fillRect (QRectF (x, std::floor (cy - 3.5), 7, 7), led_);
-    x += 7.0 + gap;
+    p.fillRect (QRectF (hr.left () + 9.0, std::floor (cy - 3.5), 7, 7), led_);
+    double x = left;
     p.setFont (fTitle_);
     p.setPen (Theme::textStrong);
     const QString title = ft.elidedText (title_, Qt::ElideRight, std::max (16.0, right - x));
     p.drawText (QPointF (x, baselineFor (ft, cy)), title);
     x += ft.horizontalAdvance (title) + gap;
-    if (x + fu.horizontalAdvance (units_) <= right)
+    if (showUnits && !u.isEmpty ())
     {
         p.setFont (fUnits_);
         p.setPen (Theme::textDim);
-        p.drawText (QPointF (x, baselineFor (fu, cy)), units_);
-        x += fu.horizontalAdvance (units_) + gap;
-        // source substituted through a fallback (details in the tooltip)
-        const QString tag = QStringLiteral ("SUBST");
-        const QFontMetricsF fc (fChip_);
-        if (noteFlag_ && x + fc.horizontalAdvance (tag) <= right)
+        p.drawText (QPointF (x, baselineFor (fu, cy)), u);
+        x += fu.horizontalAdvance (u) + gap;
+    }
+    // source substituted through a fallback (details in the tooltip)
+    if (showTag)
+    {
+        p.setFont (fChip_);
+        p.setPen (Theme::textFaint);
+        p.drawText (QPointF (x, baselineFor (fc, cy)), tag);
+    }
+}
+
+void PlotWidget::paintLaneStrip (QPainter &p)
+{
+    // [ACC g  -- X +0.012  - - Y -0.981  .. Z +0.105 | GYR °/s ... | MAG µT ...]
+    const QRect sr = stripRect_;
+    const double cy = sr.top () + sr.height () / 2.0;
+    const double left = sr.left () + 9.0;
+    const double inner = sr.width () - 18.0;
+    const int nL = laneCount ();
+    const double sepW = 21.0;
+    const double groupW = (inner - sepW * (nL - 1)) / std::max (1, nL);
+    const QFontMetricsF fk (fKicker_), fl (fLetter_), fv (fLegendValue_);
+    const QColor valC = tone_ == Tone::Off ? Theme::textDim : (tone_ == Tone::Warn ? Theme::warn : Theme::textStrong);
+
+    struct Column
+    {
+        double x, w;
+    };
+    std::vector<QString> kicks;
+    std::vector<Column> cols;
+    // One format for the whole strip: glyph + letter + value when every
+    // column has room, else glyph + value, else the values alone.
+    int mode = 2;
+    int flat = 0;
+    for (int li = 0; li < nL; ++li)
+    {
+        const Lane &L = lanes_[static_cast<std::size_t> (li)];
+        QString kick = L.spec.label;
+        if (!L.spec.units.isEmpty ())
+            kick += QStringLiteral (" ") + L.spec.units;
+        kicks.push_back (kick);
+        const double x0 = left + li * (groupW + sepW);
+        const int nT = L.spec.traces.size ();
+        const double cx0 = x0 + fk.horizontalAdvance (kick) + 10.0;
+        const double colW = (x0 + groupW - cx0 - 8.0 * (nT - 1)) / std::max (1, nT);
+        for (int i = 0; i < nT; ++i, ++flat)
         {
-            p.setFont (fChip_);
-            p.setPen (Theme::textFaint);
-            p.drawText (QPointF (x, baselineFor (fc, cy)), tag);
+            cols.push_back ({cx0 + i * (colW + 8.0), colW});
+            const double vw = fv.horizontalAdvance (valueText_.value (flat, kNoValue));
+            if (colW < 14.0 + 4.0 + fl.horizontalAdvance (L.spec.traces[i].name) + 6.0 + vw)
+                mode = std::min (mode, 1);
+            if (colW < 14.0 + 6.0 + vw)
+                mode = 0;
+        }
+    }
+
+    flat = 0;
+    for (int li = 0; li < nL; ++li)
+    {
+        const Lane &L = lanes_[static_cast<std::size_t> (li)];
+        const double x0 = left + li * (groupW + sepW);
+        if (li > 0)
+            p.fillRect (QRectF (std::round (x0 - 11.0), std::floor (cy - 7.0), 1, 14), Theme::edge);
+        p.setFont (fKicker_);
+        p.setPen (Theme::textDim);
+        p.drawText (QPointF (x0, baselineFor (fk, cy)), kicks[static_cast<std::size_t> (li)]);
+        for (int i = 0; i < L.spec.traces.size (); ++i, ++flat)
+        {
+            const Trace &T = L.spec.traces[i];
+            const Column &c = cols[static_cast<std::size_t> (flat)];
+            if (mode >= 1)
+                legendGlyph (p, T, c.x, cy);
+            if (mode == 2)
+            {
+                p.setFont (fLetter_);
+                p.setPen (Theme::textMuted);
+                p.drawText (QPointF (c.x + 14.0 + 4.0, baselineFor (fl, cy)), T.name);
+            }
+            const QString v = valueText_.value (flat, kNoValue);
+            p.setFont (fLegendValue_);
+            p.setPen (valC);
+            p.drawText (QPointF (c.x + c.w - fv.horizontalAdvance (v), baselineFor (fv, cy)), v);
         }
     }
 }
 
-void PlotWidget::paintLegend (QPainter &p)
+void PlotWidget::paintChipStrip (QPainter &p)
 {
-    const QRect lr = legendRect_;
-    const double cy = lr.top () + lr.height () / 2.0;
-    const double left = lr.left () + 9.0;
-    const double inner = lr.width () - 18.0;
-    const int n = static_cast<int> (traces_.size ());
-    const double colW = (inner - 10.0 * (n - 1)) / std::max (1, n);
-    const QFontMetricsF fl (fLetter_), fv (fLegendValue_);
-    const QColor valC = tone_ == Tone::Off ? Theme::textDim : (tone_ == Tone::Warn ? Theme::warn : Theme::textStrong);
-    for (int i = 0; i < n; ++i)
+    const QRect sr = stripRect_;
+    const double cy = sr.top () + sr.height () / 2.0;
+    const QFontMetricsF fc (fChip_);
+    const int chipH = 15;
+    double x = sr.left () + 9.0;
+    const double right = sr.left () + sr.width () - 9.0;
+    p.setFont (fChip_);
+    for (const Chip &c : stripChips_)
     {
-        const double x0 = left + i * (colW + 10.0);
-        // 14 x 6 legend line, 2 px, the trace's dash pattern (4 2.5 / 1 2.5)
-        QPen pen (traces_[i].color, 2.0);
-        pen.setCapStyle (Qt::FlatCap);
-        if (traces_[i].dash == Dash::Dashed)
-            pen.setDashPattern ({4.0 / 2.0, 2.5 / 2.0});
-        else if (traces_[i].dash == Dash::Dotted)
-            pen.setDashPattern ({1.0 / 2.0, 2.5 / 2.0});
-        p.save ();
-        p.setRenderHint (QPainter::Antialiasing);
-        p.setPen (pen);
-        p.drawLine (QPointF (x0, std::round (cy)), QPointF (x0 + 14.0, std::round (cy)));
-        p.restore ();
-        p.setFont (fLetter_);
-        p.setPen (Theme::textMuted);
-        p.drawText (QPointF (x0 + 14.0 + 5.0, baselineFor (fl, cy)), traces_[i].name);
-        const QString v = valueText_.value (i, kNoValue);
-        p.setFont (fLegendValue_);
-        p.setPen (valC);
-        p.drawText (QPointF (x0 + colW - fv.horizontalAdvance (v), baselineFor (fv, cy)), v);
+        const int w = static_cast<int> (std::ceil (fc.horizontalAdvance (c.text) + 12.0));
+        if (x + w > right)
+            break;
+        const QRect r (static_cast<int> (std::round (x)), static_cast<int> (std::round (cy - chipH / 2.0)), w, chipH);
+        outline (p, r, c.warn ? Theme::warn : (c.on ? Theme::controlEdge : Theme::divider));
+        p.setPen (c.warn ? Theme::warn : (c.on ? Theme::textMuted : Theme::textFainter));
+        p.drawText (QPointF (r.left () + 6.0, baselineFor (fc, r.top () + chipH / 2.0)), c.text);
+        x += w + 6.0;
     }
 }
 
@@ -912,9 +1136,19 @@ void PlotWidget::ensureRecessCache ()
     const QSize sz = recessRect_.size ();
     const bool hero = kind_ == Kind::Hero;
     const bool railOn = railMode_ && hero;
-    const bool labels = n_ > 0;
-    if (cacheValid_ && sz == cacheSize_ && dpr == cacheDpr_ && dLo_ == cacheLo_ && dHi_ == cacheHi_ &&
-        windowSec_ == cacheWindow_ && railOn == cacheRail_ && labels == cacheLabels_)
+    bool labels = false;
+    for (const Lane &L : lanes_)
+        labels = labels || L.finite;
+    std::vector<double> ranges;
+    ranges.reserve (lanes_.size () * 3);
+    for (const Lane &L : lanes_)
+    {
+        ranges.push_back (L.dLo);
+        ranges.push_back (L.dHi);
+        ranges.push_back (L.finite ? 1.0 : 0.0);
+    }
+    if (cacheValid_ && sz == cacheSize_ && dpr == cacheDpr_ && ranges == cacheRanges_ && windowSec_ == cacheWindow_ &&
+        railOn == cacheRail_ && labels == cacheLabels_)
         return;
 
     // Layer 1, the dot raster, is rasterised only when the size / DPR change;
@@ -929,8 +1163,7 @@ void PlotWidget::ensureRecessCache ()
     cacheValid_ = true;
     cacheSize_ = sz;
     cacheDpr_ = dpr;
-    cacheLo_ = dLo_;
-    cacheHi_ = dHi_;
+    cacheRanges_ = ranges;
     cacheWindow_ = windowSec_;
     cacheRail_ = railOn;
     cacheLabels_ = labels;
@@ -949,10 +1182,11 @@ void PlotWidget::ensureRecessCache ()
 
     if (hero)
     {
+        const Lane &L = lanes_.front ();
         // zero line
-        if (0.0 >= dLo_ && 0.0 <= dHi_)
+        if (0.0 >= L.dLo && 0.0 <= L.dHi)
         {
-            const double y = std::round (mapY (0.0)) - o.y ();
+            const double y = std::round (mapY (L, 0.0)) - o.y ();
             p.fillRect (QRectF (pl, y, pr - pl, 1.0), Theme::zeroLine);
         }
         // +-FS rails (dashed 6 5) in the near-rail view, in raw coordinates;
@@ -964,25 +1198,25 @@ void PlotWidget::ensureRecessCache ()
             p.setPen (rp);
             for (double v : {fullScale_, -fullScale_})
             {
-                const double y = std::round (mapY (v)) - o.y () + 0.5;
+                const double y = std::round (mapY (L, v)) - o.y () + 0.5;
                 if (y >= ptop && y <= pbot)
                     p.drawLine (QPointF (pl, y), QPointF (pr, y));
             }
         }
         // Y labels: top / middle / bottom of the range (design positions)
         p.setPen (Theme::textDim);
-        const double mid = (0.0 >= dLo_ && 0.0 <= dHi_) ? 0.0 : 0.5 * (dLo_ + dHi_);
+        const double mid = (0.0 >= L.dLo && 0.0 <= L.dHi) ? 0.0 : 0.5 * (L.dLo + L.dHi);
         const double lx = pl + 6.0;
         if (labels)
         {
-            p.drawText (QPointF (lx, baselineFor (fa, mapTop_ - o.y ())), axisLabel (dHi_, true));
-            p.drawText (QPointF (lx, baselineFor (fa, mapY (mid) - o.y ()) - (mid == 0.0 ? 7.0 : 0.0)),
-                axisLabel (mid, true));
-            p.drawText (QPointF (lx, baselineFor (fa, mapBottom_ - o.y ())), axisLabel (dLo_, true));
+            p.drawText (QPointF (lx, baselineFor (fa, L.mapTop - o.y ())), axisLabel (L, L.dHi, true));
+            p.drawText (QPointF (lx, baselineFor (fa, mapY (L, mid) - o.y ()) - (mid == 0.0 ? 7.0 : 0.0)),
+                axisLabel (L, mid, true));
+            p.drawText (QPointF (lx, baselineFor (fa, L.mapBottom - o.y ())), axisLabel (L, L.dLo, true));
         }
         // full scale, top right
         const QString fs = QStringLiteral ("FS ±") + Readouts::number (fullScale_, 0, false, true) +
-            QStringLiteral (" ") + units_;
+            QStringLiteral (" ") + units ();
         p.setPen (Theme::textFainter);
         p.drawText (QPointF (pr - 7.0 - fa.horizontalAdvance (fs), ptop + 5.0 + fa.ascent ()), fs);
         // time ticks along the bottom
@@ -1001,16 +1235,30 @@ void PlotWidget::ensureRecessCache ()
             const double lxx = std::clamp (xx - w / 2.0, pl + 8.0, pr - 8.0 - w);
             p.drawText (QPointF (lxx, base), s);
         }
+        return;
     }
-    else
+
+    // Panels: faint range labels at the left (top / bottom of each lane's
+    // range); lanes are separated by a 1 px divider and carry their label.
+    const double lx = pl + 5.0;
+    for (std::size_t li = 0; li < lanes_.size (); ++li)
     {
-        // Panels: faint range labels at the left (top / bottom of the range).
-        p.setPen (Theme::textFaint);
-        const double lx = pl + 5.0;
-        if (labels)
+        const Lane &L = lanes_[li];
+        if (li > 0)
+            p.fillRect (QRectF (pl, L.band.top () - 1 - o.y (), pr - pl, 1.0), Theme::divider);
+        double x = lx;
+        const double topBase = baselineFor (fa, L.mapTop - o.y ());
+        if (kind_ == Kind::Lanes && !L.spec.label.isEmpty ())
         {
-            p.drawText (QPointF (lx, baselineFor (fa, mapTop_ - o.y ())), axisLabel (dHi_, false));
-            p.drawText (QPointF (lx, baselineFor (fa, mapBottom_ - o.y ())), axisLabel (dLo_, false));
+            p.setPen (Theme::textDim);
+            p.drawText (QPointF (x, topBase), L.spec.label);
+            x += fa.horizontalAdvance (L.spec.label) + 8.0;
+        }
+        if (L.finite)
+        {
+            p.setPen (Theme::textFaint);
+            p.drawText (QPointF (x, topBase), axisLabel (L, L.dHi, false));
+            p.drawText (QPointF (lx, baselineFor (fa, L.mapBottom - o.y ())), axisLabel (L, L.dLo, false));
         }
     }
 }
@@ -1025,73 +1273,79 @@ void PlotWidget::paintRecess (QPainter &p)
     const double designW = hero ? 1.4 : 1.3;
 
     p.save ();
-    p.setClipRect (plotRect_);
-    for (int tr = 0; tr < static_cast<int> (segCount_.size ()); ++tr)
+    for (const Lane &L : lanes_)
     {
-        const std::size_t ti = static_cast<std::size_t> (tr);
-        const Trace &T = traces_[tr];
-        const QPen fast = cosmeticPen (T.color);
-        QPen fastDash = fast;
-        QPen design (T.color, designW);
-        design.setCapStyle (Qt::FlatCap);
-        design.setJoinStyle (Qt::RoundJoin);
-        if (T.dash == Dash::Dashed)
+        p.setClipRect (L.band.intersected (plotRect_));
+        for (int tr = 0; tr < static_cast<int> (L.segCount.size ()); ++tr)
         {
-            fastDash.setDashPattern ({7.0 * dpr, 4.0 * dpr});
-            design.setDashPattern ({7.0 / designW, 4.0 / designW});
-        }
-        else if (T.dash == Dash::Dotted)
-        {
-            fastDash.setDashPattern ({2.0 * dpr, 4.0 * dpr});
-            design.setDashPattern ({2.0 / designW, 4.0 / designW});
-        }
-        const QPen dot = [&T] {
-            QPen d = cosmeticPen (T.color, 3.0);
-            d.setCapStyle (Qt::RoundCap);
-            return d;
-        }();
-        const auto &segs = polys_[ti];
-        const auto &flags = denseFlags_[ti];
-        for (int s = 0; s < segCount_[ti]; ++s)
-        {
-            const std::size_t si = static_cast<std::size_t> (s);
-            const QPolygonF &poly = segs[si];
-            if (poly.size () == 1)
+            const std::size_t ti = static_cast<std::size_t> (tr);
+            const Trace &T = L.spec.traces[tr];
+            const QPen fast = cosmeticPen (T.color);
+            QPen fastDash = fast;
+            QPen design (T.color, designW);
+            design.setCapStyle (Qt::FlatCap);
+            design.setJoinStyle (Qt::RoundJoin);
+            if (T.dash == Dash::Dashed)
             {
-                p.setRenderHint (QPainter::Antialiasing, true);
-                p.setPen (dot);
-                p.drawPoint (poly[0]);
-                continue;
+                fastDash.setDashPattern ({7.0 * dpr, 4.0 * dpr});
+                design.setDashPattern ({7.0 / designW, 4.0 / designW});
             }
-            if (poly.size () < 2)
-                continue;
-            const double span = std::fabs (poly.last ().x () - poly.first ().x ()) + 1.0;
-            const double density = static_cast<double> (poly.size ()) / span;
-            const bool decimated = si < flags.size () && flags[si] != 0;
-            if (decimated || density > 2.0)
+            else if (T.dash == Dash::Dotted)
             {
-                // min/max zig-zag: vertical pixel runs, aliased, solid
-                p.setRenderHint (QPainter::Antialiasing, false);
-                p.setPen (fast);
+                fastDash.setDashPattern ({2.0 * dpr, 4.0 * dpr});
+                design.setDashPattern ({2.0 / designW, 4.0 / designW});
             }
-            else if (density > kSparseDensity || !kDesignPenWhenSparse)
+            const QPen dot = [&T] {
+                QPen d = cosmeticPen (T.color, 3.0);
+                d.setCapStyle (Qt::RoundCap);
+                return d;
+            }();
+            const auto &segs = L.polys[ti];
+            const auto &flags = L.denseFlags[ti];
+            for (int s = 0; s < L.segCount[ti]; ++s)
             {
-                // exact samples: antialiased, the trace's dash pattern
-                // (cosmetic dashes stay on the fast path)
-                p.setRenderHint (QPainter::Antialiasing, true);
-                p.setPen (fastDash);
+                const std::size_t si = static_cast<std::size_t> (s);
+                const QPolygonF &poly = segs[si];
+                if (poly.size () == 1)
+                {
+                    p.setRenderHint (QPainter::Antialiasing, true);
+                    p.setPen (dot);
+                    p.drawPoint (poly[0]);
+                    continue;
+                }
+                if (poly.size () < 2)
+                    continue;
+                const double span = std::fabs (poly.last ().x () - poly.first ().x ()) + 1.0;
+                const double density = static_cast<double> (poly.size ()) / span;
+                const bool decimated = si < flags.size () && flags[si] != 0;
+                if (decimated || density > 2.0)
+                {
+                    // min/max zig-zag: vertical pixel runs, aliased, solid
+                    p.setRenderHint (QPainter::Antialiasing, false);
+                    p.setPen (fast);
+                }
+                else if (density > kSparseDensity || !kDesignPenWhenSparse)
+                {
+                    // exact samples: antialiased, the trace's dash pattern
+                    // (cosmetic dashes stay on the fast path)
+                    p.setRenderHint (QPainter::Antialiasing, true);
+                    p.setPen (fastDash);
+                }
+                else
+                {
+                    p.setRenderHint (QPainter::Antialiasing, true);
+                    p.setPen (design);
+                }
+                p.drawPolyline (poly);
             }
-            else
-            {
-                p.setRenderHint (QPainter::Antialiasing, true);
-                p.setPen (design);
-            }
-            p.drawPolyline (poly);
         }
     }
     p.restore ();
 
     // ---- dynamic overlays
+    bool labels = false; // any finite sample in view (a status-only ring shows the placeholder)
+    for (const Lane &L : lanes_)
+        labels = labels || L.finite;
     p.setRenderHint (QPainter::TextAntialiasing);
     const QPointF c = QRectF (plotRect_).center ();
     const bool overlayUp = overlay_ && overlay_->isVisible ();
@@ -1109,7 +1363,7 @@ void PlotWidget::paintRecess (QPainter &p)
         p.setPen (Theme::warn);
         p.drawText (at, stallText_);
     }
-    else if (n_ == 0 && !placeholder_.isEmpty () && !overlayUp)
+    else if (!labels && !placeholder_.isEmpty () && !overlayUp)
     {
         const QFontMetricsF fm (fEmpty_);
         p.setFont (fEmpty_);
