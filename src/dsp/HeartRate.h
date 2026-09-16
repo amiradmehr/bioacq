@@ -24,14 +24,29 @@
 //     height.)
 //  2. Inverted: reflectance counts DROP at systole (more blood absorbs more
 //     light), so a systolic pulse is a MAXIMUM of -bandpass(counts).
-//  3. Blocks of interest after Elgendi et al. (2013): z = clipped square of
-//     the inverted signal; a block is where the 111 ms moving average of z
-//     (systolic peak) exceeds the 667 ms moving average (one beat) plus
+//  3. Artefacts: once kScaleBeats beats of the last kWindowSec are known, the
+//     band-pass is clipped to kArtefactFactor x the median largest |band-pass|
+//     between those beats, and the output samples a clipped stretch reaches
+//     (half the baseline window before it, that plus kArtefactSettleSec after)
+//     are masked to 0: no beat there, nothing for the periodicity check. A
+//     candidate beat above kArtefactFactor x the median beat height is dropped
+//     and cannot replace a beat or raise the amplitude gate. The scales expire
+//     kWindowSec after their kScaleBeats-th newest beat, so a real, lasting
+//     change of the pulse amplitude is accepted again.
+//  4. Baseline removal: the clipped signal minus its centred kDetrendSec
+//     moving average (a delay line; the output lags by delaySec ()).
+//     Respiratory wander at 0.2-0.3 Hz is up to about the pulse's size on
+//     reflectance PPG and step 1 leaves a quarter of it at 0.25 Hz; a steeper
+//     IIR high-pass rings into false beats at 30-45 bpm, while a moving
+//     average is FIR and cannot ring past its window.
+//  5. Blocks of interest after Elgendi et al. (2013): z = square of the
+//     positive part of that signal; a block is where the 111 ms moving average
+//     of z (systolic peak) exceeds the 667 ms moving average (one beat) plus
 //     kBeta x the long-term mean of z. Both averages are centred, so a block
 //     is decided kBeatWindowSec / 2 after the fact. A block at least 111 ms
 //     long yields one candidate beat at its largest sample, timed by
 //     parabolic interpolation between samples.
-//  4. A candidate must reach kAmplitudeGate of the largest beat of the last
+//  6. A candidate must reach kAmplitudeGate of the largest beat of the last
 //     kGateMemorySec (rejects band-pass ringing and small wiggles), and lies
 //     at least 60 / (1.05 x kMaxBpm) s after the previous beat (refractory
 //     period); a larger peak inside the refractory period replaces it.
@@ -45,11 +60,14 @@
 // +-20 % of that median; HR = 60 / mean of those inlier IBIs (the mean of the
 // inliers averages the sub-sample timing error that a single median IBI
 // keeps). Valid only with >= kMinBeats beats, quality >= kMinQuality, a beat
-// in the last max(2 s, 2.2 IBIs) and periodicity >= kMinPeriodicity: the
-// autocorrelation of the band-passed signal at the beat interval minus its
-// (positive) autocorrelation at half that interval. Band-passed noise also
-// yields fairly regular "beats", but it does not repeat itself; slow
-// respiratory wander repeats, but stays correlated at half a beat too.
+// in the last max(2 s, 2.2 IBIs) (counted from the detector's delayed time)
+// and periodicity >= kMinPeriodicity: the autocorrelation of the band-passed,
+// baseline-removed signal at the beat interval minus its (positive)
+// autocorrelation at half that interval. Band-passed noise also yields fairly
+// regular "beats", but it does not repeat itself; slow respiratory wander
+// repeats, but stays correlated at half a beat too. With less than kWindowSec
+// of signal buffered the gate is raised by sqrt(kWindowSec / buffered s): a
+// short correlation is noisier (noise-only starts passed ~4x more often).
 //
 // Tracker: one detector per PPG channel; the source is the valid channel with
 // the best quality, switched only when another channel is better by
@@ -74,11 +92,16 @@ inline constexpr double kBeta = 0.02;           // threshold offset, x mean of z
 inline constexpr double kAmplitudeGate = 0.35;
 inline constexpr double kGateMemorySec = 3.0;
 inline constexpr double kSettleSec = 1.5; // filters settling: no beats yet
+inline constexpr double kDetrendSec = 1.5; // centred moving average removed after the band-pass
 inline constexpr double kDropoutSec = 1.0; // a longer gap restarts the filters
 inline constexpr double kRateCheckSec = 4.0;
 inline constexpr double kRateTolerance = 0.15;
 inline constexpr double kMinRateFactor = 0.6; // redesign range, x nominal rate
 inline constexpr double kMaxRateFactor = 1.6;
+inline constexpr int kScaleBeats = 4;         // beats needed for an artefact scale (median of up to 8)
+inline constexpr double kArtefactFactor = 3.0; // x the median recent beat height
+// masked after an artefact beyond the moving average's half window (band-pass ringing)
+inline constexpr double kArtefactSettleSec = 0.25;
 // While there is no valid HR the tracker still publishes its status (NaN HR,
 // quality) this often, so the UI can show the quality it is getting.
 inline constexpr double kStatusIntervalSec = 1.0;
@@ -118,11 +141,19 @@ public:
     void process (const double *t, const double *x, std::size_t n);
 
     // estimateFromBeats plus the periodicity check
+    // (`now` is the newest sample time; the beats lag it by delaySec ())
     Estimate estimate (double now) const;
+    // how far the beat detection lags the newest sample: half the baseline window
+    double delaySec () const
+    {
+        return static_cast<double> (dy_.size () / 2) / fs_;
+    }
     // Largest normalised autocorrelation of the band-passed signal (last
     // kWindowSec) at lags within +-20 % of ibiSec, minus the (positive part of
     // the) autocorrelation at half that lag; 0 without enough data.
     double periodicity (double ibiSec) const;
+    // kMinPeriodicity, raised while less than kWindowSec is buffered
+    double periodicityThreshold () const;
     double correlation (int lagSamples) const; // at the ~25 Hz periodicity rate
 
     const std::deque<double> &beats () const
@@ -141,11 +172,17 @@ public:
     {
         return count_ > 0;
     }
+    // candidates dropped as artefacts (above kArtefactFactor x the beat scale)
+    std::uint64_t artefacts () const
+    {
+        return artefacts_;
+    }
 
 private:
     void design ();
     void restart (double t);
     void candidate (double tp, double yp);
+    void updateScale (double t);
 
     double nominalFs_ = 25.0;
     double fs_ = 25.0;
@@ -158,14 +195,30 @@ private:
     std::uint64_t rateIntervals_ = 0;
     bool rateChecked_ = false;
     double settleUntil_ = 0.0;
+    // baseline removal: centred moving average (delay line of the clipped band-pass)
+    std::vector<double> dy_, dt_;
+    std::size_t dHead_ = 0, dFilled_ = 0;
+    double dSum_ = 0.0;
+    // the latest artefact stretch (times of its first and last clipped sample)
+    double artStart_ = -std::numeric_limits<double>::infinity ();
+    double artEnd_ = -std::numeric_limits<double>::infinity ();
+    // artefact scales, valid until scaleUntil_: the median height of recent
+    // beats, and the median largest |band-pass| between them (the limit
+    // before the baseline removal, where respiratory wander is still in)
+    double scale_ = 0.0;
+    double spanScale_ = 0.0;
+    double scaleUntil_ = -std::numeric_limits<double>::infinity ();
+    double span_ = 0.0; // largest |clipped band-pass| since the last beat
+    std::uint64_t artefacts_ = 0;
     double absMean_ = 0.0;
     double zMean_ = 0.0;
-    // the newest n2_ samples: time, inverted band-pass, clipped square
+    // the newest n2_ samples: time, baseline-removed signal (step 4), square
+    // of its positive part
     int n1_ = 3, n2_ = 17;
     std::vector<double> ht_, hy_, hz_;
     std::size_t head_ = 0, filled_ = 0;
     double sumBeat_ = 0.0;
-    // inverted band-pass of the last window at ~25 Hz (periodicity check)
+    // baseline-removed signal of the last window at ~25 Hz (periodicity check)
     int pStep_ = 1;
     std::vector<double> py_;
     std::size_t pHead_ = 0, pFilled_ = 0;
@@ -177,7 +230,11 @@ private:
     double lastBeatT_ = -std::numeric_limits<double>::infinity ();
     double lastBeatY_ = 0.0;
     std::deque<double> beats_;
-    std::deque<std::pair<double, double>> peaks_; // (time, band-passed height) of recent beats
+    struct Peak
+    {
+        double t, height, span;
+    };
+    std::deque<Peak> peaks_; // recent beats: time, height, largest |band-pass| since the beat before
     std::uint64_t total_ = 0;
 };
 

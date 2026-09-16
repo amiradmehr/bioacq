@@ -115,6 +115,11 @@ void BeatDetector::reset (double nominalFs)
     beats_.clear ();
     peaks_.clear ();
     total_ = 0;
+    scale_ = 0.0;
+    spanScale_ = 0.0;
+    scaleUntil_ = -std::numeric_limits<double>::infinity ();
+    span_ = 0.0;
+    artefacts_ = 0;
 }
 
 void BeatDetector::design ()
@@ -128,6 +133,9 @@ void BeatDetector::design ()
     ht_.assign (static_cast<std::size_t> (n2_), 0.0);
     hy_.assign (static_cast<std::size_t> (n2_), 0.0);
     hz_.assign (static_cast<std::size_t> (n2_), 0.0);
+    const std::size_t nd = static_cast<std::size_t> (std::max (3, odd (kDetrendSec)));
+    dy_.assign (nd, 0.0);
+    dt_.assign (nd, 0.0);
     pStep_ = std::max (1, static_cast<int> (std::lround (fs_ / 25.0)));
     py_.assign (static_cast<std::size_t> (std::ceil (kWindowSec * fs_ / pStep_)) + 2, 0.0);
 }
@@ -142,6 +150,11 @@ void BeatDetector::restart (double t)
     pHead_ = 0;
     pFilled_ = 0;
     pCount_ = 0;
+    dHead_ = 0;
+    dFilled_ = 0;
+    dSum_ = 0.0;
+    artStart_ = -std::numeric_limits<double>::infinity ();
+    artEnd_ = -std::numeric_limits<double>::infinity ();
     inBlock_ = false;
     blockLen_ = 0;
     settleUntil_ = t + kSettleSec;
@@ -190,7 +203,42 @@ void BeatDetector::process (const double *t, const double *x, std::size_t n)
             }
         }
 
-        const double y = -bp_.process (xi); // inverted: systole = maximum
+        // Band-pass, inverted: a systolic pulse is a maximum.
+        const double y1 = -bp_.process (xi);
+        // Artefact: beyond kArtefactFactor x the recent beat height. Clipped
+        // before the baseline removal, so it cannot spread over the moving
+        // average; the samples it reaches are masked below.
+        const double lim = ti <= scaleUntil_ ? kArtefactFactor * spanScale_ : std::numeric_limits<double>::infinity ();
+        const double maskBefore = delaySec (), maskAfter = delaySec () + kArtefactSettleSec;
+        if (std::fabs (y1) > lim)
+        {
+            if (ti - artEnd_ > maskBefore + maskAfter)
+                artStart_ = ti; // a new stretch (the output has passed the previous one)
+            artEnd_ = ti;
+        }
+
+        // Baseline removal: the sample in the middle of the delay line minus
+        // the mean of the whole line (centred moving average).
+        const std::size_t nd = dy_.size ();
+        const double y1c = std::clamp (y1, -lim, lim);
+        span_ = std::max (span_, std::fabs (y1c));
+        dSum_ += y1c - (dFilled_ == nd ? dy_[dHead_] : 0.0);
+        dy_[dHead_] = y1c;
+        dt_[dHead_] = ti;
+        dHead_ = (dHead_ + 1) % nd;
+        dFilled_ = std::min (dFilled_ + 1, nd);
+        if (dFilled_ < nd)
+            continue;
+        if (dHead_ == 0)
+        {
+            dSum_ = 0.0; // re-sum once per turn: no rounding drift over hours
+            for (double v : dy_)
+                dSum_ += v;
+        }
+        const std::size_t mid = (dHead_ + nd / 2) % nd;
+        const double tc = dt_[mid];
+        const bool masked = tc >= artStart_ - maskBefore && tc <= artEnd_ + maskAfter;
+        const double y = masked ? 0.0 : dy_[mid] - dSum_ / static_cast<double> (nd);
         const double z = y > 0.0 ? y * y : 0.0;
         if (pCount_++ % static_cast<std::uint64_t> (pStep_) == 0)
         {
@@ -200,12 +248,12 @@ void BeatDetector::process (const double *t, const double *x, std::size_t n)
         }
         const std::size_t cap = hz_.size ();
         sumBeat_ += z - hz_[head_];
-        ht_[head_] = ti;
+        ht_[head_] = tc;
         hy_[head_] = y;
         hz_[head_] = z;
         head_ = (head_ + 1) % cap;
         filled_ = std::min (filled_ + 1, cap);
-        const bool settling = ti < settleUntil_;
+        const bool settling = tc < settleUntil_;
         zMean_ += (settling ? 0.2 : 1.0 / (10.0 * fs_)) * (z - zMean_);
         if (filled_ < cap || settling)
             continue;
@@ -259,12 +307,17 @@ void BeatDetector::process (const double *t, const double *x, std::size_t n)
 
 void BeatDetector::candidate (double tp, double yp)
 {
+    if (tp <= scaleUntil_ && yp > kArtefactFactor * scale_)
+    {
+        ++artefacts_; // motion or contact artefact: neither a beat nor a gate reference
+        return;
+    }
     double ref = 0.0; // largest recent beat
     for (std::size_t i = peaks_.size (); i-- > 0;)
     {
-        if (peaks_[i].first < tp - kGateMemorySec)
+        if (peaks_[i].t < tp - kGateMemorySec)
             break;
-        ref = std::max (ref, peaks_[i].second);
+        ref = std::max (ref, peaks_[i].height);
     }
     if (yp < kAmplitudeGate * ref)
         return;
@@ -274,19 +327,52 @@ void BeatDetector::candidate (double tp, double yp)
         if (yp > lastBeatY_ && !beats_.empty ())
         {
             beats_.back () = tp;
-            peaks_.back () = {tp, yp};
+            peaks_.back () = {tp, yp, std::max (peaks_.back ().span, span_)};
+            span_ = 0.0;
             lastBeatT_ = tp;
             lastBeatY_ = yp;
+            updateScale (tp);
         }
         return;
     }
     beats_.push_back (tp);
-    peaks_.emplace_back (tp, yp);
+    peaks_.push_back ({tp, yp, span_});
+    span_ = 0.0;
     while (peaks_.size () > 16)
         peaks_.pop_front ();
     ++total_;
     lastBeatT_ = tp;
     lastBeatY_ = yp;
+    updateScale (tp);
+}
+
+void BeatDetector::updateScale (double t)
+{
+    // medians over the newest (up to 8) beats of the last kWindowSec
+    double h[8], sp[8];
+    int m = 0;
+    double until = -std::numeric_limits<double>::infinity ();
+    for (std::size_t i = peaks_.size (); i-- > 0 && m < 8;)
+    {
+        if (peaks_[i].t < t - kWindowSec)
+            break;
+        h[m] = peaks_[i].height;
+        sp[m] = peaks_[i].span;
+        if (++m == kScaleBeats)
+            until = peaks_[i].t + kWindowSec; // fewer than kScaleBeats left in the window after this
+    }
+    if (m < kScaleBeats)
+    {
+        scaleUntil_ = -std::numeric_limits<double>::infinity ();
+        return;
+    }
+    auto median = [m] (double *v) {
+        std::sort (v, v + m);
+        return (m % 2) ? v[m / 2] : 0.5 * (v[m / 2 - 1] + v[m / 2]);
+    };
+    scale_ = median (h);
+    spanScale_ = median (sp);
+    scaleUntil_ = until;
 }
 
 double BeatDetector::correlation (int lag) const
@@ -334,13 +420,22 @@ double BeatDetector::periodicity (double ibiSec) const
     return best - std::max (0.0, half);
 }
 
+double BeatDetector::periodicityThreshold () const
+{
+    // The correlation of a short buffer (after the start or a dropout) is
+    // noisier, so noise passes kMinPeriodicity more often: scale the gate by
+    // sqrt(kWindowSec / buffered seconds).
+    const double sec = static_cast<double> (pFilled_) * pStep_ / fs_;
+    return kMinPeriodicity * std::sqrt (kWindowSec / std::clamp (sec, 1.0, kWindowSec));
+}
+
 Estimate BeatDetector::estimate (double now) const
 {
-    Estimate e = estimateFromBeats (beats_, now);
+    Estimate e = estimateFromBeats (beats_, now - delaySec ());
     if (std::isfinite (e.bpm))
     {
         e.periodicity = periodicity (60.0 / e.bpm);
-        e.valid = e.valid && e.periodicity >= kMinPeriodicity;
+        e.valid = e.valid && e.periodicity >= periodicityThreshold ();
     }
     return e;
 }

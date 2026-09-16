@@ -331,6 +331,17 @@ struct PpgChannelSim
     double wander = 0.0;
 };
 
+// Disturbances on top of the channels: no samples in [gapFrom, gapTo) s (a
+// dropout), and a 0.4 s step of artefactAmp x the pulse amplitude on every
+// channel at artefactAt s (a motion artefact).
+struct HrSimOptions
+{
+    double gapFrom = -1.0;
+    double gapTo = -1.0;
+    double artefactAt = -1.0;
+    double artefactAmp = 0.0;
+};
+
 struct HrSimResult
 {
     std::vector<HeartRate::Sample> samples;
@@ -342,6 +353,20 @@ struct HrSimResult
                 return &samples[i];
         return nullptr;
     }
+    // longest time between consecutive HR values after `from` (s since start)
+    double longestGap (double from, double t0) const
+    {
+        double last = std::numeric_limits<double>::quiet_NaN (), gap = 0.0;
+        for (const HeartRate::Sample &s : samples)
+        {
+            if (!std::isfinite (s.bpm) || s.t - t0 < from)
+                continue;
+            if (std::isfinite (last))
+                gap = std::max (gap, s.t - last);
+            last = s.t;
+        }
+        return std::isfinite (last) ? gap : std::numeric_limits<double>::infinity ();
+    }
     int validCount () const
     {
         int n = 0;
@@ -351,9 +376,12 @@ struct HrSimResult
     }
 };
 
-HrSimResult simulateHeartRate (const PpgChannelSim ch[HeartRate::kSources], double seconds, unsigned seed)
+constexpr double kHrSimT0 = 1.7e9;
+
+HrSimResult simulateHeartRate (const PpgChannelSim ch[HeartRate::kSources], double seconds, unsigned seed,
+    const HrSimOptions &opt = HrSimOptions ())
 {
-    const double fs = 25.0, t0 = 1.7e9, amp = 800.0;
+    const double fs = 25.0, t0 = kHrSimT0, amp = 800.0;
     const double dc[HeartRate::kSources] = {120000.0, 90000.0, 150000.0};
     std::mt19937 rng (seed);
     std::normal_distribution<double> noise (0.0, 1.0);
@@ -367,14 +395,17 @@ HrSimResult simulateHeartRate (const PpgChannelSim ch[HeartRate::kSources], doub
     for (int i = 0; i < n; ++i)
     {
         const double ti = i / fs;
+        if (ti >= opt.gapFrom && ti < opt.gapTo)
+            continue;
         t[k] = t0 + ti + jitter (rng);
+        const double artefact = ti >= opt.artefactAt && ti < opt.artefactAt + 0.4 ? opt.artefactAmp * amp : 0.0;
         for (int c = 0; c < HeartRate::kSources; ++c)
         {
             double v = ch[c].bpm > 0.0 ? HeartRate::syntheticPpg (ti, ch[c].bpm, dc[c], amp) : dc[c];
             v += ch[c].wander * amp *
                 (1.5 * std::sin (2.0 * M_PI * 0.25 * ti + c) + 3.0 * std::sin (2.0 * M_PI * 0.05 * ti + 1.0 + c));
             v += ch[c].noise * amp * noise (rng);
-            x[c][k] = v;
+            x[c][k] = v + artefact;
         }
         if (++k < 3)
             continue;
@@ -443,6 +474,19 @@ void heartRateChecks (Checker &check)
             fmt ("heart rate: noise-only (4 x 30 s) -> %.0f HR values, flat -> %.0f HR values (status only)",
                 double (noiseValid), double (f.validCount ())));
     }
+    // Respiratory wander about the pulse's size (1.5 x at 0.25 Hz, plus 3 x
+    // drift at 0.05 Hz) at low rates, where it sits closest to the pulse.
+    for (double bpm : {45.0, 60.0})
+    {
+        const PpgChannelSim ch[3] = {{bpm, 0.08, 1.0}, {bpm, 0.6, 1.0}, {0.0, 1.0, 1.0}};
+        const HrSimResult r = simulateHeartRate (ch, 40.0, static_cast<unsigned> (bpm) + 100);
+        const HeartRate::Sample *s = r.lastValid ();
+        const double gap = r.longestGap (15.0, kHrSimT0);
+        check (s && std::isfinite (r.samples.back ().bpm) && std::fabs (s->bpm - bpm) <= 2.0 && gap <= 2.0 * 60.0 / bpm,
+            fmt ("heart rate: %.0f bpm under respiratory wander 1.5 x the pulse at 0.25 Hz -> %.2f bpm, longest gap "
+                 "after 15 s %.1f s",
+                bpm, s ? s->bpm : std::numeric_limits<double>::quiet_NaN (), gap));
+    }
     // A PPG dropout during the rate check must not redesign the filters for a
     // wrong rate (it used to blank the HR for the rest of the session); a
     // stream that really runs at 21 Hz still gets a 21 Hz design.
@@ -477,6 +521,21 @@ void heartRateChecks (Checker &check)
             fmt ("heart rate: a 2 s PPG dropout at t = 1 s keeps the 25 Hz design and a valid %.2f bpm after 20 s; a "
                  "21 Hz stream is redesigned to %.2f Hz (%.0f %% valid)",
                 gapBpm, slowRate, 100.0 * slowValid));
+    }
+    // One 0.4 s motion artefact of 15 x the pulse amplitude: masked, not a
+    // beat, so the HR returns within a few beats instead of after the whole
+    // 8 s window (the longest gap between HR values was ~9.5 s, now ~4 s).
+    {
+        const PpgChannelSim ch[3] = {{72.0, 0.08, 0.3}, {72.0, 0.6, 0.3}, {0.0, 1.0, 0.3}};
+        HrSimOptions opt;
+        opt.artefactAt = 20.0;
+        opt.artefactAmp = 15.0;
+        const HrSimResult r = simulateHeartRate (ch, 40.0, 72, opt);
+        const HeartRate::Sample *s = r.lastValid ();
+        const double gap = r.longestGap (15.0, kHrSimT0);
+        check (s && std::isfinite (r.samples.back ().bpm) && std::fabs (s->bpm - 72.0) <= 2.0 && gap <= 6.0,
+            fmt ("heart rate: a 0.4 s artefact of 15 x the pulse at t = 20 s -> longest gap %.1f s, then %.2f bpm", gap,
+                s ? s->bpm : std::numeric_limits<double>::quiet_NaN ()));
     }
     {
         const PpgChannelSim ch[3] = {{0.0, 1.0, 0.3}, {72.0, 0.08, 0.3}, {72.0, 0.5, 0.3}};
