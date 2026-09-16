@@ -45,7 +45,7 @@ scripts/run.sh --selftest 2>&1 | grep -E "FAIL|RESULT"   # only failures + the s
 - Stages:
   1. Unit checks: ring, decimation, retimer, biquads (ECG high-pass 0.5 Hz, notch, low-pass 40 Hz), heart rate (synthetic PPG at 60/72/120/180 bpm, inverted-count alignment, noise / flat, 45 / 60 bpm under 1.5 × respiratory wander, a 2 s dropout during the rate check and a real 21 Hz stream, a 15 × motion artefact, source selection), board-row mapping (incl. PPG order), `Readouts` rules (2 s rail window clearing, saturation wording, heart-rate readout), CPU meter, serial port enumeration (dongles first, BrainFlow port names, under 250 ms because the GUI rescans at 1 Hz), typed ports in the OS spelling (`matchPortName`) and the default recording folders.
   2. Cancel while `prepare_session` is still blocking.
-  3. EmotiBit discovery against a loopback fake device.
+  3. EmotiBit discovery against a loopback fake device, including the typed-IP broadcast fallback (`DeviceConfig::testBroadcastTargets`).
   4. Synthetic streaming, ECG filters, heart rate through the worker (a third session with `testPpgBpm`), recording and the drop counter.
   5. Shutdown.
   6. Reconnect.

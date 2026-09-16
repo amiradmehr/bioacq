@@ -49,8 +49,10 @@ struct DeviceConfig
     bool ownDiscovery = true;
     int discoveryPort = emotibit::kAdvertisingPort;
     double discoveryTimeoutSec = -1.0; // <= 0: use params.timeout
-    // Own discovery only: when unicast to params.ip_address (e.g. the last IP
-    // that answered) finds nothing, search again by broadcast (same subnet).
+    // Own discovery only: when unicast to params.ip_address (a typed IP or the
+    // last IP that answered) finds nothing within kUnicastTrySeconds, search
+    // again by broadcast on every interface (same subnet): the EmotiBit may
+    // have joined another network, e.g. a hotspot, and got a new address.
     bool broadcastFallback = false;
 
     // Count gaps in the board's package-number row (Cyton: 0..255 per
@@ -70,6 +72,9 @@ struct DeviceConfig
     // near-rail path). BrainFlow's recordings are unaffected by both.
     double testFreezeAfterSec = -1.0;
     double testRawOffset = 0.0;
+    // Test only (--selftest): broadcast targets for the fallback instead of
+    // this computer's interface broadcast addresses (loopback fake EmotiBit).
+    std::vector<std::string> testBroadcastTargets;
     // Test hook (--test-ppg-bpm): replace the PPG display values (and so the
     // heart-rate input) with HeartRate::syntheticPpg at this rate. 0 = off.
     double testPpgBpm = 0.0;

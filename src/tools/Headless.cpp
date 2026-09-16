@@ -174,11 +174,12 @@ DeviceConfig makeConfig (DeviceKind kind, bool synthetic, const ProbeOptions *po
     else
     {
         // Same as MainWindow::connectDeviceWith, minus the GUI's remembered
-        // "last IP that answered": a blank IP is broadcast discovery only.
+        // "last IP that answered": a typed IP gets a short unicast try, then
+        // broadcast discovery; a blank IP is broadcast discovery only.
         cfg.params.ip_address = po->emotibitIp.trimmed ().toStdString ();
         cfg.params.timeout = po->emotibitTimeoutSec;
         cfg.ownDiscovery = !po->bfDiscovery;
-        cfg.broadcastFallback = false;
+        cfg.broadcastFallback = cfg.ownDiscovery && !cfg.params.ip_address.empty ();
     }
     cfg.signalSpecs = resolveSignals (cfg.boardId, signalDefsFor (kind), problems);
     cfg.pollIntervalMs = kind == DeviceKind::Cyton ? 10 : 15;
@@ -1149,6 +1150,35 @@ void discoveryChecks (Checker &check)
         check (started && fin && ed.failed && ed.error.contains (QStringLiteral ("no EmotiBit answered at 127.0.0.1")) &&
                 sec < 2.0,
             fmt ("worker: unanswered EmotiBit IP fails after %.2f s without touching BrainFlow", sec));
+    }
+    {
+        // A typed IP that does not answer (the EmotiBit moved to another
+        // network, e.g. a hotspot) gets a short unicast try, then the
+        // broadcast fallback finds it at its new address.
+        ed.resetFlags ();
+        DeviceConfig cfg = emotibitTestConfig (dev.port (), 5.0);
+        cfg.params.ip_address = "192.0.2.1"; // TEST-NET-1: never answers
+        cfg.broadcastFallback = true;
+        cfg.testBroadcastTargets = {"127.0.0.1"};
+        DeviceWorker *w = ed.worker.get ();
+        QString foundIp;
+        double foundSec = -1.0;
+        // direct: runs on the worker thread, so the stop lands before prepare_session
+        const auto conn = QObject::connect (
+            w, &DeviceWorker::discovered, w,
+            [&foundIp, &foundSec, &ed, w] (const QString &ip, const QString &) {
+                foundIp = ip;
+                foundSec = since (ed.startedAt);
+                w->requestStop ();
+            },
+            Qt::DirectConnection);
+        ed.startedAt = SteadyClock::now ();
+        const bool started = w->start (cfg);
+        const bool fin = pumpUntil ([&] { return ed.finished; }, 10.0) && w->waitForFinished (5000);
+        QObject::disconnect (conn);
+        check (started && fin && foundIp == QStringLiteral ("127.0.0.1") && foundSec > 1.8 && foundSec < 3.5 &&
+                !ed.connected,
+            fmt ("worker: a typed IP without an answer falls back to broadcast; EmotiBit found after %.2f s", foundSec));
     }
 }
 

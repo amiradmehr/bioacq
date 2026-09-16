@@ -27,6 +27,9 @@ namespace
 // EmotiBit. BrainFlow then only re-greets that one address; one HELLO
 // exchange is all it needs (values < 2 would be forced to 4 by BrainFlow).
 constexpr int kBrainFlowEmotiTimeout = 2;
+// With a broadcast fallback, the unicast try at the typed / remembered IP is
+// short: a live EmotiBit answers HELLO_EMOTIBIT within ~0.1 s.
+constexpr double kUnicastTrySeconds = 2.0;
 
 QString cleanWhat (const BrainFlowException &e)
 {
@@ -440,21 +443,24 @@ bool DeviceWorker::discoverEmotibit (DeviceConfig &cfg)
         ? cfg.discoveryTimeoutSec
         : std::max (2.0, static_cast<double> (cfg.params.timeout));
     const QString secs = QString::number (timeout, 'g', 3);
+    const bool fallback = !typed.empty () && cfg.broadcastFallback;
+    const double firstTimeout = fallback ? std::min (timeout, kUnicastTrySeconds) : timeout;
     emit progress (typed.empty ()
             ? QStringLiteral ("discovering EmotiBit: broadcast to %1 (same subnet only, up to %2 s)…")
                   .arg (targets.empty () ? QStringLiteral ("no interface") : joinTargets (targets), secs)
             : QStringLiteral ("looking for the EmotiBit at %1 (up to %2 s)…")
-                  .arg (QString::fromStdString (typed), secs));
+                  .arg (QString::fromStdString (typed), QString::number (firstTimeout, 'g', 3)));
 
-    emotibit::DiscoveryResult r = emotibit::discover (targets, cfg.discoveryPort, timeout,
+    emotibit::DiscoveryResult r = emotibit::discover (targets, cfg.discoveryPort, firstTimeout,
         cfg.params.serial_number, [this] { return stop_.load (); }, &probes_);
     if (r.cancelled)
         return false;
-    if (!r.found && !typed.empty () && cfg.broadcastFallback)
+    if (!r.found && fallback)
     {
-        // The remembered IP did not answer: the EmotiBit may have a new
-        // address on this subnet.
-        const std::vector<std::string> bc = emotibit::ipv4BroadcastAddresses ();
+        // The typed / remembered IP did not answer: the EmotiBit may have a
+        // new address, on this subnet or on another network both joined.
+        const std::vector<std::string> bc = cfg.testBroadcastTargets.empty () ? emotibit::ipv4BroadcastAddresses ()
+                                                                              : cfg.testBroadcastTargets;
         emit progress (QStringLiteral ("no answer at %1; broadcast discovery on %2 (same subnet only, up to %3 s)…")
                            .arg (QString::fromStdString (typed),
                                bc.empty () ? QStringLiteral ("no interface") : joinTargets (bc), secs));
