@@ -26,6 +26,8 @@
 	<string>public.app-category.medical</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>BioAcq streams from your EmotiBit over Bluetooth.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>

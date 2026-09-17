@@ -127,6 +127,15 @@
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>Frameworks/QtBluetooth.framework</key>
+		<dict>
+			<key>cdhash</key>
+			<data>
+			v1+TZFqxPavjP2FCzn3oUKOfrOM=
+			</data>
+			<key>requirement</key>
+			<string>cdhash H"bf5f93645ab13dabe33f6142ce7de850a39face3"</string>
+		</dict>
 		<key>Frameworks/QtCore.framework</key>
 		<dict>
 			<key>cdhash</key>
