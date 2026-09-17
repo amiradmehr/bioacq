@@ -30,6 +30,29 @@ constexpr int kBrainFlowEmotiTimeout = 2;
 // With a broadcast fallback, the unicast try at the typed / remembered IP is
 // short: a live EmotiBit answers HELLO_EMOTIBIT within ~0.1 s.
 constexpr double kUnicastTrySeconds = 2.0;
+// Bluetooth: the shortest scan (an advertising EmotiBit shows up within ~1 s),
+// and the time allowed after it to connect, read the services and subscribe.
+constexpr double kBluetoothScanMinSeconds = 4.0;
+constexpr double kBluetoothConnectSeconds = 15.0;
+// EmotiBitBleBridge::stop (): cancels the scan / link and joins its thread.
+constexpr double kBluetoothStopSeconds = 2.0;
+
+double discoveryTimeoutFor (const DeviceConfig &cfg)
+{
+    return cfg.discoveryTimeoutSec > 0.0 ? cfg.discoveryTimeoutSec : std::max (2.0, static_cast<double> (cfg.params.timeout));
+}
+
+double bluetoothScanSeconds (const DeviceConfig &cfg)
+{
+    return std::max (discoveryTimeoutFor (cfg), kBluetoothScanMinSeconds);
+}
+
+// The Bluetooth route may be tried for this session (if permission allows).
+bool mayUseBluetooth (const DeviceConfig &cfg)
+{
+    return cfg.boardId == static_cast<int> (BoardIds::EMOTIBIT_BOARD) &&
+        (cfg.emotiLink == EmotiBitLink::Bluetooth || (cfg.emotiLink == EmotiBitLink::Auto && cfg.ownDiscovery));
+}
 
 QString cleanWhat (const BrainFlowException &e)
 {
@@ -159,13 +182,21 @@ bool DeviceWorker::start (const DeviceConfig &cfg)
         worstCaseStop_ = 15.0; // serial open + soft reset + stop/release
     else
         worstCaseStop_ = 5.0;
+    if (mayUseBluetooth (cfg))
+        worstCaseStop_ += kBluetoothStopSeconds; // the bridge stops after release_session
     worstCaseStop_ += cfg.testPrepareDelayMs / 1000.0;
-    discTimeout_ = cfg.discoveryTimeoutSec > 0.0 ? cfg.discoveryTimeoutSec
-                                                 : std::max (2.0, static_cast<double> (cfg.params.timeout));
+    discTimeout_ = discoveryTimeoutFor (cfg);
     {
         std::lock_guard<std::mutex> lock (filesMutex_);
         files_.clear ();
     }
+    {
+        std::lock_guard<std::mutex> lock (btMutex_);
+        btWhy_ = cfg.bluetoothWhy;
+    }
+    btPermission_.store (cfg.bluetoothAllowed ? 1 : (cfg.bluetoothPending ? 0 : 2));
+    btStage_.store (BtOff);
+    viaBluetooth_.store (false);
 
     stop_.store (false);
     done_.store (false);
@@ -439,8 +470,176 @@ QString DeviceWorker::discoveryFailureText (
         .arg (QString::fromStdString (typedIp), secs);
 }
 
-bool DeviceWorker::discoverEmotibit (DeviceConfig &cfg)
+void DeviceWorker::setBluetoothPermission (bool granted, const QString &why)
 {
+    {
+        std::lock_guard<std::mutex> lock (btMutex_);
+        btWhy_ = granted ? QString () : why;
+    }
+    int pending = 0;
+    btPermission_.compare_exchange_strong (pending, granted ? 1 : 2);
+}
+
+QString DeviceWorker::bluetoothWhy () const
+{
+    std::lock_guard<std::mutex> lock (btMutex_);
+    return btWhy_;
+}
+
+DeviceWorker::BluetoothStage DeviceWorker::pollBluetooth (EmotiBitBleBridge &ble, const DeviceConfig &cfg)
+{
+    BluetoothStage stage = BtOff;
+    if (bleStartedAt_ <= 0.0)
+    {
+        const int permission = btPermission_.load ();
+        if (permission == 0)
+            stage = BtPermission;
+        else if (permission == 1)
+        {
+            ble.start (cfg.testSyntheticBluetooth ? EmotiBitBleBridge::Source::Synthetic
+                                                  : EmotiBitBleBridge::Source::Bluetooth,
+                cfg.bluetoothName, bluetoothScanSeconds (cfg));
+            bleStartedAt_ = steadyNow ();
+            stage = BtScanning;
+        }
+    }
+    else
+    {
+        switch (ble.state ())
+        {
+            case EmotiBitBleBridge::Idle:
+            case EmotiBitBleBridge::Scanning:
+                stage = BtScanning;
+                break;
+            case EmotiBitBleBridge::Connecting:
+                stage = BtConnecting;
+                break;
+            case EmotiBitBleBridge::Ready:
+                stage = ble.linkUp () ? BtLinked : BtLost;
+                break;
+            case EmotiBitBleBridge::Failed:
+                stage = BtFailed;
+                break;
+            case EmotiBitBleBridge::Stopped:
+                stage = BtOff;
+                break;
+        }
+    }
+    btStage_.store (stage);
+    return stage;
+}
+
+bool DeviceWorker::waitForBluetooth (EmotiBitBleBridge &ble, const DeviceConfig &cfg)
+{
+    setPhase (PhaseBluetooth);
+    QString shown;
+    for (;;)
+    {
+        const BluetoothStage stage = pollBluetooth (ble, cfg);
+        if (stage == BtLinked)
+            return true;
+        if (stage == BtFailed)
+            throw std::runtime_error (ble.error ().toStdString ());
+        if (stage == BtOff) // permission refused, or the bridge was stopped
+        {
+            const QString why = bluetoothWhy ();
+            throw std::runtime_error (why.isEmpty () ? std::string ("Bluetooth is not available") : why.toStdString ());
+        }
+        const QString status = stage == BtPermission
+            ? QStringLiteral ("waiting for Bluetooth permission (answer the system prompt)…")
+            : ble.status ();
+        if (!status.isEmpty () && status != shown)
+        {
+            emit progress (status);
+            shown = status;
+        }
+        // no deadline while the user reads the permission prompt
+        if (bleStartedAt_ > 0.0 && steadyNow () > bleStartedAt_ + bluetoothScanSeconds (cfg) + kBluetoothConnectSeconds)
+            throw std::runtime_error ("the Bluetooth connection to " +
+                (ble.deviceName ().isEmpty () ? std::string ("the EmotiBit") : ble.deviceName ().toStdString ()) +
+                " timed out");
+        if (waitStop (50))
+            return false;
+    }
+}
+
+void DeviceWorker::useBluetooth (DeviceConfig &cfg, EmotiBitBleBridge &ble)
+{
+    // BrainFlow's Wi-Fi driver talks to the bridge as if the EmotiBit were at 127.0.0.1
+    cfg.params.ip_address = "127.0.0.1";
+    cfg.params.serial_number.clear ();
+    cfg.params.timeout = kBrainFlowEmotiTimeout;
+    viaBluetooth_.store (true);
+    emit bluetoothLinked (ble.deviceName ());
+    emit progress (QStringLiteral ("%1 linked over Bluetooth; opening the BrainFlow session…").arg (ble.deviceName ()));
+}
+
+bool DeviceWorker::discoverEmotibit (DeviceConfig &cfg, EmotiBitBleBridge *ble)
+{
+    if (cfg.emotiLink == EmotiBitLink::Bluetooth)
+    {
+        if (!ble)
+        {
+            failKind_.store (FailOther);
+            const QString why = bluetoothWhy ();
+            throw std::runtime_error (why.isEmpty () ? std::string ("Bluetooth is not available to BioAcq")
+                                                     : why.toStdString ());
+        }
+        try
+        {
+            if (!waitForBluetooth (*ble, cfg))
+                return false;
+        }
+        catch (const std::exception &)
+        {
+            failKind_.store (ble->failedNotFound () ? FailNotFound : FailOther);
+            throw;
+        }
+        useBluetooth (cfg, *ble);
+        return true;
+    }
+
+    // Auto: the Bluetooth scan runs alongside the Wi-Fi search, and whichever
+    // finds the EmotiBit first wins. The Wi-Fi search stops as soon as the
+    // bridge connects to an EmotiBit (on the BLE firmware it is not on Wi-Fi).
+    const auto bleFound = [this, ble, &cfg] {
+        const BluetoothStage st = ble ? pollBluetooth (*ble, cfg) : BtOff;
+        return st == BtConnecting || st == BtLinked || st == BtLost;
+    };
+    const auto cancelled = [this, &bleFound] { return stop_.load () || bleFound (); };
+    // No EmotiBit on Wi-Fi (wifiFailure; "" = the search was cut short by
+    // Bluetooth): the Bluetooth route decides, its scan may still be running.
+    const auto bluetoothOrThrow = [&] (const std::string &wifiFailure) {
+        if (!ble)
+        {
+            const QString why = bluetoothWhy ();
+            throw std::runtime_error (cfg.emotiLink == EmotiBitLink::Auto && !why.isEmpty ()
+                    ? wifiFailure + "\nBluetooth not used: " + why.toStdString ()
+                    : wifiFailure);
+        }
+        if (!wifiFailure.empty () && btPermission_.load () == 1)
+            emit progress (QStringLiteral ("no EmotiBit on Wi-Fi; waiting for the Bluetooth scan…"));
+        try
+        {
+            if (!waitForBluetooth (*ble, cfg))
+                return false;
+        }
+        catch (const std::exception &e)
+        {
+            if (wifiFailure.empty ())
+            {
+                failKind_.store (FailOther);
+                throw;
+            }
+            // keeps the Wi-Fi failure kind (not found / could not send)
+            throw std::runtime_error (wifiFailure + "\nBluetooth: " + e.what ());
+        }
+        failKind_.store (FailNone);
+        useBluetooth (cfg, *ble);
+        return true;
+    };
+    const QString alsoBle = ble ? QStringLiteral (" · scanning Bluetooth too") : QString ();
+
     const std::string typed = cfg.params.ip_address;
     // A search of this computer's networks: every interface's broadcast
     // address plus a unicast scan of its small subnets (/24 or narrower),
@@ -462,47 +661,53 @@ bool DeviceWorker::discoverEmotibit (DeviceConfig &cfg)
         return t;
     };
     const std::vector<std::string> targets = typed.empty () ? networkTargets () : std::vector<std::string> {typed};
-    const double timeout = cfg.discoveryTimeoutSec > 0.0
-        ? cfg.discoveryTimeoutSec
-        : std::max (2.0, static_cast<double> (cfg.params.timeout));
+    const double timeout = discoveryTimeoutFor (cfg);
     const QString secs = QString::number (timeout, 'g', 3);
     const bool fallback = !typed.empty () && cfg.broadcastFallback;
     const double firstTimeout = fallback ? std::min (timeout, kUnicastTrySeconds) : timeout;
-    emit progress (typed.empty ()
+    emit progress ((typed.empty ()
             ? QStringLiteral ("discovering EmotiBit: broadcast to %1 (same subnet only, up to %2 s)…")
                   .arg (searchText, secs)
             : QStringLiteral ("looking for the EmotiBit at %1 (up to %2 s)…")
-                  .arg (QString::fromStdString (typed), QString::number (firstTimeout, 'g', 3)));
+                  .arg (QString::fromStdString (typed), QString::number (firstTimeout, 'g', 3))) + alsoBle);
 
     emotibit::DiscoveryResult r = emotibit::discover (targets, cfg.discoveryPort, firstTimeout,
-        cfg.params.serial_number, [this] { return stop_.load (); }, &probes_);
-    if (r.cancelled)
+        cfg.params.serial_number, cancelled, &probes_);
+    if (stop_.load ())
         return false;
+    if (r.cancelled) // Bluetooth found the EmotiBit first
+        return bluetoothOrThrow (std::string ());
     if (!r.found && fallback)
     {
         // The typed / remembered IP did not answer: the EmotiBit may have a
         // new address, on this subnet or on another network both joined.
         const std::vector<std::string> bc = networkTargets ();
         emit progress (QStringLiteral ("no answer at %1; broadcast discovery on %2 (same subnet only, up to %3 s)…")
-                           .arg (QString::fromStdString (typed), searchText, secs));
+                           .arg (QString::fromStdString (typed), searchText, secs) + alsoBle);
         setPhase (PhaseDiscovering); // restarts the elapsed / timeout readout
         probes_.store (0);
-        r = emotibit::discover (bc, cfg.discoveryPort, timeout, cfg.params.serial_number,
-            [this] { return stop_.load (); }, &probes_);
-        if (r.cancelled)
+        r = emotibit::discover (bc, cfg.discoveryPort, timeout, cfg.params.serial_number, cancelled, &probes_);
+        if (stop_.load ())
             return false;
+        if (r.cancelled)
+            return bluetoothOrThrow (std::string ());
         if (!r.found)
         {
             failKind_.store (r.anySendOk ? FailNotFound : FailNoSend);
-            throw std::runtime_error (discoveryFailureText (r, std::string (), timeout).toStdString ());
+            return bluetoothOrThrow (discoveryFailureText (r, std::string (), timeout).toStdString ());
         }
     }
     if (!r.found)
     {
         failKind_.store (r.anySendOk ? FailNotFound : FailNoSend);
-        throw std::runtime_error (discoveryFailureText (r, typed, timeout).toStdString ());
+        return bluetoothOrThrow (discoveryFailureText (r, typed, timeout).toStdString ());
     }
 
+    if (ble)
+    {
+        ble->stop (); // Wi-Fi found it first
+        btStage_.store (BtOff);
+    }
     cfg.params.ip_address = r.ip;
     cfg.params.timeout = kBrainFlowEmotiTimeout;
     emit discovered (QString::fromStdString (r.ip), QString::fromStdString (r.serial));
@@ -520,6 +725,8 @@ void DeviceWorker::run (DeviceConfig cfg, std::vector<SignalChannel> chans)
     };
 
     std::unique_ptr<BoardShim> board;
+    EmotiBitBleBridge bridge; // Bluetooth route: started by the discovery, stopped after release_session
+    bleStartedAt_ = 0.0;
     bool prepared = false;
     bool streaming = false;
     bool cancelled = false;
@@ -545,10 +752,18 @@ void DeviceWorker::run (DeviceConfig cfg, std::vector<SignalChannel> chans)
         }
 
         // EmotiBit: find the device without holding BrainFlow's global lock.
-        if (cfg.boardId == static_cast<int> (BoardIds::EMOTIBIT_BOARD) && cfg.ownDiscovery)
+        const bool bluetooth = mayUseBluetooth (cfg) && btPermission_.load () != 2;
+        if (cfg.boardId == static_cast<int> (BoardIds::EMOTIBIT_BOARD) && (cfg.ownDiscovery || mayUseBluetooth (cfg)))
         {
             setPhase (PhaseDiscovering);
-            cancelled = !discoverEmotibit (cfg);
+            if (bluetooth)
+            {
+                ble_ = &bridge;
+                pollBluetooth (bridge, cfg); // starts the scan now if allowed
+            }
+            cancelled = !discoverEmotibit (cfg, bluetooth ? &bridge : nullptr);
+            if (!viaBluetooth_.load ())
+                ble_ = nullptr;
         }
 
         if (!cancelled)
@@ -625,6 +840,8 @@ void DeviceWorker::run (DeviceConfig cfg, std::vector<SignalChannel> chans)
         }
         board.reset ();
     }
+    ble_ = nullptr;
+    bridge.stop ();
     streamers_.clear ();
     if (recording_.exchange (false))
         emit recordingStopped (recordingFiles ());
@@ -700,6 +917,8 @@ void DeviceWorker::pollLoop (
 
     while (!stop_.load ())
     {
+        if (ble_)
+            pollBluetooth (*ble_, cfg); // link lost / back (the bridge reconnects on its own)
         const unsigned gen = filterGen_.load ();
         if (gen != appliedGen)
         {

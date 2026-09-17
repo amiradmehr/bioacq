@@ -1,5 +1,6 @@
 #pragma once
 
+#include "EmotiBitBleBridge.h"
 #include "RateMeter.h"
 #include "Readouts.h"
 #include "SignalSpec.h"
@@ -58,6 +59,8 @@ struct LaunchOptions
     bool notch = true;    // 60 Hz
     bool lowPass = true;  // 40 Hz
     bool brainflowDiscovery = false; // --bf-discovery: let BrainFlow search (holds its lock)
+    // --emotibit-link. Auto: a Bluetooth scan alongside the Wi-Fi discovery.
+    EmotiBitLink emotibitLink = EmotiBitLink::Auto;
 
     // QSettings: restore the last used values at start, save them on a
     // successful connect and on close (interactive GUI only). Values given on
@@ -131,6 +134,8 @@ private:
         QString typedIp;             // EmotiBit: unicast target at connect ("" = broadcast)
         QString serial;              // EmotiBit serial from discovery
         QString targets;             // EmotiBit: discovery targets (display)
+        bool bluetooth = false;      // EmotiBit: the session runs over Bluetooth
+        QString bluetoothName;       // EmotiBit: the advertised name of that device
         QString progressText;        // latest connecting-phase text
         double connectStarted = 0.0; // DeviceWorker::steadyNow() at connect
         double linkSeconds = std::numeric_limits<double>::quiet_NaN ();
@@ -201,6 +206,7 @@ private:
     void refreshPorts (bool announce = true); // announce: "Found N USB serial port(s)"
     void openWifiSetup ();                    // EmotiBitWifiDialog (only while the EmotiBit is idle)
     QString portOverride () const;            // the rail's port choice, "" = auto-detect
+    bool bluetoothUsable () const;            // the EmotiBit link may use Bluetooth (allowed or not asked yet)
     QString cytonPortFor (const QString &override) const;
     void applyFilterSettings ();
     void updateWindowTitle ();
@@ -239,6 +245,7 @@ private:
     QPushButton *wifiBtn_ = nullptr; // "wi-fi setup" link
     QSpinBox *timeoutSpin_ = nullptr;
     QString lastEmotibitIp_; // the last EmotiBit that answered (blank field: tried first)
+    QString lastBluetoothName_; // the last EmotiBit that streamed over Bluetooth (the scan prefers it)
     QWidget *discoverWrap_ = nullptr;
     QLabel *discoverTitle_ = nullptr;
     QLabel *discoverTime_ = nullptr;
