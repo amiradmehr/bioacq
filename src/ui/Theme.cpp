@@ -264,8 +264,6 @@ void apply (QApplication &app)
         "QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color: %6; }\n"
         "QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled { background: %8; border-color: %9;"
         " color: %10; }\n"
-        "QLineEdit[attention=\"true\"] { border-color: %6; }\n"
-        "QLineEdit[invalid=\"true\"] { border-color: %11; color: %11; }\n"
         "QSpinBox::up-button, QSpinBox::down-button { width: 0; border: 0; }\n"
         // text origin 1 + 6 + QLineEdit's 2 px margin = 9 px (design: border 1 +
         // padding 8); the 20 px drop-down holds the 8 px caret + 8 px padding
@@ -275,15 +273,15 @@ void apply (QApplication &app)
         " subcontrol-position: center right; }\n"
         "QComboBox::down-arrow { image: none; width: 0; height: 0; border: 0; }\n"
         "QComboBox QLineEdit { border: 0; padding: 0; background: transparent; }\n"
-        "QComboBox QAbstractItemView { background: %1; border: 1px solid %6; color: %12; outline: 0;"
+        "QComboBox QAbstractItemView { background: %1; border: 1px solid %6; color: %11; outline: 0;"
         " padding: 0; margin: 0; font-family: %4; font-size: %5; selection-background-color: %6;"
         " selection-color: %7; }\n"
         "QComboBox QAbstractItemView::item { padding: 5px 8px; min-height: 16px; border: 0; }\n"
         "QComboBox QAbstractItemView::item:selected { background: %6; color: %7; }\n"
-        "QComboBox QAbstractItemView::item:disabled { color: %13; background: %1; }\n")
+        "QComboBox QAbstractItemView::item:disabled { color: %12; background: %1; }\n")
              .arg (hex (inputFill), hex (controlEdge), hex (textStrong), m, pt (11), hex (action), hex (onAction),
                  hex (panel), hex (divider))
-             .arg (hex (textDim), hex (fault), hex (textBody), hex (textFaint));
+             .arg (hex (textDim), hex (textBody), hex (textFaint));
 
     app.setStyleSheet (q);
 }

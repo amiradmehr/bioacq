@@ -289,7 +289,7 @@ public:
     static double steadyNow ();
     static QString describeError (int exitCode, int boardId);
     static QString emotibitNetworkHint ();
-    // "Broadcast discovery only works on the same subnet ... enter the IP".
+    // "Broadcast discovery only works on the same subnet ... a known IP is reached by unicast".
     static QString emotibitSubnetHint ();
     // User-facing text for a discovery that found nothing.
     static QString discoveryFailureText (

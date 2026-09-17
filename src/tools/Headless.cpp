@@ -1178,7 +1178,7 @@ void discoveryChecks (Checker &check)
         r.anySendOk = true;
         const QString t = DeviceWorker::discoveryFailureText (r, "", 5.0);
         check (t.contains (QStringLiteral ("same subnet")) && t.contains (QStringLiteral ("IP address")),
-            "discovery: blank-IP failure explains the same-subnet limit and asks for the IP");
+            "discovery: blank-IP failure explains the same-subnet limit and how a known IP address is reached");
     }
 
     // The worker runs the discovery BEFORE any BrainFlow call: a stop during

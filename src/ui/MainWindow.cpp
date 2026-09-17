@@ -53,7 +53,6 @@ namespace
 // QSettings keys
 const char *kKeyPort = "cyton/port";                 // last port that connected (auto-detect prefers it)
 const char *kKeyPortOverride = "cyton/portOverride"; // the rail's port choice, "" = auto-detect
-const char *kKeyIp = "emotibit/ip";                  // the IP field ("" = last IP, then broadcast)
 const char *kKeyLastIp = "emotibit/lastIp";          // the last EmotiBit that answered
 const char *kKeyLastBle = "emotibit/lastBluetoothName"; // the last EmotiBit that streamed over Bluetooth
 const char *kKeyTimeout = "emotibit/timeout";
@@ -116,14 +115,6 @@ void setVariant (QPushButton *b, const char *v)
         return;
     b->setProperty ("variant", v);
     repolish (b);
-}
-
-void setFlag (QWidget *w, const char *prop, bool on)
-{
-    if (w->property (prop).toBool () == on)
-        return;
-    w->setProperty (prop, on);
-    repolish (w);
 }
 
 QPushButton *makeButton (const QString &text, const char *variant, const char *size, int height)
@@ -485,8 +476,6 @@ void MainWindow::loadSettings ()
             opts_.cytonPort = st.value (kKeyPort).toString ();
         portOverride_ = st.value (kKeyPortOverride).toString ();
     }
-    if (!opts_.ipSet && st.contains (kKeyIp))
-        opts_.emotibitIp = st.value (kKeyIp).toString (); // may be "" = last IP, then broadcast
     lastEmotibitIp_ = st.value (kKeyLastIp).toString ();
     lastBluetoothName_ = st.value (kKeyLastBle).toString ();
     if (!opts_.timeoutSet)
@@ -524,10 +513,7 @@ void MainWindow::saveDeviceAddress (DeviceKind kind, const QString &address)
     if (kind == DeviceKind::Cyton)
         st.setValue (kKeyPort, address);
     else if (validIpv4 (address))
-    {
-        st.setValue (kKeyIp, ipEdit_->text ().trimmed ());
         st.setValue (kKeyLastIp, address);
-    }
 }
 
 // =============================================================== rail
@@ -748,24 +734,12 @@ QWidget *MainWindow::buildEmotibitModule ()
     v->addLayout (headerRow (QStringLiteral ("// EMOTIBIT · PPG"), emotibit_.chip));
     v->addSpacing (9);
 
+    // No address to enter: Connect scans Bluetooth and searches Wi-Fi (the last
+    // EmotiBit that answered, then broadcast discovery) at once.
     auto *row = new QHBoxLayout;
     row->setContentsMargins (0, 0, 0, 0);
-    row->setSpacing (6);
-    auto *c1 = new QVBoxLayout;
-    c1->setSpacing (5);
-    c1->addWidget (kicker (QStringLiteral ("// IP ADDRESS")));
-    ipEdit_ = new QLineEdit (opts_.emotibitIp);
-    ipEdit_->setFixedHeight (30); // content-box 28 + 1 px border (design)
-    ipEdit_->setPlaceholderText (QStringLiteral ("auto"));
-    ipEdit_->setToolTip (QStringLiteral (
-        "EmotiBit IP address (shown in its serial boot log and in EmotiBit Oscilloscope).\n"
-        "Connect tries this address first (unicast, works across subnets; blank: the last EmotiBit\n"
-        "that answered), then broadcast discovery, which finds the EmotiBit on any network this\n"
-        "computer shares with it (same subnet), e.g. a hotspot. A new address replaces the field."));
-    c1->addWidget (ipEdit_);
-    auto *c2 = new QVBoxLayout;
-    c2->setSpacing (5);
-    c2->addWidget (kicker (QStringLiteral ("// TIMEOUT")));
+    row->addWidget (makeLabel (QStringLiteral ("Search timeout"), Theme::sans (11.5), Theme::textBody));
+    row->addStretch (1);
     timeoutSpin_ = new QSpinBox;
     timeoutSpin_->setFixedSize (72, 30);
     timeoutSpin_->setRange (2, kMaxDiscoveryTimeoutSec);
@@ -773,11 +747,10 @@ QWidget *MainWindow::buildEmotibitModule ()
     timeoutSpin_->setSuffix (QStringLiteral (" s"));
     timeoutSpin_->setButtonSymbols (QAbstractSpinBox::NoButtons);
     timeoutSpin_->setToolTip (QStringLiteral (
-        "How long to wait for the EmotiBit to answer (2-20 s; arrow keys / scroll to change).\n"
-        "The search runs outside BrainFlow and can be cancelled at any time; it does not pause the Cyton."));
-    c2->addWidget (timeoutSpin_);
-    row->addLayout (c1, 1);
-    row->addLayout (c2);
+        "How long Connect searches for the EmotiBit (2-20 s; arrow keys / scroll to change): the Wi-Fi\n"
+        "discovery waits this long, the Bluetooth scan at least 4 s. The search runs outside BrainFlow\n"
+        "and can be cancelled at any time; it does not pause the Cyton."));
+    row->addWidget (timeoutSpin_);
     v->addLayout (row);
     v->addSpacing (7);
     auto *metaRow = new QHBoxLayout;
@@ -833,13 +806,6 @@ QWidget *MainWindow::buildEmotibitModule ()
     v->addWidget (discoverWrap_);
 
     v->addWidget (buildErrorBox (emotibit_));
-
-    connect (ipEdit_, &QLineEdit::textChanged, this, [this] (const QString &t) {
-        const QString s = t.trimmed ();
-        setFlag (ipEdit_, "invalid", !s.isEmpty () && !validIpv4 (s));
-        updateSlotUi (emotibit_);
-    });
-    setFlag (ipEdit_, "invalid", !ipEdit_->text ().trimmed ().isEmpty () && !validIpv4 (ipEdit_->text ().trimmed ()));
     return f;
 }
 
@@ -1167,13 +1133,8 @@ void MainWindow::wireWorker (DeviceKind kind)
 
     connect (w, &DeviceWorker::discovered, this, [this, kind] (const QString &ip, const QString &serial) {
         Slot &s = slot (kind);
-        s.address = ip;
+        s.address = ip; // remembered on connect: the next Connect tries it first
         s.serial = serial;
-        // found by the broadcast fallback at a new address: the typed IP was
-        // stale, so the field (saved on connect) follows the device
-        const QString field = ipEdit_->text ().trimmed ();
-        if (kind == DeviceKind::EmotiBit && !field.isEmpty () && field != ip && validIpv4 (ip))
-            ipEdit_->setText (ip);
         showMessage (QStringLiteral ("EmotiBit%1 found at %2")
                          .arg (serial.isEmpty () ? QString () : QStringLiteral (" ") + serial, ip));
     });
@@ -1393,7 +1354,7 @@ void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
     cfg.displayName = deviceDisplayName (kind);
     cfg.boardId = synth ? static_cast<int> (BoardIds::SYNTHETIC_BOARD) : realBoardIdFor (kind);
     s.synthetic = synth;
-    s.fieldBlank = false;
+    s.autoAddress = false;
     s.address.clear ();
     s.serial.clear ();
     s.typedIp.clear ();
@@ -1438,20 +1399,20 @@ void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
     }
     else
     {
-        const QString field = ipEdit_->text ().trimmed ();
-        if (!field.isEmpty () && !validIpv4 (field))
+        const QString given = opts_.ipSet ? opts_.emotibitIp.trimmed () : QString ();
+        if (!given.isEmpty () && !validIpv4 (given))
         {
-            failNow (DeviceWorker::FailOther, QStringLiteral ("'%1' is not an IPv4 address").arg (field));
+            failNow (DeviceWorker::FailOther, QStringLiteral ("'%1' is not an IPv4 address").arg (given));
             return;
         }
-        // The typed IP (blank field: the last EmotiBit that answered) gets a
-        // short unicast try, which works across subnets; then broadcast
-        // discovery on every interface, so an EmotiBit that joined another
-        // network both share (e.g. a hotspot) is found at its new address.
-        QString target = field;
-        s.fieldBlank = field.isEmpty ();
+        // Wi-Fi: the address given with --ip, else the last EmotiBit that
+        // answered, gets a short unicast try, which works across subnets; then
+        // broadcast discovery on every interface, so an EmotiBit that joined
+        // another network both share (e.g. a hotspot) is found at its new address.
+        QString target = given;
+        s.autoAddress = given.isEmpty ();
         cfg.ownDiscovery = !opts_.brainflowDiscovery;
-        if (s.fieldBlank && validIpv4 (lastEmotibitIp_) && cfg.ownDiscovery)
+        if (s.autoAddress && validIpv4 (lastEmotibitIp_) && cfg.ownDiscovery)
             target = lastEmotibitIp_;
         cfg.broadcastFallback = cfg.ownDiscovery && !target.isEmpty ();
         cfg.params.ip_address = target.toStdString ();
@@ -1676,7 +1637,7 @@ QString MainWindow::metaText (const Slot &s) const
                     ? QStringLiteral ("no answer over bluetooth or wi-fi")
                     : QStringLiteral ("not on wi-fi · bluetooth: %1").arg (bt);
             if (!cy && s.failKind == DeviceWorker::FailNotFound)
-                return s.typedIp.isEmpty () || s.fieldBlank
+                return s.typedIp.isEmpty () || s.autoAddress
                     ? QStringLiteral ("no answer%1 · broadcast failed")
                           .arg (s.typedIp.isEmpty () ? QString () : QStringLiteral (" at ") + s.typedIp)
                     : QStringLiteral ("no answer at %1 within %2 s").arg (s.typedIp).arg (s.failTimeout, 0, 'f', 0);
@@ -1698,13 +1659,12 @@ QString MainWindow::metaText (const Slot &s) const
         const bool ble = bluetoothUsable ();
         if (opts_.emotibitLink == EmotiBitLink::Bluetooth)
             return ble ? QStringLiteral ("bluetooth only") : QStringLiteral ("bluetooth only · not available here");
-        const QString plus = ble ? QStringLiteral ("ble + ") : QString ();
-        const QString field = ipEdit_->text ().trimmed ();
-        if (!field.isEmpty ())
-            return validIpv4 (field) ? QStringLiteral ("%1%2, then broadcast").arg (plus, field)
-                                     : QStringLiteral ("not an IPv4 address");
-        return validIpv4 (lastEmotibitIp_) ? QStringLiteral ("auto · %1%2, then broadcast").arg (plus, lastEmotibitIp_)
-                                           : QStringLiteral ("auto · %1broadcast (same subnet)").arg (plus);
+        if (ble)
+            return QStringLiteral ("auto · bluetooth or wi-fi");
+        const QString given = opts_.ipSet ? opts_.emotibitIp.trimmed () : QString ();
+        const QString first = !given.isEmpty () ? given : (validIpv4 (lastEmotibitIp_) ? lastEmotibitIp_ : QString ());
+        return first.isEmpty () ? QStringLiteral ("auto · wi-fi broadcast (same subnet)")
+                                : QStringLiteral ("auto · wi-fi %1, then broadcast").arg (first);
     }
     if (st == DeviceWorker::Streaming && !s.stopRequested)
     {
@@ -1790,7 +1750,6 @@ void MainWindow::updateSlotUi (Slot &s)
     }
     else
     {
-        ipEdit_->setReadOnly (!editable);
         timeoutSpin_->setReadOnly (!editable);
         wifiBtn_->setEnabled (editable);
         const QString wifiTip = editable
@@ -1798,8 +1757,6 @@ void MainWindow::updateSlotUi (Slot &s)
             : QStringLiteral ("Disconnect the EmotiBit first: Wi-Fi setup restarts it.");
         if (wifiBtn_->toolTip () != wifiTip)
             wifiBtn_->setToolTip (wifiTip);
-        const bool nf = s.failed && s.failKind == DeviceWorker::FailNotFound;
-        setFlag (ipEdit_, "attention", nf && editable);
         updateDiscoverBox (s);
     }
     if (synthToggle_)
@@ -1930,14 +1887,15 @@ void MainWindow::updateErrorBox (Slot &s)
     else if (s.kind == DeviceKind::EmotiBit && s.failKind == DeviceWorker::FailNotFound)
     {
         title = QStringLiteral ("EMOTIBIT NOT FOUND");
-        if (s.fieldBlank || s.typedIp.isEmpty ())
+        if (s.typedIp.isEmpty ())
         {
             text = QStringLiteral ("Auto-discovery is a UDP broadcast — it only reaches devices on the %1 as "
                                    "this computer. This computer is on %2.")
                        .arg (b (QStringLiteral ("same subnet"), Theme::textStrong), subnets ().toHtmlEscaped ());
-            hint = QStringLiteral ("Enter the EmotiBit's address in the %1 field above (it is printed on the serial "
-                                   "monitor at boot), then connect again.")
-                       .arg (b (QStringLiteral ("IP address"), Theme::textBody));
+            hint = QStringLiteral ("Check that the EmotiBit is on and has joined a network this computer is on, and "
+                                   "that EmotiBit Oscilloscope is closed. To use this network, add it to the EmotiBit "
+                                   "with %1 (USB).")
+                       .arg (b (QStringLiteral ("wi-fi setup"), Theme::textBody));
         }
         else
         {
@@ -2469,9 +2427,9 @@ void MainWindow::refreshChrome (double now)
             !bluetoothReason (failedSlot->failText).isEmpty ())
             dmsg = QStringLiteral ("EmotiBit not found over Bluetooth or Wi-Fi");
         else if (failedSlot->kind == DeviceKind::EmotiBit && failedSlot->failKind == DeviceWorker::FailNotFound)
-            dmsg = (failedSlot->fieldBlank || failedSlot->typedIp.isEmpty ())
-                ? QStringLiteral ("EmotiBit not found on %1 — enter IP manually").arg (subnets ())
-                : QStringLiteral ("EmotiBit not found at %1 — check the IP address").arg (failedSlot->typedIp);
+            dmsg = failedSlot->typedIp.isEmpty ()
+                ? QStringLiteral ("EmotiBit not found on %1").arg (subnets ())
+                : QStringLiteral ("EmotiBit not found at %1 or on %2").arg (failedSlot->typedIp, subnets ());
         else if (failedSlot->kind == DeviceKind::Cyton && failedSlot->failKind == DeviceWorker::FailNotFound)
             dmsg = QStringLiteral ("Cyton not found — no dongle on USB");
         else
@@ -2569,9 +2527,10 @@ void MainWindow::refreshChrome (double now)
             text = QStringLiteral ("EmotiBit not found over Bluetooth or Wi-Fi. Check that it is on and near this computer, "
                                    "then connect again.");
         else if (nf && failedSlot->kind == DeviceKind::EmotiBit)
-            text = (failedSlot->fieldBlank || failedSlot->typedIp.isEmpty ())
-                ? QStringLiteral ("EmotiBit did not answer the discovery. Enter its IP address in the left rail and connect again.")
-                : QStringLiteral ("EmotiBit did not answer at %1. Check the address in the left rail and connect again.").arg (failedSlot->typedIp);
+            text = failedSlot->typedIp.isEmpty ()
+                ? QStringLiteral ("EmotiBit did not answer the discovery. Check that it is on, then connect again.")
+                : QStringLiteral ("EmotiBit did not answer at %1 or on this computer's network. Check that it is on, then "
+                                  "connect again.").arg (failedSlot->typedIp);
         else if (nf)
             text = QStringLiteral ("No Cyton dongle on USB. Plug it in, then connect again.");
         else
