@@ -15,9 +15,9 @@ struct ProbeOptions
     QString emotibitIp = QStringLiteral ("192.168.1.12"); // blank = broadcast discovery
     int emotibitTimeoutSec = 5;
     bool bfDiscovery = false; // let BrainFlow discover the EmotiBit (holds its global lock)
-    // Auto: a Bluetooth scan alongside the Wi-Fi discovery (only when started
-    // as BioAcq.app, see BluetoothAccess.h; asks for the permission first).
-    EmotiBitLink emotibitLink = EmotiBitLink::Auto;
+    // Bluetooth only by default (only when started as BioAcq.app, see
+    // BluetoothAccess.h; asks for the permission first); auto / wifi add Wi-Fi.
+    EmotiBitLink emotibitLink = EmotiBitLink::Bluetooth;
     double seconds = 8.0;
     bool record = false;
     QString recordDir;
