@@ -60,8 +60,9 @@ struct LaunchOptions
     bool notch = true;    // 60 Hz
     bool lowPass = true;  // 40 Hz
     bool brainflowDiscovery = false; // --bf-discovery: let BrainFlow search (holds its lock)
-    // --emotibit-link. Auto: a Bluetooth scan alongside the Wi-Fi discovery.
-    EmotiBitLink emotibitLink = EmotiBitLink::Auto;
+    // --emotibit-link: Bluetooth only by default; auto adds the Wi-Fi discovery
+    // (and the rail's search timeout and wi-fi setup link).
+    EmotiBitLink emotibitLink = EmotiBitLink::Bluetooth;
 
     // QSettings: restore the last used values at start, save them on a
     // successful connect and on close (interactive GUI only). Values given on
@@ -208,6 +209,7 @@ private:
     void openWifiSetup ();                    // EmotiBitWifiDialog (only while the EmotiBit is idle)
     QString portOverride () const;            // the rail's port choice, "" = auto-detect
     bool bluetoothUsable () const;            // the EmotiBit link may use Bluetooth (allowed or not asked yet)
+    bool bluetoothOnly () const;              // --emotibit-link bluetooth (the default): no Wi-Fi search
     QString cytonPortFor (const QString &override) const;
     void applyFilterSettings ();
     void updateWindowTitle ();
