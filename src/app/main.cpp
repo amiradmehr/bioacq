@@ -57,7 +57,7 @@ struct Args
     QString port; // empty = auto-detect the OpenBCI dongle (findCytonDongle)
     QString ip = QStringLiteral ("192.168.1.12");
     int timeout = 5;
-    EmotiBitLink link = EmotiBitLink::Auto;
+    EmotiBitLink link = EmotiBitLink::Bluetooth;
     bool linkSet = false;
     QString recordDir = defaultRecordDir ();
     bool recordDirSet = false;
@@ -251,10 +251,10 @@ void usage ()
         "  --timeout <s>             EmotiBit discovery timeout, 2-%d (default 5)\n"
         "  --bf-discovery            let BrainFlow do the EmotiBit discovery (old behaviour; holds\n"
         "                            BrainFlow's global lock, pausing the Cyton meanwhile)\n"
-        "  --emotibit-link <l>       auto (default): scan Bluetooth (bioacq BLE firmware) while the Wi-Fi\n"
-        "                            discovery runs, the first to find the EmotiBit wins; wifi; bluetooth.\n"
+        "  --emotibit-link <l>       bluetooth (default; the bioacq BLE firmware) | wifi | auto (Bluetooth\n"
+        "                            scan and Wi-Fi discovery at once, the first to find the EmotiBit wins).\n"
         "                            macOS: Bluetooth only when started as BioAcq.app (Finder, open);\n"
-        "                            --screenshot defaults to wifi\n"
+        "                            --screenshot --state connecting / error default to wifi\n"
         "  --record                  arm recording: each device records from its first sample\n"
         "  --record-dir <dir>        recording folder (default %s)\n"
         "  --window <s>              plot window length, 1-60 (default 10)\n"
@@ -363,8 +363,10 @@ int main (int argc, char **argv)
     lo.record = a.record;
     lo.windowSec = a.window > 0 ? a.window : (shot ? 8 : 10);
     lo.brainflowDiscovery = a.bfDiscovery;
-    // --screenshot stays reproducible: no radio scan unless asked for
-    lo.emotibitLink = shot && !a.linkSet ? EmotiBitLink::WiFi : a.link;
+    // --screenshot stays reproducible: the states that search for a real EmotiBit
+    // use the unanswered Wi-Fi address below, never a radio scan, unless asked for
+    const bool searches = a.state == QLatin1String ("connecting") || a.state == QLatin1String ("error");
+    lo.emotibitLink = shot && searches && !a.linkSet ? EmotiBitLink::WiFi : a.link;
     // Saved settings only for the interactive GUI: --screenshot stays
     // reproducible and never overwrites what the user last used.
     lo.useSettings = a.mode == Args::Gui;
