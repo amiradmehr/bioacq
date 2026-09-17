@@ -19,6 +19,7 @@
 | `scripts/` | `build.sh`, `run.sh` (development build); `build_brainflow.sh` / `.ps1`; `package_macos.sh`, `package_windows.ps1`; `run_cli_windows.ps1` |
 | `.github/workflows/` | `windows.yml` (every push: build, selftest, package), `macos.yml` (manual) |
 | `third_party/brainflow/` | The local BrainFlow 5.23.0 patch, BrainFlow's licence, and how to build BrainFlow with it |
+| `third_party/emotibit-firmware/` | EmotiBit firmware patch for Bluetooth (BLE) streaming, build / flash / restore steps and a BLE test script |
 | `third_party/qt/` | The Qt notice and the LGPL-3.0 / GPL-3.0 texts the packages ship |
 | `design/` | Claude Design export used as the visual spec |
 

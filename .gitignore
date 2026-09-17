@@ -17,3 +17,6 @@ __pycache__/
 *.pyc
 .claude/
 .vscode/
+
+# device firmware backups (binary, device-specific)
+emotibit-firmware-backup/
