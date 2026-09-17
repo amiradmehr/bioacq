@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "AppPaths.h"
+#include "BluetoothAccess.h"
 #include "BuildConfig.h"
 #include "DeviceWorker.h"
 #include "EmotiBitDiscovery.h"
@@ -53,6 +54,7 @@ const char *kKeyPort = "cyton/port";                 // last port that connected
 const char *kKeyPortOverride = "cyton/portOverride"; // the rail's port choice, "" = auto-detect
 const char *kKeyIp = "emotibit/ip";                  // the IP field ("" = last IP, then broadcast)
 const char *kKeyLastIp = "emotibit/lastIp";          // the last EmotiBit that answered
+const char *kKeyLastBle = "emotibit/lastBluetoothName"; // the last EmotiBit that streamed over Bluetooth
 const char *kKeyTimeout = "emotibit/timeout";
 const char *kKeyWindow = "display/windowSec";
 // ECG display filters. New keys (the old cyton/* ones are ignored) because the
@@ -194,6 +196,20 @@ QString homeAbbrev (const QString &path)
 {
     const QString home = QDir::homePath ();
     return path.startsWith (home) ? QStringLiteral ("~") + path.mid (home.size ()) : path;
+}
+
+// The Bluetooth part of an EmotiBit failure text ("Bluetooth: ..." or
+// "Bluetooth not used: ..." from DeviceWorker::discoverEmotibit); "" if none.
+QString bluetoothReason (const QString &failText)
+{
+    for (const QString &line : failText.split (QLatin1Char ('\n')))
+    {
+        if (line.startsWith (QLatin1String ("Bluetooth: ")))
+            return line.mid (11).trimmed ();
+        if (line.startsWith (QLatin1String ("Bluetooth not used: ")))
+            return line.mid (20).trimmed ();
+    }
+    return QString ();
 }
 
 bool validIpv4 (const QString &s)
@@ -351,6 +367,7 @@ void MainWindow::loadSettings ()
     if (!opts_.ipSet && st.contains (kKeyIp))
         opts_.emotibitIp = st.value (kKeyIp).toString (); // may be "" = last IP, then broadcast
     lastEmotibitIp_ = st.value (kKeyLastIp).toString ();
+    lastBluetoothName_ = st.value (kKeyLastBle).toString ();
     if (!opts_.timeoutSet)
         opts_.emotibitTimeoutSec = st.value (kKeyTimeout, opts_.emotibitTimeoutSec).toInt ();
     if (!opts_.windowSet)
@@ -385,7 +402,7 @@ void MainWindow::saveDeviceAddress (DeviceKind kind, const QString &address)
     QSettings st;
     if (kind == DeviceKind::Cyton)
         st.setValue (kKeyPort, address);
-    else
+    else if (validIpv4 (address))
     {
         st.setValue (kKeyIp, ipEdit_->text ().trimmed ());
         st.setValue (kKeyLastIp, address);
@@ -607,7 +624,7 @@ QWidget *MainWindow::buildEmotibitModule ()
     QVBoxLayout *v = nullptr;
     QFrame *f = moduleFrame (v);
     emotibit_.chip = new StatusChip;
-    v->addLayout (headerRow (QStringLiteral ("// EMOTIBIT · WIFI"), emotibit_.chip));
+    v->addLayout (headerRow (QStringLiteral ("// EMOTIBIT · PPG"), emotibit_.chip));
     v->addSpacing (9);
 
     auto *row = new QHBoxLayout;
@@ -889,9 +906,9 @@ QWidget *MainWindow::buildIdleOverlay ()
     gap (14);
     auto *para = makeLabel (richPara (QStringLiteral (
                                           "One button opens every available device at once: the Cyton on its USB "
-                                          "dongle and the EmotiBit at the address in the left rail, or anywhere on "
-                                          "this computer's network (broadcast discovery). Plots arm themselves "
-                                          "as soon as samples arrive."),
+                                          "dongle and the EmotiBit over Bluetooth or Wi-Fi (the address in the left "
+                                          "rail, then this computer's network). Plots arm themselves as soon as "
+                                          "samples arrive."),
                                 20), // 12.5 px x 1.6
         Theme::sans (12.5), Theme::textMuted);
     para->setWordWrap (true);
@@ -1047,6 +1064,15 @@ void MainWindow::wireWorker (DeviceKind kind)
                          .arg (serial.isEmpty () ? QString () : QStringLiteral (" ") + serial, ip));
     });
 
+    connect (w, &DeviceWorker::bluetoothLinked, this, [this, kind] (const QString &deviceName) {
+        Slot &s = slot (kind);
+        s.bluetooth = true;
+        s.bluetoothName = deviceName;
+        s.address.clear ();
+        s.serial = EmotiBitBleBridge::deviceIdFromName (deviceName);
+        showMessage (QStringLiteral ("%1 found over Bluetooth").arg (deviceName));
+    });
+
     connect (w, &DeviceWorker::connected, this, [this, kind, name] (const QString &) {
         Slot &s = slot (kind);
         s.linkSeconds = DeviceWorker::steadyNow () - s.connectStarted;
@@ -1055,7 +1081,13 @@ void MainWindow::wireWorker (DeviceKind kind)
         if (!std::isfinite (sessionStartWall_))
             sessionStartWall_ = wallClockSeconds ();
         showMessage (QStringLiteral ("%1 connected in %2 s").arg (name).arg (s.linkSeconds, 0, 'f', 1), 5000);
-        if (!s.synthetic)
+        if (!s.synthetic && s.bluetooth)
+        {
+            lastBluetoothName_ = s.bluetoothName; // the scan prefers it next time
+            if (opts_.useSettings)
+                QSettings ().setValue (kKeyLastBle, s.bluetoothName);
+        }
+        else if (!s.synthetic)
         {
             saveDeviceAddress (kind, s.address);
             if (kind == DeviceKind::Cyton)
@@ -1228,6 +1260,14 @@ QString MainWindow::portOverride () const
     return isAuto (t) ? QString () : t;
 }
 
+bool MainWindow::bluetoothUsable () const
+{
+    if (opts_.emotibitLink == EmotiBitLink::WiFi || (opts_.emotibitLink == EmotiBitLink::Auto && opts_.brainflowDiscovery))
+        return false;
+    const bluetooth_access::Status st = bluetooth_access::check ();
+    return st == bluetooth_access::Status::Granted || st == bluetooth_access::Status::Undetermined;
+}
+
 void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
 {
     Slot &s = slot (kind);
@@ -1244,6 +1284,8 @@ void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
     s.serial.clear ();
     s.typedIp.clear ();
     s.targets.clear ();
+    s.bluetooth = false;
+    s.bluetoothName.clear ();
     s.failed = false;
     s.streamingSinceWall = kNaN;
     auto failNow = [&] (int failKind, const QString &text) {
@@ -1309,6 +1351,21 @@ void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
                                       : target;
         s.progressText = cfg.ownDiscovery ? QString ()
                                           : QStringLiteral ("BrainFlow is discovering the EmotiBit (holds its lock)…");
+        // Bluetooth (the bioacq BLE firmware): scanned alongside the Wi-Fi search.
+        // An unanswered permission prompt does not hold the Wi-Fi search up.
+        cfg.emotiLink = opts_.emotibitLink;
+        if (cfg.emotiLink == EmotiBitLink::Bluetooth || (cfg.emotiLink == EmotiBitLink::Auto && cfg.ownDiscovery))
+        {
+            QString why;
+            const bluetooth_access::Status bt = bluetooth_access::check (&why);
+            cfg.bluetoothAllowed = bt == bluetooth_access::Status::Granted;
+            cfg.bluetoothPending = bt == bluetooth_access::Status::Undetermined;
+            // denied: the failure text tells how to allow it. Unavailable (a
+            // development binary started from a terminal): Wi-Fi only, silently.
+            if (bt == bluetooth_access::Status::Denied || cfg.emotiLink == EmotiBitLink::Bluetooth)
+                cfg.bluetoothWhy = why;
+            cfg.bluetoothName = lastBluetoothName_;
+        }
     }
     cfg.countPackageGaps = kind == DeviceKind::Cyton;
     if (kind == DeviceKind::EmotiBit && opts_.testFreezeEmotibitSec >= 0.0)
@@ -1338,6 +1395,13 @@ void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
     s.connectStarted = DeviceWorker::steadyNow ();
     if (!s.worker->start (cfg))
         return;
+    if (cfg.bluetoothPending)
+        bluetooth_access::request (this, [this, kind] (bluetooth_access::Status st) {
+            QString why;
+            if (st != bluetooth_access::Status::Granted)
+                bluetooth_access::check (&why);
+            slot (kind).worker->setBluetoothPermission (st == bluetooth_access::Status::Granted, why);
+        });
     s.stopRequested = false;
     s.stalled = s.held = s.pending = false;
 
@@ -1492,6 +1556,11 @@ QString MainWindow::metaText (const Slot &s) const
                     : s.failText.section ('\n', 0, 0);
             if (cy && s.failKind == DeviceWorker::FailPortBusy)
                 return QStringLiteral ("%1 busy or board silent").arg (s.address);
+            const QString bt = cy ? QString () : bluetoothReason (s.failText);
+            if (!cy && s.failKind == DeviceWorker::FailNotFound && !bt.isEmpty ())
+                return bt.startsWith (QLatin1String ("no EmotiBit advertising"))
+                    ? QStringLiteral ("no answer over bluetooth or wi-fi")
+                    : QStringLiteral ("not on wi-fi · bluetooth: %1").arg (bt);
             if (!cy && s.failKind == DeviceWorker::FailNotFound)
                 return s.typedIp.isEmpty () || s.fieldBlank
                     ? QStringLiteral ("no answer%1 · broadcast failed")
@@ -1512,18 +1581,29 @@ QString MainWindow::metaText (const Slot &s) const
             return detectedPort_.isEmpty () ? QStringLiteral ("auto · no dongle detected")
                                             : QStringLiteral ("auto · %1").arg (detectedPort_);
         }
+        const bool ble = bluetoothUsable ();
+        if (opts_.emotibitLink == EmotiBitLink::Bluetooth)
+            return ble ? QStringLiteral ("bluetooth only") : QStringLiteral ("bluetooth only · not available here");
+        const QString plus = ble ? QStringLiteral ("ble + ") : QString ();
         const QString field = ipEdit_->text ().trimmed ();
         if (!field.isEmpty ())
-            return validIpv4 (field) ? QStringLiteral ("%1, then broadcast").arg (field)
+            return validIpv4 (field) ? QStringLiteral ("%1%2, then broadcast").arg (plus, field)
                                      : QStringLiteral ("not an IPv4 address");
-        return validIpv4 (lastEmotibitIp_) ? QStringLiteral ("auto · %1, then broadcast").arg (lastEmotibitIp_)
-                                           : QStringLiteral ("auto · broadcast (same subnet)");
+        return validIpv4 (lastEmotibitIp_) ? QStringLiteral ("auto · %1%2, then broadcast").arg (plus, lastEmotibitIp_)
+                                           : QStringLiteral ("auto · %1broadcast (same subnet)").arg (plus);
     }
     if (st == DeviceWorker::Streaming && !s.stopRequested)
     {
         QStringList t;
         if (s.synthetic)
             t << QStringLiteral ("synthetic");
+        else if (s.bluetooth)
+        {
+            const DeviceWorker::BluetoothStage bt = s.worker->bluetoothStage ();
+            t << (bt == DeviceWorker::BtLost          ? QStringLiteral ("bluetooth link lost · reconnecting")
+                     : bt == DeviceWorker::BtFailed ? QStringLiteral ("bluetooth link failed")
+                                                    : QStringLiteral ("bluetooth"));
+        }
         else
             t << s.address;
         if (!s.synthetic && !s.serial.isEmpty ())
@@ -1654,6 +1734,31 @@ void MainWindow::updateDiscoverBox (Slot &s)
                            : QStringLiteral ("Unicast to %1 · %2").arg (s.typedIp, probes);
         if (broadcast && !s.typedIp.isEmpty ())
             detail = QStringLiteral ("No answer at %1 · broadcast · %2").arg (s.typedIp, probes);
+        switch (s.worker->bluetoothStage ())
+        {
+            case DeviceWorker::BtPermission:
+                detail += QStringLiteral (" · Bluetooth: allow access in the system prompt");
+                break;
+            case DeviceWorker::BtScanning:
+                detail += QStringLiteral (" · Bluetooth scan");
+                break;
+            case DeviceWorker::BtConnecting:
+            case DeviceWorker::BtLinked:
+            case DeviceWorker::BtLost:
+                detail += QStringLiteral (" · EmotiBit found over Bluetooth");
+                break;
+            case DeviceWorker::BtFailed:
+                detail += QStringLiteral (" · no Bluetooth");
+                break;
+            case DeviceWorker::BtOff:
+                break;
+        }
+    }
+    else if (ph == DeviceWorker::PhaseBluetooth)
+    {
+        title = QStringLiteral ("BLUETOOTH…");
+        time = QStringLiteral ("%1 s").arg (el, 0, 'f', 1);
+        detail = s.progressText;
     }
     else
     {
@@ -1684,7 +1789,31 @@ void MainWindow::updateErrorBox (Slot &s)
     QString title, text, hint;
     const QString first = s.failText.section ('\n', 0, 0).trimmed ();
     QString rest = s.failText.section ('\n', 1).trimmed ();
-    if (s.kind == DeviceKind::EmotiBit && s.failKind == DeviceWorker::FailNotFound)
+    const QString bt = s.kind == DeviceKind::EmotiBit ? bluetoothReason (s.failText) : QString ();
+    if (s.kind == DeviceKind::EmotiBit && s.failKind == DeviceWorker::FailNotFound && !bt.isEmpty ())
+    {
+        title = QStringLiteral ("EMOTIBIT NOT FOUND");
+        const QString wifi = s.typedIp.isEmpty () ? QStringLiteral ("broadcast on %1").arg (subnets ().toHtmlEscaped ())
+                                                  : QStringLiteral ("%1, then broadcast on %2")
+                                                        .arg (b (s.typedIp, Theme::textStrong), subnets ().toHtmlEscaped ());
+        if (bt.startsWith (QLatin1String ("no EmotiBit advertising")))
+        {
+            text = QStringLiteral ("No EmotiBit is advertising over %1, and none answered on Wi-Fi (%2).")
+                       .arg (b (QStringLiteral ("Bluetooth"), Theme::textStrong), wifi);
+            hint = QStringLiteral ("Switch the EmotiBit on and keep it near this computer; it starts in Bluetooth mode "
+                                   "unless its button is held at start-up. Close EmotiBit Oscilloscope. In Wi-Fi mode it "
+                                   "must share a network with this computer (%1, over USB).")
+                       .arg (b (QStringLiteral ("wi-fi setup"), Theme::textBody));
+        }
+        else
+        {
+            text = QStringLiteral ("Bluetooth: %1. No EmotiBit answered on Wi-Fi (%2).").arg (bt.toHtmlEscaped (), wifi);
+            hint = QStringLiteral ("Fix Bluetooth and connect again, or start the EmotiBit in Wi-Fi mode (button held at "
+                                   "start-up) on a network this computer shares (%1).")
+                       .arg (b (QStringLiteral ("wi-fi setup"), Theme::textBody));
+        }
+    }
+    else if (s.kind == DeviceKind::EmotiBit && s.failKind == DeviceWorker::FailNotFound)
     {
         title = QStringLiteral ("EMOTIBIT NOT FOUND");
         if (s.fieldBlank || s.typedIp.isEmpty ())
@@ -2202,6 +2331,13 @@ void MainWindow::refreshChrome (double now)
         dmsg = parts.join (QStringLiteral (" · "));
         dcol = Theme::warn;
     }
+    else if (emDiscovering && emotibit_.worker->phase () == DeviceWorker::PhaseBluetooth)
+    {
+        dmsg = QStringLiteral ("%1Connecting EmotiBit over Bluetooth — %2 s")
+                   .arg (cyConnecting ? QStringLiteral ("Connecting Cyton · ") : QString ())
+                   .arg (std::max (0.0, DeviceWorker::steadyNow () - emotibit_.worker->phaseSince ()), 0, 'f', 1);
+        dcol = Theme::warn;
+    }
     else if (emDiscovering && emotibit_.worker->phase () != DeviceWorker::PhaseOpening)
     {
         const double el = std::max (0.0, DeviceWorker::steadyNow () -
@@ -2215,7 +2351,10 @@ void MainWindow::refreshChrome (double now)
     }
     else if (failedSlot)
     {
-        if (failedSlot->kind == DeviceKind::EmotiBit && failedSlot->failKind == DeviceWorker::FailNotFound)
+        if (failedSlot->kind == DeviceKind::EmotiBit && failedSlot->failKind == DeviceWorker::FailNotFound &&
+            !bluetoothReason (failedSlot->failText).isEmpty ())
+            dmsg = QStringLiteral ("EmotiBit not found over Bluetooth or Wi-Fi");
+        else if (failedSlot->kind == DeviceKind::EmotiBit && failedSlot->failKind == DeviceWorker::FailNotFound)
             dmsg = (failedSlot->fieldBlank || failedSlot->typedIp.isEmpty ())
                 ? QStringLiteral ("EmotiBit not found on %1 — enter IP manually").arg (subnets ())
                 : QStringLiteral ("EmotiBit not found at %1 — check the IP address").arg (failedSlot->typedIp);
@@ -2312,7 +2451,10 @@ void MainWindow::refreshChrome (double now)
     {
         const bool nf = failedSlot->failKind == DeviceWorker::FailNotFound;
         QString text;
-        if (nf && failedSlot->kind == DeviceKind::EmotiBit)
+        if (nf && failedSlot->kind == DeviceKind::EmotiBit && !bluetoothReason (failedSlot->failText).isEmpty ())
+            text = QStringLiteral ("EmotiBit not found over Bluetooth or Wi-Fi. Check that it is on and near this computer, "
+                                   "then connect again.");
+        else if (nf && failedSlot->kind == DeviceKind::EmotiBit)
             text = (failedSlot->fieldBlank || failedSlot->typedIp.isEmpty ())
                 ? QStringLiteral ("EmotiBit did not answer the discovery. Enter its IP address in the left rail and connect again.")
                 : QStringLiteral ("EmotiBit did not answer at %1. Check the address in the left rail and connect again.").arg (failedSlot->typedIp);

@@ -1,0 +1,171 @@
+From 6403090b1e60968538acf4eda9102ebb02dc16f0 Mon Sep 17 00:00:00 2001
+From: Amir <amir.radmehr77@gmail.com>
+Date: Wed, 16 Sep 2026 20:16:44 -0400
+Subject: [PATCH] bioacq: BLE streaming as the default mode, MTU and chunking
+ fixes
+
+- EmotiBitBluetooth::begin: BLEDevice::setMTU(517). With the default
+  local MTU of 23 every notification carried 20 bytes and
+  BLECharacteristic::notify() truncated the rest of each data chunk.
+- EmotiBitBluetooth::sendData: send each message in chunks of at most
+  (negotiated ATT MTU - 3) bytes, cut after a packet delimiter, with a
+  2 ms pause between notifications so the BLE stack doesn't drop them.
+- EMOTIBIT_BLUETOOTH_DEFAULT (env bioacq_ble_feather_esp32): Bluetooth
+  mode unless the button is held during the boot prompt (then WiFi).
+  upload_speed 115200 for the Feather HUZZAH32's CP2104.
+
+Verified on EmotiBit MD-V7-0001421 (HW V07a) with a Mac central
+(ATT MTU 515): 60 s, 9691 packets, 0 missing, 0 malformed; PPG 24.7 Hz,
+IMU 24.8 Hz, EDA 15.0 Hz, T1/TH 7.5 Hz.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ EmotiBit.cpp                           | 18 +++++++-
+ EmotiBitBluetooth.cpp                  | 61 +++++++++++++++-----------
+ EmotiBit_stock_firmware/platformio.ini |  9 +++-
+ 3 files changed, 61 insertions(+), 27 deletions(-)
+
+diff --git a/EmotiBit.cpp b/EmotiBit.cpp
+index bae94e8..4cd2392 100644
+--- a/EmotiBit.cpp
++++ b/EmotiBit.cpp
+@@ -451,15 +451,31 @@ uint8_t EmotiBit::setup(String firmwareVariant)
+ 	// prompt for serial input
+ 	Serial.println("Enter " + String(EmotiBitSerial::Inputs::CRED_UPDATE) + " to enter WiFi config edit mode (Add/ Delete WiFi creds)");
+ 
++#if defined(ARDUINO_FEATHER_ESP32) && defined(EMOTIBIT_BLUETOOTH_DEFAULT)
++	// bioacq build: Bluetooth unless the button is held during this window (then WiFi)
++	bool wifiRequested = false;
++#endif
+ 	while (!Serial.available() && millis() - now < 2000)
+ 	{
+-#ifdef ARDUINO_FEATHER_ESP32		
++#ifdef ARDUINO_FEATHER_ESP32
++#ifdef EMOTIBIT_BLUETOOTH_DEFAULT
++		if (digitalRead(buttonPin) && !wifiRequested) {
++			Serial.println("WiFi requested (button held at boot)");
++			wifiRequested = true;
++		}
++#else
+ 		if (digitalRead(buttonPin) && !_bluetoothEnabled ) {
+ 			Serial.println("Bluetooth Enabled");
+ 			_bluetoothEnabled  = true;
+ 		}
++#endif // EMOTIBIT_BLUETOOTH_DEFAULT
+ #endif // ARDUINO_FEATHER_ESP32
+ 	}
++#if defined(ARDUINO_FEATHER_ESP32) && defined(EMOTIBIT_BLUETOOTH_DEFAULT)
++	_bluetoothEnabled = !wifiRequested;
++	Serial.println(_bluetoothEnabled ? "bioacq BLE build: Bluetooth mode (hold the button at boot for WiFi)"
++		: "bioacq BLE build: WiFi mode");
++#endif
+ #ifdef ADAFRUIT_FEATHER_M0
+ 	AdcCorrection::AdcCorrectionValues adcCorrectionValues;
+ #endif
+diff --git a/EmotiBitBluetooth.cpp b/EmotiBitBluetooth.cpp
+index e833bad..8b85e45 100644
+--- a/EmotiBitBluetooth.cpp
++++ b/EmotiBitBluetooth.cpp
+@@ -15,6 +15,10 @@ uint8_t EmotiBitBluetooth::begin(const String& emotibitDeviceId)
+     
+         Serial.println("Bluetooth tag detected, turning on bluetooth.");
+         BLEDevice::init(("EmotiBit: " + _emotibitDeviceId).c_str());
++        // bioacq: accept a large ATT MTU (the central negotiates its own, typically
++        // 185-517 bytes). With the default of 23, a notification carries at most
++        // 20 bytes and the BLE library truncated the rest of every data chunk.
++        BLEDevice::setMTU(517);
+ 
+         pServer = BLEDevice::createServer();
+ 
+@@ -89,38 +93,45 @@ void EmotiBitBluetooth::sendData(const String &message)
+ {
+         if (deviceConnected)
+         {
+-                //TODO: consider truncating via MTU if message is too long
+                 if (pDataTxCharacteristic == nullptr)
+                 {
+                 //Serial.println("ERROR: pDataTxCharacteristic is NULL!");
+                 return;
+                 }
+-                
+-                //Serial.print("BLE TX: Message length=");
+-                //Serial.print(message.length());
+-                
+-                // Set the value
+-                pDataTxCharacteristic->setValue(message.c_str());
+-                
+-                // Call notify - note: doesn't return success/failure status
+-                pDataTxCharacteristic->notify();
+-                
+-                // Check descriptor status
+-                BLEDescriptor* p2902 = pDataTxCharacteristic->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+-                if (p2902)
+-                {
+-                const uint8_t* val = p2902->getValue();
+-                if (val)
++
++                // bioacq: a notification carries at most (negotiated ATT MTU - 3) bytes
++                // and BLECharacteristic::notify() truncates anything longer, so send the
++                // message in chunks that fit, cut after a packet delimiter where possible.
++                const uint16_t mtu = pServer ? pServer->getPeerMTU(_connId) : 0;
++                const size_t chunkMax = mtu > 3 ? mtu - 3 : 20;
++                const char* data = message.c_str();
++                const size_t len = message.length();
++                size_t start = 0;
++                while (start < len)
+                 {
+-                        //Serial.print(" | Notifications enabled=");
+-                        //Serial.print((val[0] & 0x01) ? "YES" : "NO");
+-                }
++                        size_t end = start + chunkMax;
++                        if (end >= len)
++                        {
++                                end = len;
++                        }
++                        else
++                        {
++                                size_t cut = end;
++                                while (cut > start && data[cut - 1] != EmotiBitPacket::PACKET_DELIMITER_CSV)
++                                {
++                                        cut--;
++                                }
++                                if (cut > start)
++                                {
++                                        end = cut; // else one packet longer than a notification: split it
++                                }
++                        }
++                        pDataTxCharacteristic->setValue((uint8_t*)(data + start), end - start);
++                        pDataTxCharacteristic->notify(); // no-op unless the client enabled notifications
++                        start = end;
++                        // let the BLE stack drain its queue: it drops notifications when congested
++                        delay(2);
+                 }
+-                
+-                //Serial.print(" | Char ptr=0x");
+-                //Serial.print((uint32_t)pDataTxCharacteristic, HEX);
+-                //Serial.print(" | Message: ");
+-                //Serial.println(message.c_str());
+         }
+         else
+         {
+diff --git a/EmotiBit_stock_firmware/platformio.ini b/EmotiBit_stock_firmware/platformio.ini
+index d8e9cbd..dc4bfb3 100644
+--- a/EmotiBit_stock_firmware/platformio.ini
++++ b/EmotiBit_stock_firmware/platformio.ini
+@@ -19,4 +19,11 @@ lib_dir = ../../
+ variant_flags = -DSTOCK_FIRMWARE
+ 
+ [env]
+-lib_ldf_mode = deep+
+\ No newline at end of file
++lib_ldf_mode = deep+
++; bioacq: the stock firmware with Bluetooth (BLE) streaming as the default mode.
++; Holding the EmotiBit's button during the boot prompt selects WiFi instead.
++[env:bioacq_ble_feather_esp32]
++extends = env:adafruit_feather_esp32
++build_flags = ${env:adafruit_feather_esp32.build_flags} -DEMOTIBIT_BLUETOOTH_DEFAULT
++; the Feather HUZZAH32's CP2104 drops bytes above 115200 baud here
++upload_speed = 115200
+-- 
+2.55.0
+
