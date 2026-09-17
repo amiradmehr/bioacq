@@ -1,5 +1,7 @@
 #pragma once
 
+#include "EmotiBitBleBridge.h"
+
 #include <QString>
 
 #include <csignal>
@@ -13,6 +15,9 @@ struct ProbeOptions
     QString emotibitIp = QStringLiteral ("192.168.1.12"); // blank = broadcast discovery
     int emotibitTimeoutSec = 5;
     bool bfDiscovery = false; // let BrainFlow discover the EmotiBit (holds its global lock)
+    // Auto: a Bluetooth scan alongside the Wi-Fi discovery (only when started
+    // as BioAcq.app, see BluetoothAccess.h; asks for the permission first).
+    EmotiBitLink emotibitLink = EmotiBitLink::Auto;
     double seconds = 8.0;
     bool record = false;
     QString recordDir;

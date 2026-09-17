@@ -269,11 +269,14 @@ done < <(macho_files)
 [[ "$bad" == 0 ]] || fail "the bundle still references files outside itself"
 echo "  $(macho_files | wc -l | tr -d ' ') Mach-O files, no /opt/homebrew, /usr/local or /Users paths"
 for req in PlugIns/platforms/libqcocoa.dylib PlugIns/platforms/libqoffscreen.dylib Resources/qt.conf \
-    Frameworks/QtCore.framework Frameworks/QtWidgets.framework Frameworks/QtSerialPort.framework; do
+    Frameworks/QtCore.framework Frameworks/QtWidgets.framework Frameworks/QtSerialPort.framework \
+    Frameworks/QtBluetooth.framework; do
     [[ -e "$APP/Contents/$req" ]] || fail "missing Contents/$req"
 done
-/usr/libexec/PlistBuddy -c "Print :NSLocalNetworkUsageDescription" "$APP/Contents/Info.plist" >/dev/null ||
-    fail "Info.plist has no NSLocalNetworkUsageDescription"
+for key in NSLocalNetworkUsageDescription NSBluetoothAlwaysUsageDescription; do
+    /usr/libexec/PlistBuddy -c "Print :$key" "$APP/Contents/Info.plist" >/dev/null ||
+        fail "Info.plist has no $key"
+done
 for req in Inter-OFL.txt JetBrainsMono-OFL.txt BrainFlow-LICENSE.txt Qt-NOTICE.md Qt-LGPL-3.0.txt Qt-GPL-3.0.txt; do
     [[ -s "$APP/Contents/Resources/licenses/$req" ]] || fail "missing licence Contents/Resources/licenses/$req"
 done

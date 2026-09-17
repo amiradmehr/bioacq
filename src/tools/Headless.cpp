@@ -2,8 +2,10 @@
 
 #include "AppPaths.h"
 #include "Biquad.h"
+#include "BluetoothAccess.h"
 #include "Decimate.h"
 #include "DeviceWorker.h"
+#include "EmotiBitBleBridge.h"
 #include "EmotiBitDiscovery.h"
 #include "EmotiBitWifiSetup.h"
 #include "HeartRate.h"
@@ -181,6 +183,26 @@ DeviceConfig makeConfig (DeviceKind kind, bool synthetic, const ProbeOptions *po
         cfg.params.timeout = po->emotibitTimeoutSec;
         cfg.ownDiscovery = !po->bfDiscovery;
         cfg.broadcastFallback = cfg.ownDiscovery && !cfg.params.ip_address.empty ();
+        // The GUI asks for the Bluetooth permission without waiting; here the
+        // prompt is answered before the search starts.
+        cfg.emotiLink = po->emotibitLink;
+        if (cfg.emotiLink == EmotiBitLink::Bluetooth || (cfg.emotiLink == EmotiBitLink::Auto && cfg.ownDiscovery))
+        {
+            QString why;
+            bluetooth_access::Status bt = bluetooth_access::check (&why);
+            if (bt == bluetooth_access::Status::Undetermined)
+            {
+                std::printf ("  [emotibit] asking for Bluetooth permission (answer the system prompt)...\n");
+                std::fflush (stdout);
+                bt = bluetooth_access::requestBlocking ();
+                why.clear ();
+                bluetooth_access::check (&why);
+            }
+            cfg.bluetoothAllowed = bt == bluetooth_access::Status::Granted;
+            cfg.bluetoothWhy = why;
+            if (!cfg.bluetoothAllowed)
+                std::printf ("  [emotibit] Bluetooth not used: %s\n", qPrintable (why));
+        }
     }
     cfg.signalSpecs = resolveSignals (cfg.boardId, signalDefsFor (kind), problems);
     cfg.pollIntervalMs = kind == DeviceKind::Cyton ? 10 : 15;
@@ -1221,6 +1243,163 @@ void discoveryChecks (Checker &check)
     }
 }
 
+// ------------------------------------------------- EmotiBit over Bluetooth
+// The bridge's synthetic packet source stands in for the radio, so this runs
+// anywhere: BrainFlow's real EmotiBit driver connects to the bridge on
+// 127.0.0.1 exactly as it would for a device received over Bluetooth.
+DeviceConfig bluetoothTestConfig (EmotiBitLink link, int wifiPort, double timeoutSec)
+{
+    DeviceConfig cfg = emotibitTestConfig (wifiPort, timeoutSec);
+    cfg.emotiLink = link;
+    cfg.bluetoothAllowed = true;
+    cfg.testSyntheticBluetooth = true;
+    return cfg;
+}
+
+void bluetoothChecks (Checker &check, double seconds)
+{
+    {
+        QByteArray buf ("1,2,1,AX,1,100,0.1\n3,4,1,AY,1,100,0.2\n5,6,1,A");
+        const QByteArray done = EmotiBitBleBridge::takeCompletePackets (buf);
+        QByteArray partial ("5,6,1,A");
+        const QByteArray none = EmotiBitBleBridge::takeCompletePackets (partial);
+        check (done == "1,2,1,AX,1,100,0.1\n3,4,1,AY,1,100,0.2\n" && buf == "5,6,1,A" && none.isEmpty () &&
+                partial == "5,6,1,A" &&
+                EmotiBitBleBridge::deviceIdFromName (QStringLiteral ("EmotiBit: MD-V7-0001421")) ==
+                    QLatin1String ("MD-V7-0001421"),
+            "Bluetooth bridge: only complete packets are forwarded (a split packet waits for its tail); device id "
+            "from the advertised name");
+    }
+
+    FakeEmotibit mute (false); // Wi-Fi: an address that never answers
+    if (!mute.ok ())
+    {
+        check (false, "Bluetooth: cannot open a local UDP test socket");
+        return;
+    }
+    DeviceRun br;
+    br.name = "emotibit(ble)";
+    br.kind = DeviceKind::EmotiBit;
+    wire (br, true);
+    DeviceWorker *w = br.worker.get ();
+    QString linkedName;
+    QStringList progressTexts;
+    double linkedSec = -1.0;
+    QObject::connect (w, &DeviceWorker::bluetoothLinked, w, [&linkedName, &linkedSec, &br] (const QString &name) {
+        linkedName = name;
+        linkedSec = since (br.startedAt);
+    });
+    QObject::connect (w, &DeviceWorker::progress, w, [&progressTexts] (const QString &t) { progressTexts << t; });
+    auto finish = [&] (double timeoutSec) {
+        w->requestStop ();
+        return pumpUntil ([&] { return br.finished; }, timeoutSec) && w->waitForFinished (2000);
+    };
+
+    // Bluetooth only: bridge -> BrainFlow session -> rings, at the firmware's rates.
+    {
+        br.resetFlags ();
+        linkedName.clear ();
+        br.startedAt = SteadyClock::now ();
+        const bool started = w->start (bluetoothTestConfig (EmotiBitLink::Bluetooth, mute.port (), 5.0));
+        const bool con = pumpUntil ([&] { return br.resolved (); }, 20.0) && br.connected;
+        check (started && con && w->viaBluetooth () && linkedName == QLatin1String ("EmotiBit: SYNTHETIC-BLE") &&
+                w->bluetoothStage () == DeviceWorker::BtLinked,
+            fmt ("Bluetooth: BrainFlow's EmotiBit driver opened the bridge on 127.0.0.1 (HELLO, control TCP, data "
+                 "UDP) in %.1f s",
+                br.connectSec));
+        if (con)
+        {
+            pumpFor (1.0); // past the first packets
+            beginMeasure (br);
+            const auto t0 = SteadyClock::now ();
+            while (since (t0) < seconds && !g_interruptRequested)
+            {
+                pumpFor (0.25);
+                sampleMeters (br);
+            }
+            const double measured = since (t0);
+            std::printf ("\n");
+            for (const SignalReport &rep : report (br, measured, true))
+            {
+                if (rep.nominal <= 0.0)
+                    continue; // derived (heart rate)
+                const bool rateOk = std::fabs (rep.rate2s - rep.nominal) / rep.nominal < 0.15 &&
+                    std::fabs (rep.rateAvg - rep.nominal) / rep.nominal < 0.15;
+                char line[256];
+                std::snprintf (line, sizeof (line), " over Bluetooth: %llu samples, %.1f Hz (2 s) / %.1f Hz (avg), "
+                                                    "nominal %.0f Hz%s",
+                    static_cast<unsigned long long> (rep.samples), rep.rate2s, rep.rateAvg, rep.nominal,
+                    rep.finite ? "" : ", NON-FINITE values");
+                check (rep.samples > 0 && rateOk && rep.finite, rep.key + line);
+            }
+        }
+        const auto tStop = SteadyClock::now ();
+        const bool fin = finish (15.0);
+        const double ms = since (tStop) * 1000.0;
+        check (fin && !br.failed && ms < w->worstCaseStopSeconds () * 1000.0,
+            fmt ("Bluetooth: stop_stream + release_session, then the bridge stops, in %.0f ms", ms));
+    }
+
+    // Auto: the Bluetooth route wins while the Wi-Fi search (30 s) is still
+    // running; the direct connection stops the worker before prepare_session.
+    {
+        const auto conn = QObject::connect (
+            w, &DeviceWorker::bluetoothLinked, w, [w] (const QString &) { w->requestStop (); }, Qt::DirectConnection);
+        br.resetFlags ();
+        linkedSec = -1.0;
+        br.startedAt = SteadyClock::now ();
+        const bool started = w->start (bluetoothTestConfig (EmotiBitLink::Auto, mute.port (), 30.0));
+        const bool fin = pumpUntil ([&] { return br.finished; }, 10.0) && w->waitForFinished (5000);
+        QObject::disconnect (conn);
+        check (started && fin && linkedSec >= 0.0 && linkedSec < 2.0 && !br.connected &&
+                !br.failed,
+            fmt ("Bluetooth: auto link runs the Wi-Fi search and the Bluetooth scan at once; Bluetooth won after "
+                 "%.2f s (Wi-Fi timeout 30 s)",
+                linkedSec));
+    }
+
+    // Auto while the permission prompt is open: the Wi-Fi search runs out,
+    // then the worker waits for the answer; granted, the bridge starts.
+    {
+        const auto conn = QObject::connect (
+            w, &DeviceWorker::bluetoothLinked, w, [w] (const QString &) { w->requestStop (); }, Qt::DirectConnection);
+        DeviceConfig cfg = bluetoothTestConfig (EmotiBitLink::Auto, mute.port (), 0.5);
+        cfg.bluetoothAllowed = false;
+        cfg.bluetoothPending = true;
+        br.resetFlags ();
+        progressTexts.clear ();
+        linkedSec = -1.0;
+        br.startedAt = SteadyClock::now ();
+        const bool started = w->start (cfg);
+        pumpFor (1.2);
+        const bool waiting = w->state () == DeviceWorker::Connecting && w->phase () == DeviceWorker::PhaseBluetooth &&
+            w->bluetoothStage () == DeviceWorker::BtPermission &&
+            !progressTexts.filter (QStringLiteral ("waiting for Bluetooth permission")).isEmpty ();
+        w->setBluetoothPermission (true, QString ());
+        const bool fin = pumpUntil ([&] { return br.finished; }, 10.0) && w->waitForFinished (5000);
+        QObject::disconnect (conn);
+        check (started && waiting && fin && linkedSec > 1.2 && !br.failed,
+            fmt ("Bluetooth: pending permission holds the Bluetooth route after Wi-Fi gave up; granted at 1.2 s, "
+                 "linked at %.2f s",
+                linkedSec));
+    }
+    {
+        DeviceConfig cfg = bluetoothTestConfig (EmotiBitLink::Auto, mute.port (), 0.5);
+        cfg.bluetoothAllowed = false;
+        cfg.bluetoothPending = true;
+        br.resetFlags ();
+        br.startedAt = SteadyClock::now ();
+        const bool started = w->start (cfg);
+        pumpFor (0.8);
+        w->setBluetoothPermission (false, QStringLiteral ("refused by the selftest"));
+        const bool fin = pumpUntil ([&] { return br.finished; }, 10.0) && w->waitForFinished (5000);
+        check (started && fin && br.failed && br.error.contains (QStringLiteral ("no EmotiBit answered at 127.0.0.1")) &&
+                br.error.contains (QStringLiteral ("Bluetooth: refused by the selftest")) &&
+                w->failureKind () == DeviceWorker::FailNotFound,
+            "Bluetooth: permission refused -> the Wi-Fi failure plus the Bluetooth reason, reported as not found");
+    }
+}
+
 } // namespace
 
 // =============================================================================
@@ -1530,6 +1709,10 @@ int runSelftest (double seconds)
         em.worker->waitForFinished (2000);
     }
 
+    // ---------------------------------------------------------- Bluetooth
+    std::printf ("\n[8] EmotiBit over Bluetooth (synthetic bridge -> BrainFlow's EmotiBit driver on 127.0.0.1)\n");
+    bluetoothChecks (check, std::min (seconds, 3.0));
+
     std::printf ("\nRESULT: %s (%d/%d checks passed)\n", check.failures ? "FAIL" : "PASS",
         check.total - check.failures, check.total);
     std::fflush (stdout);
@@ -1551,11 +1734,14 @@ int runProbe (const ProbeOptions &options)
     const QString emDesc = o.emotibitIp.trimmed ().isEmpty ()
         ? QStringLiteral ("broadcast discovery")
         : o.emotibitIp.trimmed ();
-    std::printf ("bioacq probe -- real devices (Cyton: %s, EmotiBit: %s%s, timeout %d s), "
+    const char *linkDesc = o.emotibitLink == EmotiBitLink::Bluetooth ? "Bluetooth only"
+        : o.emotibitLink == EmotiBitLink::WiFi                        ? "Wi-Fi only"
+                                                                      : "Bluetooth scan + Wi-Fi";
+    std::printf ("bioacq probe -- real devices (Cyton: %s, EmotiBit: %s%s, %s, timeout %d s), "
                  "measuring %.1f s\n",
         o.skipCyton ? "skipped" : qPrintable (cytonDesc),
         o.skipEmotibit ? "skipped" : qPrintable (emDesc),
-        (!o.skipEmotibit && o.bfDiscovery) ? " via BrainFlow's discovery" : "",
+        (!o.skipEmotibit && o.bfDiscovery) ? " via BrainFlow's discovery" : "", linkDesc,
         o.emotibitTimeoutSec, o.seconds);
     std::printf ("BrainFlow %s\n\n", BoardShim::get_version ().c_str ());
     std::fflush (stdout);

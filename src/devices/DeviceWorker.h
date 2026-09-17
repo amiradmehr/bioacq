@@ -1,5 +1,6 @@
 #pragma once
 
+#include "EmotiBitBleBridge.h"
 #include "EmotiBitDiscovery.h"
 #include "Retimer.h"
 #include "RingBuffer.h"
@@ -54,6 +55,16 @@ struct DeviceConfig
     // again by broadcast on every interface (same subnet): the EmotiBit may
     // have joined another network, e.g. a hotspot, and got a new address.
     bool broadcastFallback = false;
+    // How the EmotiBit is reached. Auto scans Bluetooth (the bioacq BLE
+    // firmware, through EmotiBitBleBridge) while the Wi-Fi discovery above
+    // runs, and the first to find the EmotiBit wins. Bluetooth is used only if
+    // bluetoothAllowed, or once setBluetoothPermission (true) arrives while
+    // bluetoothPending (the macOS permission prompt is still open).
+    EmotiBitLink emotiLink = EmotiBitLink::WiFi;
+    bool bluetoothAllowed = false;
+    bool bluetoothPending = false;
+    QString bluetoothWhy;  // user-facing reason Bluetooth is not allowed (if it is not)
+    QString bluetoothName; // preferred advertised name ("EmotiBit: MD-V7-0001421"); "" = any EmotiBit
 
     // Count gaps in the board's package-number row (Cyton: 0..255 per
     // sample) as dropped packets; resolved by start().
@@ -78,6 +89,9 @@ struct DeviceConfig
     // Test hook (--test-ppg-bpm): replace the PPG display values (and so the
     // heart-rate input) with HeartRate::syntheticPpg at this rate. 0 = off.
     double testPpgBpm = 0.0;
+    // Test only (--selftest): the Bluetooth route gets the bridge's synthetic
+    // packets instead of a radio (EmotiBitBleBridge::Source::Synthetic).
+    bool testSyntheticBluetooth = false;
 };
 
 // One plotted signal: its resolved spec and the ring buffer the worker fills.
@@ -113,6 +127,10 @@ struct SignalChannel
 // first (EmotiBitDiscovery, cancellable, lock-free) and only then calls
 // prepare_session with the found IP, which keeps the lock held ~1-7 s.
 //
+// EmotiBit over Bluetooth: EmotiBitBleBridge relays the BLE packets to
+// BrainFlow's unchanged Wi-Fi driver on 127.0.0.1; the bridge is started before
+// and stopped after the BrainFlow session, on the worker thread.
+//
 // Recording: BrainFlow's file streamers can be added to and removed from a
 // RUNNING session (Board::add_streamer / delete_streamer take the board's
 // spinlock that push_package holds while streaming; deleting a FileStreamer
@@ -139,7 +157,20 @@ public:
         PhaseDiscovering = 1, // EmotiBit: our UDP discovery (lock-free, cancellable)
         PhaseOpening = 2,     // inside BrainFlow's prepare_session
         PhaseStreaming = 3,
-        PhaseStopping = 4
+        PhaseStopping = 4,
+        PhaseBluetooth = 5 // EmotiBit: waiting for the Bluetooth link (Wi-Fi discovery done or not used)
+    };
+
+    // The EmotiBit's Bluetooth route in the current / last session.
+    enum BluetoothStage
+    {
+        BtOff = 0,        // not used (not allowed, Wi-Fi only, or Wi-Fi found the EmotiBit first)
+        BtPermission = 1, // waiting for the user to answer the Bluetooth permission prompt
+        BtScanning = 2,
+        BtConnecting = 3,
+        BtLinked = 4, // notifications on: packets flow
+        BtLost = 5,   // the link dropped; the bridge reconnects on its own
+        BtFailed = 6
     };
 
     enum FailureKind
@@ -193,6 +224,18 @@ public:
     {
         return static_cast<FailureKind> (failKind_.load ());
     }
+    BluetoothStage bluetoothStage () const
+    {
+        return static_cast<BluetoothStage> (btStage_.load ());
+    }
+    // The session streams over Bluetooth (set before prepare_session).
+    bool viaBluetooth () const
+    {
+        return viaBluetooth_.load ();
+    }
+    // The answer to the Bluetooth permission prompt for a session started with
+    // DeviceConfig::bluetoothPending; why: the reason if not granted.
+    void setBluetoothPermission (bool granted, const QString &why);
     // Packets missing from the package-number sequence since start()
     // (valid only if countsDrops()).
     std::uint64_t droppedPackets () const
@@ -256,6 +299,7 @@ signals:
     void stateChanged (int state);
     void progress (const QString &text); // connecting-phase status for the device panel
     void discovered (const QString &ip, const QString &serial); // EmotiBit answered
+    void bluetoothLinked (const QString &deviceName);           // EmotiBit found over Bluetooth
     void connected (const QString &info);
     void failed (const QString &error);
     void disconnected (const QString &info);
@@ -267,9 +311,16 @@ signals:
 
 private:
     void run (DeviceConfig cfg, std::vector<SignalChannel> chans);
-    // Our own EmotiBit discovery. Returns false if cancelled, throws if no
-    // EmotiBit answered; on success cfg.params.ip_address is the device.
-    bool discoverEmotibit (DeviceConfig &cfg);
+    // Our own EmotiBit discovery, over Wi-Fi and (ble != nullptr) Bluetooth.
+    // Returns false if cancelled, throws if no EmotiBit was found; on success
+    // cfg.params.ip_address is the device (127.0.0.1: the Bluetooth bridge).
+    bool discoverEmotibit (DeviceConfig &cfg, EmotiBitBleBridge *ble);
+    // Starts the bridge once Bluetooth is allowed and publishes its stage.
+    BluetoothStage pollBluetooth (EmotiBitBleBridge &ble, const DeviceConfig &cfg);
+    // Waits until the bridge streams. False if cancelled; throws if it failed.
+    bool waitForBluetooth (EmotiBitBleBridge &ble, const DeviceConfig &cfg);
+    void useBluetooth (DeviceConfig &cfg, EmotiBitBleBridge &ble);
+    QString bluetoothWhy () const;
     void pollLoop (BoardShim &board, const DeviceConfig &cfg, std::vector<SignalChannel> &chans);
     void startRecording (BoardShim &board, const DeviceConfig &cfg, const std::string &dir, const std::string &stamp);
     void stopRecording (BoardShim &board);
@@ -286,6 +337,13 @@ private:
     std::atomic<double> phaseSince_ {0.0};
     std::atomic<int> probes_ {0};
     std::atomic<int> failKind_ {FailNone};
+    std::atomic<int> btPermission_ {0}; // 0 pending, 1 granted, 2 refused
+    std::atomic<int> btStage_ {BtOff};
+    std::atomic<bool> viaBluetooth_ {false};
+    mutable std::mutex btMutex_;
+    QString btWhy_;                    // guarded by btMutex_
+    double bleStartedAt_ = 0.0;        // worker thread only; 0 = bridge not started
+    EmotiBitBleBridge *ble_ = nullptr; // worker thread only: the session's bridge (poll loop)
     double discTimeout_ = 0.0; // GUI thread only (set in start())
     std::atomic<std::uint64_t> dropped_ {0};
     std::atomic<bool> countDrops_ {false};
