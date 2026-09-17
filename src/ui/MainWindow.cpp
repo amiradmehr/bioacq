@@ -45,6 +45,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 
 namespace
 {
@@ -190,6 +191,126 @@ protected:
         p.fillRect (QRectF (5.4, 4.0, 1.2, 3.4), Theme::fault);
         p.fillRect (QRectF (5.4, 8.2, 1.2, 1.2), Theme::fault);
     }
+};
+
+// The idle call to action over the hero recess: rows stacked in the middle,
+// with the design's gaps between them. Where the recess is short, every gap
+// shrinks by the same factor, down to half its size; below that, optional rows
+// are hidden (setDroppable; at 1280 x 800 the paragraph) instead of crowding or
+// being squeezed by the layout, since a squeezed label still draws all its
+// lines, over the Connect button below it.
+class IdleOverlay : public QWidget
+{
+public:
+    IdleOverlay ()
+    {
+        lay_ = new QVBoxLayout (this);
+        lay_->setContentsMargins (16, 8, 16, 8);
+        lay_->setSpacing (0);
+        lay_->addStretch (1);
+        lay_->addStretch (1);
+    }
+
+    // Appends a row; gapAbove (px) separates it from the shown row above.
+    void addRow (QWidget *w, int gapAbove, Qt::Alignment align = Qt::Alignment ())
+    {
+        lay_->insertWidget (insertGap (gapAbove), w, 0, align);
+        rows_.back ().widget = w;
+    }
+    void addRow (QLayout *row, int gapAbove)
+    {
+        lay_->insertLayout (insertGap (gapAbove), row);
+        rows_.back ().layout = row;
+    }
+    // Rows hidden first to last while the stack does not fit with its gaps at half size.
+    void setDroppable (const QList<QWidget *> &rows)
+    {
+        droppable_ = rows;
+        fit ();
+    }
+
+protected:
+    void resizeEvent (QResizeEvent *event) override
+    {
+        QWidget::resizeEvent (event);
+        fit ();
+    }
+
+private:
+    // A row is a widget (droppable) or a layout (always shown), with the gap above it.
+    struct Row
+    {
+        QSpacerItem *gap = nullptr;
+        int gapPx = 0; // design size
+        QWidget *widget = nullptr;
+        QLayout *layout = nullptr;
+    };
+
+    static constexpr double kMinGapScale = 0.5;
+
+    // An explicit minimum (the paragraph's fixed height) wins over the hint.
+    static int minHeight (const QWidget *w)
+    {
+        return w->minimumHeight () > 0 ? w->minimumHeight () : w->minimumSizeHint ().height ();
+    }
+
+    // Returns the layout index for the row's item (after its gap, before the bottom stretch).
+    int insertGap (int px)
+    {
+        auto *gap = new QSpacerItem (0, px, QSizePolicy::Minimum, QSizePolicy::Fixed);
+        const int at = lay_->count () - 1;
+        lay_->insertSpacerItem (at, gap);
+        rows_.push_back ({gap, px, nullptr, nullptr});
+        return at + 1;
+    }
+
+    void fit ()
+    {
+        std::vector<bool> hide (rows_.size (), false);
+        const QMargins m = lay_->contentsMargins ();
+        // the shown rows at their minimum height (plus margins), and the gaps between them at design size
+        int rowsPx = 0, gapsPx = 0;
+        auto measure = [&] {
+            rowsPx = m.top () + m.bottom ();
+            gapsPx = 0;
+            bool first = true;
+            for (std::size_t i = 0; i < rows_.size (); ++i)
+            {
+                if (hide[i])
+                    continue;
+                rowsPx += rows_[i].widget ? minHeight (rows_[i].widget) : rows_[i].layout->minimumSize ().height ();
+                gapsPx += first ? 0 : rows_[i].gapPx;
+                first = false;
+            }
+        };
+        measure ();
+        for (QWidget *w : std::as_const (droppable_))
+        {
+            if (rowsPx + kMinGapScale * gapsPx <= height ())
+                break;
+            for (std::size_t i = 0; i < rows_.size (); ++i)
+                if (rows_[i].widget == w)
+                    hide[i] = true;
+            measure ();
+        }
+        const double scale = gapsPx > 0 ? std::clamp (static_cast<double> (height () - rowsPx) / gapsPx, 0.0, 1.0) : 0.0;
+        bool first = true;
+        for (std::size_t i = 0; i < rows_.size (); ++i)
+        {
+            const Row &r = rows_[i];
+            if (r.widget && r.widget->isHidden () != hide[i])
+                r.widget->setHidden (hide[i]);
+            const int px = hide[i] || first ? 0 : static_cast<int> (r.gapPx * scale);
+            first = first && hide[i];
+            r.gap->changeSize (0, px, QSizePolicy::Minimum, QSizePolicy::Fixed);
+        }
+        lay_->invalidate ();
+        lay_->activate ();
+    }
+
+    QVBoxLayout *lay_ = nullptr;
+    std::vector<Row> rows_;
+    QList<QWidget *> droppable_;
 };
 
 QString homeAbbrev (const QString &path)
@@ -884,26 +1005,19 @@ QWidget *MainWindow::buildMain ()
 
 QWidget *MainWindow::buildIdleOverlay ()
 {
-    auto *ov = new QWidget;
+    auto *ov = new IdleOverlay;
     ov->setAutoFillBackground (true);
     QPalette pal = ov->palette ();
     pal.setColor (QPalette::Window, Theme::recess);
     ov->setPalette (pal);
-    auto *v = new QVBoxLayout (ov);
-    v->setContentsMargins (16, 8, 16, 8);
-    v->setSpacing (0);
-    // The design's gaps; they shrink (down to 0) before anything is clipped
-    // when the hero recess is short (1280 x 800), and never grow.
-    auto gap = [v] (int px) { v->addItem (new QSpacerItem (0, px, QSizePolicy::Minimum, QSizePolicy::Maximum)); };
-    v->addStretch (1);
+    // Rows with the design's gaps: flex gap 14 px, the buttons 2 px and the
+    // hints 4 px further down.
     auto *k = makeLabel (QStringLiteral ("NO DEVICES CONNECTED"), Theme::mono (10, 400, 0.2), Theme::textDim);
     k->setAlignment (Qt::AlignCenter);
-    v->addWidget (k);
-    gap (14);
+    ov->addRow (k, 0);
     auto *t = makeLabel (QStringLiteral ("Connect to start streaming"), Theme::mono (19, 400, -0.01), Theme::textStrong);
     t->setAlignment (Qt::AlignCenter);
-    v->addWidget (t);
-    gap (14);
+    ov->addRow (t, 14);
     auto *para = makeLabel (richPara (QStringLiteral (
                                           "One button opens every available device at once: the Cyton on its USB "
                                           "dongle and the EmotiBit over Bluetooth or Wi-Fi (the address in the left "
@@ -915,8 +1029,7 @@ QWidget *MainWindow::buildIdleOverlay ()
     para->setAlignment (Qt::AlignCenter);
     para->setFixedWidth (520);
     para->setFixedHeight (para->heightForWidth (520));
-    v->addWidget (para, 0, Qt::AlignHCenter);
-    gap (16);
+    ov->addRow (para, 14, Qt::AlignHCenter);
     auto *btns = new QHBoxLayout;
     btns->setSpacing (10);
     btns->addStretch (1);
@@ -925,8 +1038,7 @@ QWidget *MainWindow::buildIdleOverlay ()
     bc->setToolTip (QStringLiteral ("Connect every available device at once (%1).").arg (keyText (kConnectKey)));
     btns->addWidget (bc);
     btns->addStretch (1);
-    v->addLayout (btns);
-    gap (18);
+    ov->addRow (btns, 16);
     auto *hints = new QHBoxLayout;
     hints->setSpacing (8);
     hints->addStretch (1);
@@ -959,8 +1071,10 @@ QWidget *MainWindow::buildIdleOverlay ()
                                               "tests the whole pipeline. Locked while a device is connected."));
     hints->addWidget (synthToggle_);
     hints->addStretch (1);
-    v->addLayout (hints);
-    v->addStretch (1);
+    ov->addRow (hints, 18);
+    // a short recess loses the explanation first, the title last; the Connect
+    // button and the hints (the only "simulate devices" switch) always stay
+    ov->setDroppable ({para, k, t});
     connect (bc, &QPushButton::clicked, this, &MainWindow::connectAll);
     connect (synthToggle_, &QAbstractButton::toggled, this, [this] (bool) {
         updateWindowTitle ();
