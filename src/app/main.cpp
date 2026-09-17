@@ -57,6 +57,8 @@ struct Args
     QString port; // empty = auto-detect the OpenBCI dongle (findCytonDongle)
     QString ip = QStringLiteral ("192.168.1.12");
     int timeout = 5;
+    EmotiBitLink link = EmotiBitLink::Auto;
+    bool linkSet = false;
     QString recordDir = defaultRecordDir ();
     bool recordDirSet = false;
     bool record = false;
@@ -156,6 +158,19 @@ Args parseArgs (int argc, char **argv)
         }
         else if (s == "--bf-discovery")
             a.bfDiscovery = true;
+        else if (s == "--emotibit-link")
+        {
+            const QString v = value ("--emotibit-link").toLower ();
+            a.linkSet = true;
+            if (v == QLatin1String ("auto"))
+                a.link = EmotiBitLink::Auto;
+            else if (v == QLatin1String ("wifi") || v == QLatin1String ("wi-fi"))
+                a.link = EmotiBitLink::WiFi;
+            else if (v == QLatin1String ("bluetooth") || v == QLatin1String ("ble"))
+                a.link = EmotiBitLink::Bluetooth;
+            else
+                a.error = QStringLiteral ("unknown --emotibit-link '%1' (auto|wifi|bluetooth)").arg (v);
+        }
         else if (s == "--timeout")
         {
             a.timeout = value ("--timeout").toInt ();
@@ -235,6 +250,10 @@ void usage ()
         "  --timeout <s>             EmotiBit discovery timeout, 2-%d (default 5)\n"
         "  --bf-discovery            let BrainFlow do the EmotiBit discovery (old behaviour; holds\n"
         "                            BrainFlow's global lock, pausing the Cyton meanwhile)\n"
+        "  --emotibit-link <l>       auto (default): scan Bluetooth (bioacq BLE firmware) while the Wi-Fi\n"
+        "                            discovery runs, the first to find the EmotiBit wins; wifi; bluetooth.\n"
+        "                            macOS: Bluetooth only when started as BioAcq.app (Finder, open);\n"
+        "                            --screenshot defaults to wifi\n"
         "  --record                  arm recording: each device records from its first sample\n"
         "  --record-dir <dir>        recording folder (default %s)\n"
         "  --window <s>              plot window length, 1-60 (default 10)\n"
@@ -319,6 +338,7 @@ int main (int argc, char **argv)
         o.emotibitIp = a.ip;
         o.emotibitTimeoutSec = a.timeout;
         o.bfDiscovery = a.bfDiscovery;
+        o.emotibitLink = a.link;
         o.seconds = a.seconds > 0.0 ? a.seconds : 8.0;
         o.record = a.record;
         o.recordDir = a.recordDir;
@@ -342,6 +362,8 @@ int main (int argc, char **argv)
     lo.record = a.record;
     lo.windowSec = a.window > 0 ? a.window : (shot ? 8 : 10);
     lo.brainflowDiscovery = a.bfDiscovery;
+    // --screenshot stays reproducible: no radio scan unless asked for
+    lo.emotibitLink = shot && !a.linkSet ? EmotiBitLink::WiFi : a.link;
     // Saved settings only for the interactive GUI: --screenshot stays
     // reproducible and never overwrites what the user last used.
     lo.useSettings = a.mode == Args::Gui;

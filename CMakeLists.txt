@@ -58,7 +58,7 @@ if(QT_PREFIX)
     list(APPEND CMAKE_PREFIX_PATH "${QT_PREFIX}")
 endif()
 
-find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Widgets Network SerialPort)
+find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Widgets Network SerialPort Bluetooth)
 
 set(brainflow_INCLUDE_DIRS "${BRAINFLOW_ROOT}/inc")
 set(brainflow_LIBRARY_DIRS "${BRAINFLOW_ROOT}/lib")
@@ -97,6 +97,8 @@ add_executable(bioacq
     src/devices/DeviceWorker.cpp
     src/devices/DeviceWorker.h
     src/devices/EmotiBitDiscovery.cpp
+    src/devices/EmotiBitBleBridge.cpp
+    src/devices/EmotiBitBleBridge.h
     src/devices/EmotiBitDiscovery.h
     src/devices/EmotiBitWifiSetup.cpp
     src/devices/EmotiBitWifiSetup.h
@@ -104,6 +106,8 @@ add_executable(bioacq
     src/devices/SignalSpec.cpp
     src/devices/SignalSpec.h
     src/platform/AppPaths.cpp
+    src/platform/BluetoothAccess.cpp
+    src/platform/BluetoothAccess.h
     src/platform/AppPaths.h
     src/platform/ProcessSetup.cpp
     src/platform/ProcessSetup.h
@@ -153,11 +157,19 @@ target_include_directories(bioacq PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tools"
     "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
+if(APPLE)
+    # Qt checks the Bluetooth permission (QBluetoothPermission) through a static
+    # plugin; without it, device discovery fails with MissingPermissionsError.
+    qt_import_plugins(bioacq INCLUDE Qt6::QDarwinBluetoothPermissionPlugin)
+    # BluetoothAccess.cpp runs the CoreFoundation run loop (headless permission request)
+    target_link_libraries(bioacq PRIVATE "-framework CoreFoundation")
+endif()
+
 # BrainFlow headers are third-party: mark as system to silence their warnings.
 target_include_directories(bioacq SYSTEM PRIVATE ${brainflow_INCLUDE_DIRS})
 
 target_link_libraries(bioacq PRIVATE
-    Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::SerialPort
+    Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::SerialPort Qt6::Bluetooth
     # order matters on some platforms (mirrors BrainFlow's own examples)
     ${BrainflowPath}
     ${MLModulePath}
