@@ -53,7 +53,7 @@ The EmotiBit's device ID lives on the FeatherWing's EEPROM and its Wi-Fi network
 
 ## With BioAcq
 
-BioAcq connects to this firmware over Bluetooth: press Connect with the default `auto` link (see *EmotiBit over Bluetooth* in the main README). On macOS only `BioAcq.app` may use Bluetooth, and it asks for access on the first Connect.
+BioAcq connects to this firmware over Bluetooth: press Connect with the default `auto` link (see *EmotiBit over Bluetooth* in the main README). On macOS only `BioAcq.app` may use Bluetooth, and it asks for access on the first Connect. Verified on MD-V7-0001421 with the packaged app (`--probe 20 --emotibit-link bluetooth`): session ready 3 s after the scan started; 25.2 Hz PPG, 25.3 Hz IMU and 15.1 Hz temperature on average over 20 s; clean release in 0.9 s.
 
 ## Test tool
 
