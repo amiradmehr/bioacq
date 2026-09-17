@@ -51,6 +51,10 @@ python3 -m platformio run -e bioacq_ble_feather_esp32 -t upload --upload-port /d
 
 The EmotiBit's device ID lives on the FeatherWing's EEPROM and its Wi-Fi networks on the SD card. Flashing touches neither, and BioAcq's *wi-fi setup* dialog keeps working, because the config edit mode is unchanged.
 
+## With BioAcq
+
+BioAcq connects to this firmware over Bluetooth: press Connect with the default `auto` link (see *EmotiBit over Bluetooth* in the main README). On macOS only `BioAcq.app` may use Bluetooth, and it asks for access on the first Connect.
+
 ## Test tool
 
 `tools/ble_stream_test.py [seconds]` (Python, `pip install bleak`) scans for `EmotiBit: <id>`, subscribes to the TX characteristic, and prints throughput, per-type sample rates and packet-counter gaps.
@@ -60,7 +64,6 @@ On macOS a process may use Bluetooth only if the app responsible for it declares
 ## Limitations
 
 * **No pairing or encryption yet:** anyone in range can connect and read the data. Add LE Secure Connections bonding before using it with participants.
-* **BioAcq can't read the Bluetooth stream yet.** Until it can, boot the EmotiBit in Wi-Fi mode (hold the button during the boot prompt) or restore the stock firmware.
 * **No time sync with the computer** (the Wi-Fi mode's `TL` / `TU` packets): timestamps are the EmotiBit's own milliseconds.
 * **Range:** Bluetooth reaches about 10 m, and the body can block it when the EmotiBit is worn. Data sent while the link is down is lost; the SD card recording is unaffected.
 * **Cosmetic:** `firmware_variant` shows the build path, because the `.ino` splits `__FILE__` on backslashes only.

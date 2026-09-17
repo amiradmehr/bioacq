@@ -161,6 +161,8 @@ if(APPLE)
     # Qt checks the Bluetooth permission (QBluetoothPermission) through a static
     # plugin; without it, device discovery fails with MissingPermissionsError.
     qt_import_plugins(bioacq INCLUDE Qt6::QDarwinBluetoothPermissionPlugin)
+    # BluetoothAccess.cpp runs the CoreFoundation run loop (headless permission request)
+    target_link_libraries(bioacq PRIVATE "-framework CoreFoundation")
 endif()
 
 # BrainFlow headers are third-party: mark as system to silence their warnings.

@@ -31,10 +31,14 @@ enum class Status
 Status check (QString *why = nullptr);
 
 // Shows the system prompt if Undetermined and calls done on context's thread
-// with the resulting status (at once, if already decided).
+// with the resulting status (at once, if already decided; never if context is
+// destroyed first). GUI thread of a QApplication: its event loop delivers it.
 void request (QObject *context, const std::function<void (Status)> &done);
 
-// request () for the headless modes: runs a local event loop until answered.
-Status requestBlocking ();
+// request () for the headless modes, on the main thread: waits until the prompt
+// is answered or stop () returns true, and returns the status then. On macOS
+// the answer arrives on the main dispatch queue, which a QCoreApplication's
+// event loop never drains, so this also runs the CoreFoundation run loop.
+Status requestAndWait (const std::function<bool ()> &stop);
 
 } // namespace bluetooth_access

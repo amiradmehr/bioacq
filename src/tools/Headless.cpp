@@ -194,7 +194,7 @@ DeviceConfig makeConfig (DeviceKind kind, bool synthetic, const ProbeOptions *po
             {
                 std::printf ("  [emotibit] asking for Bluetooth permission (answer the system prompt)...\n");
                 std::fflush (stdout);
-                bt = bluetooth_access::requestBlocking ();
+                bt = bluetooth_access::requestAndWait ([] { return g_interruptRequested != 0; });
                 why.clear ();
                 bluetooth_access::check (&why);
             }

@@ -6,6 +6,8 @@
 #include <QPermissions>
 
 #ifdef Q_OS_MACOS
+#include <CoreFoundation/CoreFoundation.h>
+
 #include <unistd.h>
 #endif
 
@@ -98,19 +100,24 @@ void request (QObject *context, const std::function<void (Status)> &done)
 #endif
 }
 
-Status requestBlocking ()
+Status requestAndWait (const std::function<bool ()> &stop)
 {
-    if (check () != Status::Undetermined)
-        return check ();
-    QEventLoop loop;
-    QObject ctx;
-    Status out = Status::Undetermined;
-    request (&ctx, [&] (Status s) {
+    Status out = check ();
+    if (out != Status::Undetermined)
+        return out;
+    bool answered = false;
+    QObject context; // no callback once it is gone
+    request (&context, [&out, &answered] (Status s) {
         out = s;
-        loop.quit ();
+        answered = true;
     });
-    if (out == Status::Undetermined)
-        loop.exec ();
+    while (!answered && !(stop && stop ()))
+    {
+        QCoreApplication::processEvents (QEventLoop::AllEvents, 20);
+#ifdef Q_OS_MACOS
+        CFRunLoopRunInMode (kCFRunLoopDefaultMode, 0.02, true);
+#endif
+    }
     return out;
 }
 
