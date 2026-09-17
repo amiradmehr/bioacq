@@ -19,7 +19,6 @@
 class QCloseEvent;
 class QFrame;
 class QLabel;
-class QLineEdit;
 class QMessageBox;
 class QPushButton;
 class QSpinBox;
@@ -48,7 +47,9 @@ struct LaunchOptions
     // detected OpenBCI dongle, else the first dongle found (SerialPorts).
     // An explicit --port (portSet) becomes the rail's port override instead.
     QString cytonPort;
-    QString emotibitIp = QStringLiteral ("192.168.1.12"); // blank = last IP that answered, then broadcast
+    // --ip (used only if ipSet: the GUI has no IP field; without it, the last
+    // EmotiBit that answered, then broadcast)
+    QString emotibitIp = QStringLiteral ("192.168.1.12");
     int emotibitTimeoutSec = 5;
     QString recordDir;
     bool record = false; // arm recording: every device records from its first sample
@@ -129,7 +130,7 @@ private:
         std::vector<int> lanes;          // the plot lane of each channel
         bool stopRequested = false;
         bool synthetic = false;      // current/last session runs on the synthetic board
-        bool fieldBlank = false;     // EmotiBit: the IP field was blank at connect
+        bool autoAddress = false;    // EmotiBit: no --ip; Wi-Fi tries the last EmotiBit that answered
         QString address;             // serial port / EmotiBit IP of the session
         QString typedIp;             // EmotiBit: unicast target at connect ("" = broadcast)
         QString serial;              // EmotiBit serial from discovery
@@ -241,7 +242,6 @@ private:
     MeterBar *railBar_ = nullptr;
     QLabel *railNote_ = nullptr;
     // rail: EmotiBit
-    QLineEdit *ipEdit_ = nullptr;
     QPushButton *wifiBtn_ = nullptr; // "wi-fi setup" link
     QSpinBox *timeoutSpin_ = nullptr;
     QString lastEmotibitIp_; // the last EmotiBit that answered (blank field: tried first)

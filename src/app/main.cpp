@@ -244,9 +244,10 @@ void usage ()
         "options:\n"
         "  --port <dev>              Cyton serial port, e.g. COM3 or /dev/cu.usbserial-XXXXXXXX\n"
         "                            (default: auto-detect the OpenBCI dongle, FTDI 0403:6015, at connect)\n"
-        "  --ip <addr>               EmotiBit IP (default 192.168.1.12; works across subnets)\n"
-        "  --discover                blank EmotiBit IP: the GUI tries the last EmotiBit that answered,\n"
-        "                            then broadcast; --probe broadcasts (same subnet only)\n"
+        "  --ip <addr>               EmotiBit IP on Wi-Fi, reached by unicast across subnets (--probe default\n"
+        "                            192.168.1.12; the GUI has no IP field and otherwise tries the last\n"
+        "                            EmotiBit that answered), then broadcast discovery\n"
+        "  --discover                --probe: broadcast discovery only (same subnet), no IP\n"
         "  --timeout <s>             EmotiBit discovery timeout, 2-%d (default 5)\n"
         "  --bf-discovery            let BrainFlow do the EmotiBit discovery (old behaviour; holds\n"
         "                            BrainFlow's global lock, pausing the Cyton meanwhile)\n"
@@ -384,6 +385,7 @@ int main (int argc, char **argv)
         if (a.state == QLatin1String ("connecting") || a.state == QLatin1String ("error"))
         {
             lo.emotibitIp = QStringLiteral ("192.0.2.1"); // TEST-NET-1: never answers
+            lo.ipSet = true;
             lo.emotibitTimeoutSec = a.state == QLatin1String ("connecting") ? 20 : 2;
         }
         if (a.state == QLatin1String ("connecting"))
