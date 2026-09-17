@@ -1,69 +1,49 @@
-# EmotiBit firmware with Bluetooth (BLE) streaming
+# EmotiBit Bluetooth firmware
 
-The stock EmotiBit firmware (1.14) streams only over Wi-Fi. This folder holds a small patch that makes the EmotiBit stream over **Bluetooth Low Energy by default**. Sampling rates and data packets stay exactly as they are over Wi-Fi.
+`bioacq-ble.patch` makes the EmotiBit stream over Bluetooth Low Energy by default, at the same rates and in the same packet format as over Wi-Fi. BioAcq connects to it with **Connect**.
 
-* **Base:** [EmotiBit_FeatherWing](https://github.com/EmotiBit/EmotiBit_FeatherWing) branch `feat-blePrototype-Example` at commit `abdec15` (library version 1.14.4, firmware version string 1.14.3). This is EmotiBit's own, not yet released, Bluetooth prototype (MIT licence). It adds a BLE GATT server with a Nordic-UART-style service:
-  * `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`, the service;
-  * `…0003`, the TX characteristic: the EmotiBit's data packets as notifications;
-  * `…0002`, the RX characteristic: control packets written by the host.
-* **`bioacq-ble.patch`**: one commit on that base.
-  1. **Raises the BLE MTU to 517.** The prototype left it at the default of 23, so every notification carried 20 bytes and `BLECharacteristic::notify()` truncated each data chunk of up to 512 bytes, which lost most of the data.
-  2. **Sends in chunks that fit.** Each 100 ms batch goes out in chunks of at most (negotiated MTU − 3) bytes, cut after a packet delimiter, with a 2 ms pause between notifications.
-  3. **Bluetooth is the default mode.** A new PlatformIO environment, `bioacq_ble_feather_esp32`, defines `EMOTIBIT_BLUETOOTH_DEFAULT`. The prototype needed the button held at boot to get Bluetooth; now holding the button during the boot prompt selects **Wi-Fi** instead.
-  4. **Uploads at 115200 baud.** The Feather HUZZAH32's CP2104 USB-serial chip corrupted reads at 460800 and 921600 baud on this Mac.
+**Base:** [EmotiBit_FeatherWing](https://github.com/EmotiBit/EmotiBit_FeatherWing) branch `feat-blePrototype-Example` at `abdec15`, EmotiBit's unreleased Bluetooth prototype (MIT). Its service `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` sends the data packets as notifications on `…0003` and takes host writes on `…0002`.
+
+**What the patch changes:**
+* Raises the BLE MTU to 517; the prototype's default of 23 truncated the data.
+* Sends each 100 ms batch in chunks of (MTU − 3) bytes, split between packets, 2 ms apart.
+* Starts in Bluetooth mode (PlatformIO environment `bioacq_ble_feather_esp32`); holding the button during the boot prompt selects Wi-Fi.
+* Uploads at 115200 baud; the Feather's CP2104 corrupted faster transfers on this Mac.
 
 ## Verified
 
-On EmotiBit MD-V7-0001421 (HW V07a, Feather HUZZAH32, ESP32-D0WD-V3, 4 MB flash), with a Mac as the Bluetooth host (negotiated ATT MTU 515), over 60 s:
+On EmotiBit MD-V7-0001421 with a Mac, over 60 s: PPG 24.7 Hz, IMU 24.8 Hz, EDA 15.0 Hz, temperature 7.5 Hz (Wi-Fi: 25 / 25 / 15 / 7.5 Hz); 9,691 packets with none missing; 5.7 kB/s. Through BioAcq: connected in 3 s, then 25.2 Hz PPG, 25.3 Hz IMU and 15.1 Hz temperature over 20 s.
 
-| | Over Bluetooth | Stock over Wi-Fi |
-|---|---|---|
-| PPG IR / red / green | 24.72 Hz | 25 Hz |
-| Accelerometer / gyroscope / magnetometer | 24.84 Hz | 25 Hz |
-| EDA | 14.96 Hz | 15 Hz |
-| Temperature T1 / thermopile TH | 7.48 Hz | 7.5 Hz |
-| Packets | 9691, **0 missing** (continuous packet counter), 0 malformed | |
-| Throughput | 5.7 kB/s in 19 notifications/s of ~300 bytes | |
-
-The stream also carries the firmware's own derived values (`HR`, `BI`, `SF`, battery `BV` / `B%`).
-
-## Build, flash, restore
+## Build and flash
 
 ```bash
 git clone https://github.com/EmotiBit/EmotiBit_FeatherWing && cd EmotiBit_FeatherWing
 git checkout abdec15 && git am /path/to/bioacq/third_party/emotibit-firmware/bioacq-ble.patch
-./download_dependencies.sh            # clones the libraries next to EmotiBit_FeatherWing (needs jq)
+./download_dependencies.sh                 # clones the libraries next to it (needs jq)
 cd EmotiBit_stock_firmware
 python3 -m pip install platformio esptool
 python3 -m platformio run -e bioacq_ble_feather_esp32
 ```
 
-**Back up the EmotiBit's flash first**, so you can restore it exactly. The EmotiBit must be on USB, with EmotiBit Oscilloscope and any serial monitor closed.
+Back up the flash first (EmotiBit on USB, EmotiBit Oscilloscope and serial monitors closed), then flash:
 
 ```bash
-python3 -m esptool --port /dev/cu.usbserial-XXXX --baud 115200 read-flash 0 ALL emotibit-backup.bin   # ~7 min for 4 MB
+python3 -m esptool --port /dev/cu.usbserial-XXXX --baud 115200 read-flash 0 ALL emotibit-backup.bin   # ~7 min
 python3 -m platformio run -e bioacq_ble_feather_esp32 -t upload --upload-port /dev/cu.usbserial-XXXX  # ~2 min
 ```
 
-* **Restore:** `python3 -m esptool --port /dev/cu.usbserial-XXXX --baud 115200 write-flash 0 emotibit-backup.bin`, or install stock firmware with EmotiBit's Firmware Installer.
-* **Reading the backup twice** gives a few different bytes inside the NVS partition (0x9000–0xDFFF), because the ESP32 rewrites its Wi-Fi calibration data at boot. Differences anywhere else point to a bad read.
-* **The lab EmotiBit's backup:** its stock 1.14.0 image from 2026-09-16 is in `emotibit-firmware-backup/` in the project folder (gitignored) and in `~/.local/share/emotibit/backup/`, together with `RESTORE.txt` and a SHA-256.
-
-The EmotiBit's device ID lives on the FeatherWing's EEPROM and its Wi-Fi networks on the SD card. Flashing touches neither, and BioAcq's *wi-fi setup* dialog keeps working, because the config edit mode is unchanged.
-
-## With BioAcq
-
-BioAcq connects to this firmware over Bluetooth: press Connect with the default `auto` link (see *EmotiBit over Bluetooth* in the main README). On macOS only `BioAcq.app` may use Bluetooth, and it asks for access on the first Connect. Verified on MD-V7-0001421 with the packaged app (`--probe 20 --emotibit-link bluetooth`): session ready 3 s after the scan started; 25.2 Hz PPG, 25.3 Hz IMU and 15.1 Hz temperature on average over 20 s; clean release in 0.9 s.
+* **Restore:** `python3 -m esptool --port /dev/cu.usbserial-XXXX --baud 115200 write-flash 0 emotibit-backup.bin`, or EmotiBit's Firmware Installer.
+* Two reads of the same flash differ only in the NVS partition (0x9000–0xDFFF); a difference anywhere else means a bad read.
+* The lab EmotiBit's stock 1.14.0 backup is in `emotibit-firmware-backup/` (gitignored) and `~/.local/share/emotibit/backup/`, with `RESTORE.txt` and a SHA-256.
+* Flashing keeps the device ID (EEPROM) and the saved Wi-Fi networks (SD card).
 
 ## Test tool
 
-`tools/ble_stream_test.py [seconds]` (Python, `pip install bleak`) scans for `EmotiBit: <id>`, subscribes to the TX characteristic, and prints throughput, per-type sample rates and packet-counter gaps.
-
-On macOS a process may use Bluetooth only if the app responsible for it declares `NSBluetoothAlwaysUsageDescription`; otherwise macOS kills it (a TCC crash). Terminal.app and IDEs that don't declare it can't run the tool directly. Run it from a minimal `.app` bundle whose `Info.plist` has the key and whose executable starts the script, and allow Bluetooth when macOS asks.
+`tools/ble_stream_test.py [seconds]` (`pip install bleak`) prints throughput, per-type rates and packet gaps. macOS lets only an app that declares `NSBluetoothAlwaysUsageDescription` use Bluetooth, so run it from a small `.app` wrapper rather than from Terminal.
 
 ## Limitations
 
-* **No pairing or encryption yet:** anyone in range can connect and read the data. Add LE Secure Connections bonding before using it with participants.
-* **No time sync with the computer** (the Wi-Fi mode's `TL` / `TU` packets): timestamps are the EmotiBit's own milliseconds.
-* **Range:** Bluetooth reaches about 10 m, and the body can block it when the EmotiBit is worn. Data sent while the link is down is lost; the SD card recording is unaffected.
-* **Cosmetic:** `firmware_variant` shows the build path, because the `.ino` splits `__FILE__` on backslashes only.
+* No pairing or encryption: add LE Secure Connections bonding before using it with participants.
+* No time sync with the computer; timestamps are the EmotiBit's own.
+* Range is about 10 m. Data sent while the link is down is lost; the SD card recording is not affected.
+* `firmware_variant` shows the build path (cosmetic).
