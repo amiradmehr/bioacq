@@ -434,9 +434,10 @@ QString DeviceWorker::emotibitSubnetHint ()
     return QStringLiteral (
         "Broadcast discovery only works when this computer and the EmotiBit are on the same subnet. "
         "Being on the same WiFi network (SSID) is not enough: the computer can end up on e.g. "
-        "172.31.x.x while the EmotiBit is on 192.168.1.x. Enter the EmotiBit's IP address "
-        "(printed in its serial boot log, or shown in EmotiBit Oscilloscope) and connect again; "
-        "a typed IP is reached by unicast across subnets.");
+        "172.31.x.x while the EmotiBit is on 192.168.1.x. A known IP address is reached by unicast "
+        "across subnets: the GUI tries the last EmotiBit that answered first, and --ip gives one on the "
+        "command line (printed in the EmotiBit's serial boot log, or shown in EmotiBit Oscilloscope). "
+        "On the bioacq firmware the EmotiBit also streams over Bluetooth, without a network.");
 }
 
 QString DeviceWorker::discoveryFailureText (
