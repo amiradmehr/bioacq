@@ -91,6 +91,7 @@ add_executable(bioacq
     src/core/RateMeter.h
     src/core/Readouts.h
     src/core/RingBuffer.h
+    src/core/Smoothing.h
     src/dsp/Biquad.h
     src/dsp/HeartRate.cpp
     src/dsp/HeartRate.h
