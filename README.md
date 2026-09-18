@@ -24,9 +24,10 @@ Close the OpenBCI GUI and EmotiBit Oscilloscope, then press **Connect** (⌘K / 
 
 ## The screen
 
-* **Plots:** ECG (Cyton channel 1, 250 Hz, µV) across the top; PPG green, red and infrared (25 Hz); heart rate, temperature and IMU (accelerometer, gyroscope and magnetometer in three lanes, 25 Hz).
+* **Plots:** ECG (Cyton channel 1, 250 Hz, µV), the largest, across the top; PPG green, red and infrared (25 Hz); heart rate, temperature and motion (the IMU's accelerometer, gyroscope and magnetometer in three lanes, 25 Hz).
 * **Left rail:** device status and a detail line per device, the ECG display filters, rail headroom, time window, pause, and record.
 * **ECG filters** (display only, all on): Remove DC, high-pass 0.5 Hz, notch 60 Hz, low-pass 40 Hz.
+* **EmotiBit filters** (display only, both on): *PPG DC removal* shows each PPG signal minus its 2 s moving average, so the pulses sit around 0 without the DC level or slow drift; *Temperature moving average* smooths the temperature over 3 s.
 * **Rail headroom** is how far the raw ECG of the last 2 s stays from the ±187.5 mV input range. Below 10 % it turns amber and the plot shows the raw signal; at full scale it reads `SATURATED` (check electrode contact).
 * **Stream health:** each plot header shows the measured / nominal rate. `STALLED` means no samples for over a second; `HELD` means the device waits while the other one connects (BrainFlow does one device setup at a time) and catches up afterwards. `DROPPED` in the status bar counts lost Cyton packets.
 * **Heart rate** comes from the PPG and is display-only (not recorded). It shows the rate, the PPG channel used and a quality score; otherwise `ACQUIRING`, `NO PULSE`, `IRREGULAR` or `NO DATA` says why there is no value. The first value takes about 5 s.
@@ -37,7 +38,7 @@ Close the OpenBCI GUI and EmotiBit Oscilloscope, then press **Connect** (⌘K / 
 
 **[ record to csv ]** starts and stops recording on every streaming device. Pressed while nothing is connected, it arms recording for the next Connect.
 
-* Files go to `Documents/BioAcq Recordings` (change with `--record-dir`), one per device and BrainFlow preset: `<device>_<preset>_<yyyyMMdd_HHmmss>.csv`. The Cyton writes `default`; the EmotiBit writes `default` (IMU), `auxiliary` (PPG) and `ancillary` (EDA, temperature).
+* Files go to `Documents/BioAcq Recordings` (change with `--record-dir`), one per device and BrainFlow preset: `<device>_<preset>_<yyyyMMdd_HHmmss>.csv`. The Cyton writes `default`; the EmotiBit writes `default` (motion), `auxiliary` (PPG) and `ancillary` (EDA, temperature).
 * Despite the `.csv` name the files are tab-separated with no header. A `*_columns.json` next to each file names the columns.
 * Rows are BrainFlow's raw data with UNIX timestamps; the filters and the heart rate are not applied.
 * If the folder can't be used, recordings go to `~/bioacq_recordings`.

@@ -28,6 +28,7 @@ inline const QColor controlEdge {0x30, 0x31, 0x30}; // 1 px control edge
 inline const QColor controlEdgeHover {0x3C, 0x3D, 0x3A};
 
 // ---- text -----------------------------------------------------------------
+inline const QColor textTitle {0xF4, 0xF6, 0xF1}; // plot titles: brighter than the design's textStrong
 inline const QColor textStrong {0xD6, 0xDA, 0xD2};
 inline const QColor textBody {0xB4, 0xBA, 0xB0};
 inline const QColor textMuted {0x8A, 0x90, 0x88};
