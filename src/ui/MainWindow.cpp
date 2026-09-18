@@ -63,12 +63,17 @@ const char *kKeyDc = "ecg/removeDc";
 const char *kKeyHp = "ecg/highPass0p5Hz";
 const char *kKeyNotch = "ecg/notch60Hz";
 const char *kKeyLp = "ecg/lowPass40Hz";
+const char *kKeyPpgDc = "ppg/removeDc";
+const char *kKeyTempAvg = "temperature/movingAverage";
 const char *kKeyRecord = "record/enabled";
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN ();
 constexpr double kEcgHighPassHz = 0.5;
 constexpr double kEcgNotchHz = 60.0;
 constexpr double kEcgLowPassHz = 40.0;
+// EmotiBit display filters: trailing moving averages (PlotWidget::setTrailingMean)
+constexpr double kPpgBaselineSec = 2.0;  // PPG DC removal: keeps pulses above ~0.5 Hz
+constexpr double kTempAverageSec = 3.0;  // temperature smoothing
 
 const QKeySequence kConnectKey (Qt::CTRL | Qt::Key_K);
 const QKeySequence kRescanKey (Qt::CTRL | Qt::Key_R);
@@ -488,6 +493,8 @@ void MainWindow::loadSettings ()
     opts_.highPass = st.value (kKeyHp, opts_.highPass).toBool ();
     opts_.notch = st.value (kKeyNotch, opts_.notch).toBool ();
     opts_.lowPass = st.value (kKeyLp, opts_.lowPass).toBool ();
+    opts_.ppgRemoveDc = st.value (kKeyPpgDc, opts_.ppgRemoveDc).toBool ();
+    opts_.temperatureAverage = st.value (kKeyTempAvg, opts_.temperatureAverage).toBool ();
 }
 
 void MainWindow::saveSettings ()
@@ -501,6 +508,8 @@ void MainWindow::saveSettings ()
     st.setValue (kKeyHp, hpToggle_->isChecked ());
     st.setValue (kKeyNotch, notchToggle_->isChecked ());
     st.setValue (kKeyLp, lpToggle_->isChecked ());
+    st.setValue (kKeyPpgDc, ppgDcToggle_->isChecked ());
+    st.setValue (kKeyTempAvg, tempAvgToggle_->isChecked ());
     st.setValue (kKeyRecord, recordWanted_);
     st.setValue (kKeyPortOverride, portOverride ());
 }
@@ -809,6 +818,24 @@ QWidget *MainWindow::buildEmotibitModule ()
     v->addWidget (discoverWrap_);
 
     v->addWidget (buildErrorBox (emotibit_));
+
+    v->addSpacing (12);
+    v->addWidget (kicker (QStringLiteral ("// EMOTIBIT DISPLAY FILTERS")));
+    v->addSpacing (6);
+    ppgDcToggle_ = new ToggleSwitch (QStringLiteral ("PPG DC removal"), true);
+    ppgDcToggle_->setChecked (opts_.ppgRemoveDc);
+    ppgDcToggle_->setToolTip (QStringLiteral ("Display only: each PPG plot shows the signal minus its 2 s moving average,\n"
+                                              "which removes the DC level and slow drift and centres the pulses on 0.\n"
+                                              "Recordings and the heart rate use the raw values."));
+    tempAvgToggle_ = new ToggleSwitch (QStringLiteral ("Temperature moving average"), true);
+    tempAvgToggle_->setChecked (opts_.temperatureAverage);
+    tempAvgToggle_->setToolTip (QStringLiteral ("Display only: the temperature plot and value show a 3 s moving average.\n"
+                                                "Recordings keep the raw values."));
+    v->addWidget (ppgDcToggle_);
+    v->addSpacing (6);
+    v->addWidget (tempAvgToggle_);
+    for (ToggleSwitch *t : {ppgDcToggle_, tempAvgToggle_})
+        connect (t, &QAbstractButton::toggled, this, [this] (bool) { applyEmotibitDisplayFilters (); });
     return f;
 }
 
@@ -931,17 +958,17 @@ QWidget *MainWindow::buildMain ()
     hrPlot_ = new PlotWidget (Kind::Vital, QStringLiteral ("HEART RATE"),
         QVector<PlotWidget::LaneSpec> {
             {QString (), QStringLiteral ("bpm"), {{QStringLiteral ("HR"), Theme::traceHeartRate, Dash::Solid}}, 20.0}});
-    imuPlot_ = new PlotWidget (Kind::Lanes, QStringLiteral ("IMU"),
+    imuPlot_ = new PlotWidget (Kind::Lanes, QStringLiteral ("MOTION"),
         QVector<PlotWidget::LaneSpec> {{QStringLiteral ("ACC"), QStringLiteral ("g"), xyz, 0.02},
             {QStringLiteral ("GYR"), QStringLiteral ("°/s"), xyz, 1.0},
             {QStringLiteral ("MAG"), QStringLiteral ("µT"), xyz, 1.0}});
     tempPlot_ = new PlotWidget (Kind::Scalar, QStringLiteral ("TEMPERATURE"), QStringLiteral ("°C"),
         {{QStringLiteral ("T"), Theme::traceTemp, Dash::Solid}});
 
-    // Hero ECG across the top; the PPG channels matter most after it, so
-    // green | red | IR get a third of the width each and the tallest row; heart
-    // rate, temperature (slow, sample-and-hold) and the IMU's three lanes share
-    // a shorter bottom row (12-column grid: 3 | 3 | 6).
+    // The ECG gets the tallest row across the top; green | red | IR below it
+    // (a third of the width each); heart rate, temperature (slow,
+    // sample-and-hold) and the motion panel's three IMU lanes share the bottom
+    // row (12-column grid: 3 | 3 | 6).
     auto *grid = new QGridLayout;
     grid->setContentsMargins (0, 0, 0, 0);
     grid->setSpacing (Theme::gutter);
@@ -954,8 +981,8 @@ QWidget *MainWindow::buildMain ()
     grid->addWidget (imuPlot_, 2, 6, 1, 6);
     for (int c = 0; c < 12; ++c)
         grid->setColumnStretch (c, 1);
-    grid->setRowStretch (0, 110);
-    grid->setRowStretch (1, 150);
+    grid->setRowStretch (0, 160);
+    grid->setRowStretch (1, 100);
     grid->setRowStretch (2, 90);
     v->addLayout (grid, 1);
 
@@ -2671,6 +2698,18 @@ void MainWindow::applyFilterSettings ()
     emotibit_.worker->setHighPass (false);
     emotibit_.worker->setNotch (false);
     emotibit_.worker->setLowPass (false);
+    applyEmotibitDisplayFilters ();
+}
+
+void MainWindow::applyEmotibitDisplayFilters ()
+{
+    const bool dc = ppgDcToggle_->isChecked ();
+    for (PlotWidget *p : {ppgGreenPlot_, ppgRedPlot_, ppgIrPlot_})
+    {
+        p->setTrailingMean (dc ? kPpgBaselineSec : 0.0, true);
+        p->setSymmetric (dc);
+    }
+    tempPlot_->setTrailingMean (tempAvgToggle_->isChecked () ? kTempAverageSec : 0.0, false);
 }
 
 void MainWindow::updateWindowTitle ()

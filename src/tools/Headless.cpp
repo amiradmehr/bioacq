@@ -15,6 +15,7 @@
 #include "RingBuffer.h"
 #include "SerialPorts.h"
 #include "SignalSpec.h"
+#include "Smoothing.h"
 #include "Sockets.h"
 
 #include "board_shim.h"
@@ -709,6 +710,36 @@ void unitChecks (Checker &check)
             fmt ("retimer: 3-sample packets spread to 40 ms steps (max error %.1g s); split polls stay "
                  "monotonic (largest step %.3f s)",
                 worst, dmax));
+    }
+    // Display smoothing (PPG DC removal, temperature moving average)
+    {
+        const double fs = 25.0;
+        std::vector<double> t, ppg, temp;
+        for (int i = 0; i < 250; ++i) // 10 s: DC 118000 + 0.5 per s drift + a 900 count, 1.2 Hz pulse
+        {
+            const double s = i / fs;
+            t.push_back (s);
+            ppg.push_back (118000.0 + 500.0 * s + 900.0 * std::sin (2.0 * M_PI * 1.2 * s));
+            temp.push_back (33.0 + ((i % 2) ? 0.04 : -0.04)); // quantisation-like flicker
+        }
+        temp[100] = std::numeric_limits<double>::quiet_NaN (); // a gap stays a gap
+        std::vector<double> ac, avg;
+        Smoothing::trailingMean (t.data (), ppg.data (), t.size (), 2.0, true, ac);
+        Smoothing::trailingMean (t.data (), temp.data (), t.size (), 3.0, false, avg);
+        double acMin = 1e300, acMax = -1e300, flicker = 0.0;
+        for (std::size_t k = 75; k < t.size (); ++k) // after the 2 s window has filled
+        {
+            acMin = std::min (acMin, ac[k]);
+            acMax = std::max (acMax, ac[k]);
+        }
+        for (std::size_t k = 80; k < t.size (); ++k)
+            if (k != 100)
+                flicker = std::max (flicker, std::fabs (avg[k] - 33.0));
+        check (acMin > -1600.0 && acMax < 1600.0 && acMax - acMin > 1200.0 && flicker < 0.005 &&
+                std::isnan (avg[100]) && std::isfinite (avg[101]),
+            fmt ("display smoothing: PPG minus its 2 s mean spans %.0f..%.0f (DC 118000 + drift removed, pulse kept); "
+                 "3 s temperature mean within %.4f of 33 C; a gap stays a gap",
+                acMin, acMax, flicker));
     }
     // Biquads at the Cyton rate
     {

@@ -3,6 +3,7 @@
 #include "Decimate.h"
 #include "Readouts.h"
 #include "RingBuffer.h"
+#include "Smoothing.h"
 #include "Theme.h"
 
 #include <QFontMetricsF>
@@ -129,7 +130,7 @@ void PlotWidget::init ()
     setSizePolicy (QSizePolicy::Expanding, QSizePolicy::Expanding);
 
     const bool hero = kind_ == Kind::Hero;
-    fTitle_ = Theme::mono (hero ? 11.0 : 10.5, 400, 0.14);
+    fTitle_ = Theme::mono (hero ? 13.5 : 12.5, 600, 0.08); // larger and brighter than the design's 11 / 10.5
     fUnits_ = Theme::mono (10);
     fSub_ = Theme::sans (11);
     fChip_ = Theme::mono (9.5, 400, 0.1);
@@ -297,7 +298,23 @@ void PlotWidget::setSymmetric (bool on)
     if (on == symmetric_)
         return;
     symmetric_ = on;
+    for (Lane &L : lanes_)
+        L.yValid = false;
     dirty_ = true;
+}
+
+void PlotWidget::setTrailingMean (double seconds, bool subtractMean)
+{
+    seconds = std::max (0.0, seconds);
+    if (seconds == smoothSec_ && subtractMean == smoothSubtract_)
+        return;
+    smoothSec_ = seconds;
+    smoothSubtract_ = subtractMean;
+    for (Lane &L : lanes_)
+        L.yValid = false;
+    dirty_ = true;
+    refreshHeaderText ();
+    updateHeader ();
 }
 
 void PlotWidget::setOverlay (QWidget *w)
@@ -439,7 +456,8 @@ void PlotWidget::tick (double now)
                 continue;
             }
             L.lastWritten = L.ring->totalWritten (); // consumed only when we actually rebuild
-            const double tmin = ref - windowSec_ * 1.02 - 1.0 / std::max (1.0, L.nominalRate);
+            // the trailing mean needs its window of history before the first shown sample
+            const double tmin = ref - windowSec_ * 1.02 - 1.0 / std::max (1.0, L.nominalRate) - smoothSec_;
             L.n = L.ring->copySince (tmin, L.t, L.v);
             L.haveLatest = L.ring->latest (L.latestTs, L.latestVals);
             total += L.n;
@@ -553,7 +571,7 @@ void PlotWidget::computeDisplayRange (Lane &L)
     L.yTop = L.mapTop;
     L.yBot = L.mapBottom;
     double lo = L.yLo, hi = L.yHi;
-    if (symmetric_ && kind_ == Kind::Hero)
+    if (symmetric_ && (kind_ == Kind::Hero || kind_ == Kind::Scalar))
     {
         double m = std::max (std::fabs (lo), std::fabs (hi));
         if (!(m > 0.0))
@@ -590,11 +608,33 @@ void PlotWidget::rebuildLane (Lane &L, bool first)
     std::fill (L.means.begin (), L.means.end (), 0.0);
     // Near-rail view plots the raw channel (no mean removal) as trace 0.
     const bool raw = first && rawView () && L.rawChannel < static_cast<int> (L.v.size ());
+    // setTrailingMean: the moving average (or the value minus it) is drawn; the
+    // copy starts smoothSec_ early for it, and only k0.. is shown.
+    const bool smooth = smoothSec_ > 0.0 && kind_ == Kind::Scalar;
+    std::size_t k0 = 0;
+    L.smoothedLatest.assign (static_cast<std::size_t> (nTr), std::numeric_limits<double>::quiet_NaN ());
+    if (smooth)
+    {
+        L.smoothed.resize (static_cast<std::size_t> (nTr));
+        for (int tr = 0; tr < nTr; ++tr)
+        {
+            std::vector<double> &out = L.smoothed[static_cast<std::size_t> (tr)];
+            Smoothing::trailingMean (L.t.data (), L.v[static_cast<std::size_t> (tr)].data (), L.n, smoothSec_,
+                smoothSubtract_, out);
+            if (L.n > 0)
+                L.smoothedLatest[static_cast<std::size_t> (tr)] = out[L.n - 1];
+        }
+        const double tShow = refTime_ - windowSec_ * 1.02 - 1.0 / std::max (1.0, L.nominalRate);
+        while (k0 < L.n && L.t[k0] < tShow)
+            ++k0;
+    }
     auto series = [&] (int tr) -> const std::vector<double> & {
+        if (smooth)
+            return L.smoothed[static_cast<std::size_t> (tr)];
         return L.v[static_cast<std::size_t> (raw && tr == 0 ? L.rawChannel : tr)];
     };
 
-    if (L.n > 0)
+    if (L.n > k0)
     {
         const double tWin = refTime_ - windowSec_;
         for (int tr = 0; tr < nTr; ++tr)
@@ -616,7 +656,7 @@ void PlotWidget::rebuildLane (Lane &L, bool first)
             L.means[static_cast<std::size_t> (tr)] = off;
             double wLo = std::numeric_limits<double>::infinity ();
             double wHi = -std::numeric_limits<double>::infinity ();
-            for (std::size_t k = 0; k < L.n; ++k)
+            for (std::size_t k = k0; k < L.n; ++k)
             {
                 const double x = vv[k] - off;
                 if (!std::isfinite (x))
@@ -661,7 +701,7 @@ void PlotWidget::rebuildLane (Lane &L, bool first)
     for (int tr = 0; tr < static_cast<int> (L.segCount.size ()); ++tr)
     {
         const std::size_t ti = static_cast<std::size_t> (tr);
-        if (tr >= nTr || L.n == 0)
+        if (tr >= nTr || L.n <= k0)
         {
             L.segCount[ti] = 0;
             L.denseFlags[ti].clear ();
@@ -669,8 +709,8 @@ void PlotWidget::rebuildLane (Lane &L, bool first)
         }
         std::size_t pts = 0;
         bool dense = L.denseMode[ti] != 0;
-        L.segCount[ti] = buildPolylines (L.t.data (), series (tr).data (), L.n, L.means[ti], m, gapSec, L.polys[ti],
-            &pts, &L.denseFlags[ti], &dense);
+        L.segCount[ti] = buildPolylines (L.t.data () + k0, series (tr).data () + k0, L.n - k0, L.means[ti], m, gapSec,
+            L.polys[ti], &pts, &L.denseFlags[ti], &dense);
         L.denseMode[ti] = dense ? 1 : 0;
         lastPoints_ += pts;
     }
@@ -693,7 +733,10 @@ bool PlotWidget::refreshHeaderText ()
                 continue;
             }
             double val = L.latestVals[static_cast<std::size_t> (i)];
-            if (kind_ == Kind::Hero && li == 0)
+            if (smoothSec_ > 0.0 && kind_ == Kind::Scalar && i < static_cast<int> (L.smoothedLatest.size ()) &&
+                std::isfinite (L.smoothedLatest[static_cast<std::size_t> (i)]))
+                val = L.smoothedLatest[static_cast<std::size_t> (i)];
+            else if (kind_ == Kind::Hero && li == 0)
             {
                 if (raw && L.rawChannel < static_cast<int> (L.latestVals.size ()))
                     val = L.latestVals[static_cast<std::size_t> (L.rawChannel)];
@@ -727,7 +770,7 @@ void PlotWidget::updateHeader ()
 void PlotWidget::layoutRects ()
 {
     const int w = width (), h = height ();
-    int headerH = 6 + 15 + 6;
+    int headerH = 6 + 17 + 6; // the 12.5 px title's line box
     if (kind_ == Kind::Hero)
         headerH = 8 + 33 + 8;
     else if (kind_ == Kind::Scalar)
@@ -918,7 +961,7 @@ void PlotWidget::paintHeroHeader (QPainter &p)
     p.fillRect (QRectF (x, std::floor (cy - 4.0), 8, 8), led_);
     x += 8.0 + 12.0;
     p.setFont (fTitle_);
-    p.setPen (Theme::textStrong);
+    p.setPen (Theme::textTitle);
     const QString title = ft.elidedText (title_, Qt::ElideRight, std::max (20.0, limit - x));
     p.drawText (QPointF (x, baselineFor (ft, cy)), title);
     x += ft.horizontalAdvance (title);
@@ -1059,7 +1102,7 @@ void PlotWidget::paintPanelHeader (QPainter &p)
     p.fillRect (QRectF (hr.left () + 9.0, std::floor (cy - 3.5), 7, 7), led_);
     double x = left;
     p.setFont (fTitle_);
-    p.setPen (Theme::textStrong);
+    p.setPen (Theme::textTitle);
     const QString title = ft.elidedText (title_, Qt::ElideRight, std::max (16.0, right - x));
     p.drawText (QPointF (x, baselineFor (ft, cy)), title);
     x += ft.horizontalAdvance (title) + gap;
