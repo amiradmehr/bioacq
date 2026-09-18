@@ -59,6 +59,9 @@ struct LaunchOptions
     bool highPass = true; // 0.5 Hz
     bool notch = true;    // 60 Hz
     bool lowPass = true;  // 40 Hz
+    // EmotiBit display filters (both on by default)
+    bool ppgRemoveDc = true;      // PPG minus its 2 s trailing mean
+    bool temperatureAverage = true; // temperature: 3 s trailing mean
     bool brainflowDiscovery = false; // --bf-discovery: let BrainFlow search (holds its lock)
     // --emotibit-link: Bluetooth only by default; auto adds the Wi-Fi discovery
     // (and the rail's search timeout and wi-fi setup link).
@@ -212,6 +215,7 @@ private:
     bool bluetoothOnly () const;              // --emotibit-link bluetooth (the default): no Wi-Fi search
     QString cytonPortFor (const QString &override) const;
     void applyFilterSettings ();
+    void applyEmotibitDisplayFilters (); // PPG DC removal, temperature average (display only)
     void updateWindowTitle ();
     void onFrame ();
     void onRateTimer ();
@@ -240,6 +244,8 @@ private:
     ToggleSwitch *hpToggle_ = nullptr;
     ToggleSwitch *notchToggle_ = nullptr;
     ToggleSwitch *lpToggle_ = nullptr;
+    ToggleSwitch *ppgDcToggle_ = nullptr;
+    ToggleSwitch *tempAvgToggle_ = nullptr;
     QLabel *railPct_ = nullptr;
     MeterBar *railBar_ = nullptr;
     QLabel *railNote_ = nullptr;

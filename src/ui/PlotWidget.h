@@ -128,7 +128,11 @@ public:
     {
         fullScale_ = fs;
     }
-    void setSymmetric (bool on); // hero: range symmetric around 0
+    void setSymmetric (bool on); // hero, scalar: range symmetric around 0
+    // Scalar plots, display only: every trace becomes its trailing moving
+    // average over `seconds` (0 = off), or with subtractMean each value minus
+    // that average, which removes the DC level and slow drift.
+    void setTrailingMean (double seconds, bool subtractMean);
     void setOverlay (QWidget *w); // placed over the recess (idle call to action)
     QRect recessRect () const
     {
@@ -186,6 +190,8 @@ private:
         std::size_t n = 0;
         bool finite = false; // any finite value in view
         std::vector<double> means;
+        std::vector<std::vector<double>> smoothed; // setTrailingMean: the displayed series
+        std::vector<double> smoothedLatest;        // ... its newest value per trace (header)
 
         // newest sample
         bool haveLatest = false;
@@ -281,6 +287,8 @@ private:
 
     double windowSec_ = 10.0;
     bool removeMean_ = false;
+    double smoothSec_ = 0.0; // setTrailingMean
+    bool smoothSubtract_ = false;
     bool paused_ = false;
     bool dirty_ = true;
     bool clockMismatch_ = false;
