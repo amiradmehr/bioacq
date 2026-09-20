@@ -1,0 +1,6 @@
+#!/bin/sh
+# BioAcq launcher. The binary in bin/ finds its libraries through its rpath and
+# its Qt plugins through bin/qt.conf, so there is nothing to set up here:
+# bin/bioacq works just as well, and this is only the friendlier name.
+here=$(cd "$(dirname "$0")" && pwd)
+exec "$here/bin/bioacq" "$@"

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=BioAcq
+GenericName=Biosignal Viewer
+Comment=Real-time ECG (OpenBCI Cyton) and EmotiBit viewer
+Exec=bioacq
+Icon=bioacq
+Terminal=false
+Categories=Science;MedicalSoftware;Monitor;
+Keywords=ECG;PPG;EmotiBit;OpenBCI;BrainFlow;biosignal;
+StartupWMClass=bioacq
