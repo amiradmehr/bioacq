@@ -89,6 +89,9 @@ struct DeviceConfig
     // Test hook (--test-ppg-bpm): replace the PPG display values (and so the
     // heart-rate input) with HeartRate::syntheticPpg at this rate. 0 = off.
     double testPpgBpm = 0.0;
+    // Test hook (--test-ecg-bpm): replace the Cyton's ECG DISPLAY values (and
+    // so the ECG heart rate) with HeartRate::syntheticEcg at this rate. 0 = off.
+    double testEcgBpm = 0.0;
     // Test only (--selftest): the Bluetooth route gets the bridge's synthetic
     // packets instead of a radio (EmotiBitBleBridge::Source::Synthetic).
     bool testSyntheticBluetooth = false;

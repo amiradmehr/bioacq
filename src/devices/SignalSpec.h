@@ -76,6 +76,7 @@ inline constexpr char EmotiTemp[] = "emotibit.temp";
 inline constexpr char EmotiAccel[] = "emotibit.accel";
 inline constexpr char EmotiGyro[] = "emotibit.gyro";
 inline constexpr char EmotiMag[] = "emotibit.mag";
+inline constexpr char CytonHeartRate[] = "cyton.hr";    // derived from the ECG's R peaks
 inline constexpr char EmotiHeartRate[] = "emotibit.hr"; // derived from the three PPG channels
 } // namespace SignalKeys
 
@@ -85,7 +86,7 @@ namespace HeartRateRing
 {
 inline constexpr int Bpm = 0;
 inline constexpr int Quality = 1;     // 0..1
-inline constexpr int Source = 2;      // HeartRate::Source, -1 = none
+inline constexpr int Source = 2;      // HeartRate::Source (SourceEcg from the ECG), -1 = none
 inline constexpr int Beats = 3;       // beats in the estimate window
 inline constexpr int Periodicity = 4; // autocorrelation at the beat interval
 inline constexpr int Count = 5;
