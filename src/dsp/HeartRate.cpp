@@ -35,7 +35,28 @@ PulseShape shapeFor (double bpm)
     return s;
 }
 
+// Synthetic ECG waves: centre (s, relative to the R peak), height (x R) and width (s).
+struct EcgWave
+{
+    double at, height, width;
+};
+constexpr EcgWave kEcgWaves[] = {
+    {-0.18, 0.12, 0.028}, // P
+    {-0.022, -0.13, 0.008}, // Q
+    {0.0, 1.0, 0.009},      // R
+    {0.026, -0.28, 0.011},  // S
+    {0.18, 0.26, 0.050}     // T
+};
+
 } // namespace
+
+const Params &paramsFor (Mode mode)
+{
+    static const Params ppg {kHighPassHz, kLowPassHz, false, kPeakWindowSec, kBeatWindowSec, kBeta, kDetrendSec};
+    static const Params ecg {kEcgHighPassHz, kEcgLowPassHz, true, kEcgPeakWindowSec, kEcgBeatWindowSec, kEcgBeta,
+        kEcgDetrendSec};
+    return mode == Mode::Ecg ? ecg : ppg;
+}
 
 const char *sourceName (int source)
 {
@@ -47,6 +68,8 @@ const char *sourceName (int source)
             return "RED";
         case SourceIr:
             return "IR";
+        case SourceEcg:
+            return "ECG";
         default:
             return "—";
     }
@@ -95,13 +118,15 @@ Estimate estimateFromBeats (const std::deque<double> &beats, double now, double 
 }
 
 // ------------------------------------------------------------ BeatDetector
-BeatDetector::BeatDetector (double nominalFs)
+BeatDetector::BeatDetector (double nominalFs, Mode mode)
 {
-    reset (nominalFs);
+    reset (nominalFs, mode);
 }
 
-void BeatDetector::reset (double nominalFs)
+void BeatDetector::reset (double nominalFs, Mode mode)
 {
+    mode_ = mode;
+    p_ = paramsFor (mode);
     nominalFs_ = nominalFs > 0.0 ? nominalFs : 25.0;
     fs_ = nominalFs_;
     design ();
@@ -125,15 +150,15 @@ void BeatDetector::reset (double nominalFs)
 void BeatDetector::design ()
 {
     bp_.stages.clear ();
-    bp_.stages.push_back (Biquad::highPass (fs_, kHighPassHz));
-    bp_.stages.push_back (Biquad::lowPass (fs_, kLowPassHz));
+    bp_.stages.push_back (Biquad::highPass (fs_, p_.highPassHz));
+    bp_.stages.push_back (Biquad::lowPass (fs_, p_.lowPassHz));
     auto odd = [this] (double sec) { return std::max (1, 2 * static_cast<int> (std::lround (sec * fs_ / 2.0)) + 1); };
-    n1_ = odd (kPeakWindowSec);
-    n2_ = std::max (odd (kBeatWindowSec), n1_ + 2);
+    n1_ = odd (p_.peakWindowSec);
+    n2_ = std::max (odd (p_.beatWindowSec), n1_ + 2);
     ht_.assign (static_cast<std::size_t> (n2_), 0.0);
     hy_.assign (static_cast<std::size_t> (n2_), 0.0);
     hz_.assign (static_cast<std::size_t> (n2_), 0.0);
-    const std::size_t nd = static_cast<std::size_t> (std::max (3, odd (kDetrendSec)));
+    const std::size_t nd = static_cast<std::size_t> (std::max (3, odd (p_.detrendSec)));
     dy_.assign (nd, 0.0);
     dt_.assign (nd, 0.0);
     pStep_ = std::max (1, static_cast<int> (std::lround (fs_ / 25.0)));
@@ -203,8 +228,10 @@ void BeatDetector::process (const double *t, const double *x, std::size_t n)
             }
         }
 
-        // Band-pass, inverted: a systolic pulse is a maximum.
-        const double y1 = -bp_.process (xi);
+        // Band-pass; a beat is a maximum: PPG counts are inverted, an ECG's
+        // QRS is rectified (its R peak may point either way).
+        const double bp = bp_.process (xi);
+        const double y1 = p_.rectify ? std::fabs (bp) : -bp;
         // Artefact: beyond kArtefactFactor x the recent beat height. Clipped
         // before the baseline removal, so it cannot spread over the moving
         // average; the samples it reaches are masked below.
@@ -268,7 +295,7 @@ void BeatDetector::process (const double *t, const double *x, std::size_t n)
         const double maPeak = sumPeak / n1_;
         const double maBeat = std::max (0.0, sumBeat_) / n2_;
         const double floorAmp = 1e-9 * absMean_ + 1e-12; // flat input: no beats from rounding noise
-        if (maPeak > std::max (maBeat + kBeta * zMean_, floorAmp * floorAmp))
+        if (maPeak > std::max (maBeat + p_.beta * zMean_, floorAmp * floorAmp))
         {
             if (!inBlock_)
             {
@@ -441,16 +468,17 @@ Estimate BeatDetector::estimate (double now) const
 }
 
 // ------------------------------------------------------------ Tracker
-Tracker::Tracker (double nominalFs)
+Tracker::Tracker (double nominalFs, Mode mode)
 {
-    reset (nominalFs);
+    reset (nominalFs, mode);
 }
 
-void Tracker::reset (double nominalFs)
+void Tracker::reset (double nominalFs, Mode mode)
 {
+    mode_ = mode;
     for (int c = 0; c < kSources; ++c)
     {
-        det_[c].reset (nominalFs);
+        det_[c].reset (nominalFs, mode);
         est_[c] = Estimate ();
         estBeats_[c] = 0;
         estAt_[c] = -std::numeric_limits<double>::infinity ();
@@ -472,8 +500,9 @@ void Tracker::process (int channel, const double *t, const double *x, std::size_
 
 void Tracker::update (double now, std::vector<Sample> &out)
 {
+    const int channels = mode_ == Mode::Ecg ? 1 : kSources; // Ecg: one detector, published as SourceEcg
     int best = SourceNone;
-    for (int c = 0; c < kSources; ++c)
+    for (int c = 0; c < channels; ++c)
     {
         if (!det_[c].hasData ())
             est_[c] = Estimate ();
@@ -527,7 +556,7 @@ void Tracker::update (double now, std::vector<Sample> &out)
         if (!publishedValid_ || publishedSource_ != source_ || total != publishedBeats_)
         {
             const double tb = est_[source_].lastBeat;
-            publish (std::isfinite (tb) ? tb : now, est_[source_], source_, true);
+            publish (std::isfinite (tb) ? tb : now, est_[source_], mode_ == Mode::Ecg ? SourceEcg : source_, true);
             publishedSource_ = source_;
             publishedBeats_ = total;
             publishedValid_ = true;
@@ -537,7 +566,7 @@ void Tracker::update (double now, std::vector<Sample> &out)
 
     // No valid HR: publish the best channel's status now and then (NaN = gap).
     int shown = SourceNone;
-    for (int c = 0; c < kSources; ++c)
+    for (int c = 0; c < channels; ++c)
         if (det_[c].hasData () && (shown == SourceNone || est_[c].quality > est_[shown].quality))
             shown = c;
     if (shown == SourceNone)
@@ -577,6 +606,28 @@ double systolicTime (double t, double bpm)
 {
     const PulseShape s = shapeFor (bpm);
     return std::floor ((t - s.sys) / s.period) * s.period + s.sys;
+}
+
+double syntheticEcg (double t, double bpm, double rAmplitude)
+{
+    const double period = 60.0 / std::clamp (bpm, 1.0, 400.0);
+    double ph = std::fmod (t, period);
+    if (ph < 0.0)
+        ph += period;
+    double v = 0.0;
+    for (int k = -1; k <= 1; ++k) // neighbouring beats: smooth across the wrap
+        for (const EcgWave &w : kEcgWaves)
+        {
+            const double d = (ph - k * period - w.at) / w.width;
+            v += w.height * std::exp (-0.5 * d * d);
+        }
+    return rAmplitude * v;
+}
+
+double ecgRTime (double t, double bpm)
+{
+    const double period = 60.0 / std::clamp (bpm, 1.0, 400.0);
+    return std::floor (t / period) * period;
 }
 
 } // namespace HeartRate

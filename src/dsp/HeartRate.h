@@ -10,10 +10,17 @@
 #include <vector>
 
 // Streaming heart rate from reflectance PPG (EmotiBit: MAX30101 green / red /
-// infrared). Runs in the EmotiBit worker on the re-timed display samples; it
-// never touches BrainFlow's rows, so recordings stay raw.
+// infrared) or from the Cyton ECG's R peaks (Mode::Ecg). Runs in the device's
+// worker on the display samples; it never touches BrainFlow's rows, so
+// recordings stay raw.
 //
-// BeatDetector, one per PPG channel:
+// Mode::Ecg keeps the whole chain below and only changes step 1-2 and the two
+// moving averages (paramsFor): the band-pass is 8-20 Hz (the QRS band) and the
+// signal is rectified instead of inverted, so a QRS is a maximum whichever way
+// the electrodes are wired; the averages are Elgendi's QRS ones (97 / 611 ms,
+// kBeta 0.08) and the baseline window is shorter, which also cuts the delay.
+//
+// BeatDetector, one per PPG channel (Mode::Ecg: one, on the ECG):
 //  1. Band-pass 0.5-4 Hz: one RBJ high-pass and one RBJ low-pass biquad
 //     (Q = 1/sqrt(2)) designed at the nominal sample rate. The rate is
 //     re-measured over the first kRateCheckSec of every uninterrupted stretch
@@ -106,15 +113,39 @@ inline constexpr double kArtefactSettleSec = 0.25;
 // quality) this often, so the UI can show the quality it is getting.
 inline constexpr double kStatusIntervalSec = 1.0;
 
+// Mode::Ecg (Elgendi's QRS windows; the R peak is far shorter than a pulse)
+inline constexpr double kEcgHighPassHz = 8.0;
+inline constexpr double kEcgLowPassHz = 20.0;
+inline constexpr double kEcgPeakWindowSec = 0.097;
+inline constexpr double kEcgBeatWindowSec = 0.611;
+inline constexpr double kEcgBeta = 0.08;
+inline constexpr double kEcgDetrendSec = 0.4; // rectified QRS needs no long baseline window
+
+enum class Mode
+{
+    Ppg, // reflectance PPG: the counts drop at systole
+    Ecg  // ECG: rectified QRS band, so either R polarity is a maximum
+};
+
+// What the mode changes in BeatDetector::design / process.
+struct Params
+{
+    double highPassHz, lowPassHz;
+    bool rectify; // Ecg: |band-pass|; Ppg: -band-pass (inverted counts)
+    double peakWindowSec, beatWindowSec, beta, detrendSec;
+};
+const Params &paramsFor (Mode mode);
+
 enum Source
 {
     SourceNone = -1,
     SourceGreen = 0,
     SourceRed = 1,
-    SourceIr = 2
+    SourceIr = 2,
+    SourceEcg = 3 // Mode::Ecg: the only channel
 };
 inline constexpr int kSources = 3;
-const char *sourceName (int source); // "GREEN" / "RED" / "IR" / "—"
+const char *sourceName (int source); // "GREEN" / "RED" / "IR" / "ECG" / "—"
 
 struct Estimate
 {
@@ -134,8 +165,8 @@ Estimate estimateFromBeats (const std::deque<double> &beats, double now, double 
 class BeatDetector
 {
 public:
-    explicit BeatDetector (double nominalFs = 25.0);
-    void reset (double nominalFs);
+    explicit BeatDetector (double nominalFs = 25.0, Mode mode = Mode::Ppg);
+    void reset (double nominalFs, Mode mode = Mode::Ppg);
     // Samples in time order (s, raw counts); non-finite or non-increasing
     // samples are skipped.
     void process (const double *t, const double *x, std::size_t n);
@@ -181,6 +212,8 @@ public:
 private:
     void design ();
     void restart (double t);
+    Mode mode_ = Mode::Ppg;
+    Params p_ = paramsFor (Mode::Ppg);
     void candidate (double tp, double yp);
     void updateScale (double t);
 
@@ -253,8 +286,8 @@ struct Sample
 class Tracker
 {
 public:
-    explicit Tracker (double nominalFs = 25.0);
-    void reset (double nominalFs);
+    explicit Tracker (double nominalFs = 25.0, Mode mode = Mode::Ppg);
+    void reset (double nominalFs, Mode mode = Mode::Ppg);
     void process (int channel, const double *t, const double *x, std::size_t n);
     // Re-estimates the channels at `now` (newest sample time), selects the
     // source and appends what is new since the last call to `out`.
@@ -270,6 +303,8 @@ public:
     }
 
 private:
+    // Mode::Ecg uses det_[0] only and publishes SourceEcg.
+    Mode mode_ = Mode::Ppg;
     BeatDetector det_[kSources];
     Estimate est_[kSources];
     std::uint64_t estBeats_[kSources] = {0, 0, 0};
@@ -292,5 +327,11 @@ private:
 double pulseWave (double t, double bpm);
 double syntheticPpg (double t, double bpm, double dc, double amplitude);
 double systolicTime (double t, double bpm);
+
+// Synthetic ECG for --selftest: P, QRS and T waves (Gaussians) at a constant
+// rate, `rAmplitude` µV at the R peak (negative for reversed electrodes).
+// ecgRTime () is the R peak at or before t.
+double syntheticEcg (double t, double bpm, double rAmplitude);
+double ecgRTime (double t, double bpm);
 
 } // namespace HeartRate

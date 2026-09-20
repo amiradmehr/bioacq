@@ -138,7 +138,18 @@ std::vector<SignalDef> signalDefsFor (DeviceKind kind)
         ecg.candidates = {{ChannelKind::Exg, kDefault, 0, 1}};
         ecg.filterable = true;
         ecg.valueDecimals = 0;
+        ecg.heartRateInput = 0; // HeartRate::Mode::Ecg: the only channel
         defs.push_back (ecg);
+
+        // Heart rate from the R peaks; the rail picks which one the panel shows.
+        SignalDef hr;
+        hr.key = SignalKeys::CytonHeartRate;
+        hr.title = "Heart rate (ECG)";
+        hr.units = "bpm";
+        hr.traceNames = {"HR"};
+        hr.derivedFrom = {SignalKeys::CytonEcg};
+        hr.valueDecimals = 0;
+        defs.push_back (hr);
         return defs;
     }
 
