@@ -63,6 +63,7 @@ const char *kKeyDc = "ecg/removeDc";
 const char *kKeyHp = "ecg/highPass0p5Hz";
 const char *kKeyNotch = "ecg/notch60Hz";
 const char *kKeyLp = "ecg/lowPass40Hz";
+const char *kKeyHrEcg = "hr/fromEcg";
 const char *kKeyPpgDc = "ppg/removeDc";
 const char *kKeyTempAvg = "temperature/movingAverage";
 const char *kKeyRecord = "record/enabled";
@@ -421,6 +422,7 @@ MainWindow::MainWindow (const LaunchOptions &opts, QWidget *parent) : QMainWindo
     wireWorker (DeviceKind::EmotiBit);
     refreshPorts (false); // silent: the idle status message is the call to action
     applyFilterSettings ();
+    applyHeartRateSource ();
     updateSlotUi (cyton_);
     updateSlotUi (emotibit_);
     updateRecordUi ();
@@ -493,6 +495,8 @@ void MainWindow::loadSettings ()
     opts_.highPass = st.value (kKeyHp, opts_.highPass).toBool ();
     opts_.notch = st.value (kKeyNotch, opts_.notch).toBool ();
     opts_.lowPass = st.value (kKeyLp, opts_.lowPass).toBool ();
+    if (!opts_.heartRateSet)
+        opts_.heartRateFromEcg = st.value (kKeyHrEcg, opts_.heartRateFromEcg).toBool ();
     opts_.ppgRemoveDc = st.value (kKeyPpgDc, opts_.ppgRemoveDc).toBool ();
     opts_.temperatureAverage = st.value (kKeyTempAvg, opts_.temperatureAverage).toBool ();
 }
@@ -508,6 +512,7 @@ void MainWindow::saveSettings ()
     st.setValue (kKeyHp, hpToggle_->isChecked ());
     st.setValue (kKeyNotch, notchToggle_->isChecked ());
     st.setValue (kKeyLp, lpToggle_->isChecked ());
+    st.setValue (kKeyHrEcg, hrSourceToggle_->isChecked ());
     st.setValue (kKeyPpgDc, ppgDcToggle_->isChecked ());
     st.setValue (kKeyTempAvg, tempAvgToggle_->isChecked ());
     st.setValue (kKeyRecord, recordWanted_);
@@ -858,6 +863,15 @@ QWidget *MainWindow::buildDisplayModule ()
     pauseToggle_->setToolTip (QStringLiteral ("Freezes the plots only: streams, recording, heart rate and the\n"
                                               "rail-headroom warning keep running."));
     v->addWidget (pauseToggle_);
+    v->addSpacing (9);
+    hrSourceToggle_ = new ToggleSwitch (QStringLiteral ("Heart rate from ECG"), true);
+    hrSourceToggle_->setChecked (opts_.heartRateFromEcg);
+    hrSourceToggle_->setToolTip (QStringLiteral (
+        "On: the heart rate comes from the R peaks of the Cyton's ECG.\n"
+        "Off: from the EmotiBit's PPG pulses (the channel with the best quality).\n"
+        "Both devices compute it while they stream, so the panel switches at once.\n"
+        "Display only: the heart rate is never recorded."));
+    v->addWidget (hrSourceToggle_);
     // ("Simulate devices" lives in the idle call to action over the hero plot:
     // it can only change while nothing is connected.)
 
@@ -879,6 +893,7 @@ QWidget *MainWindow::buildDisplayModule ()
         for (PlotWidget *p : allPlots ())
             p->setWindowSeconds (s);
     });
+    connect (hrSourceToggle_, &QAbstractButton::toggled, this, [this] (bool) { applyHeartRateSource (); });
     connect (pauseToggle_, &QAbstractButton::toggled, this, [this] (bool on) {
         for (PlotWidget *p : allPlots ())
             p->setPaused (on);
@@ -1098,8 +1113,8 @@ PlotWidget *MainWindow::plotForKey (const std::string &key, int *lane) const
         return ppgRedPlot_;
     if (key == SignalKeys::EmotiPpgIr)
         return ppgIrPlot_;
-    if (key == SignalKeys::EmotiHeartRate)
-        return hrPlot_;
+    // (the heart-rate panel is bound by applyHeartRateSource: either device's
+    // derived HR ring can feed it)
     if (key == SignalKeys::EmotiTemp)
         return tempPlot_;
     const int imuLane = key == SignalKeys::EmotiAccel ? 0 : (key == SignalKeys::EmotiGyro ? 1 : (key == SignalKeys::EmotiMag ? 2 : -1));
@@ -1235,6 +1250,7 @@ void MainWindow::wireWorker (DeviceKind kind)
             sessionStartWall_ = kNaN;
         updateSlotUi (cyton_);
         updateSlotUi (emotibit_);
+        applyHeartRateSource ();
         updateConnectUi ();
         updateRecordUi ();
         refreshChrome (wallClockSeconds ());
@@ -1484,6 +1500,8 @@ void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
         cfg.testFreezeAfterSec = opts_.testFreezeEmotibitSec;
     if (kind == DeviceKind::EmotiBit && opts_.testPpgBpm > 0.0)
         cfg.testPpgBpm = opts_.testPpgBpm;
+    if (kind == DeviceKind::Cyton && opts_.testEcgBpm > 0.0)
+        cfg.testEcgBpm = opts_.testEcgBpm;
     if (kind == DeviceKind::Cyton && opts_.testRailOffsetUv != 0.0)
         cfg.testRawOffset = opts_.testRailOffsetUv;
     if (kind == DeviceKind::Cyton && opts_.testCytonPrepareDelayMs > 0)
@@ -1567,6 +1585,7 @@ void MainWindow::connectDeviceWith (DeviceKind kind, bool synth)
     if (kind == DeviceKind::Cyton)
         cytonPlot_->setSubtitle (synth ? QStringLiteral ("synthetic board · exg[0]")
                                        : QStringLiteral ("single-ended · SRB / AGND / N1P"));
+    applyHeartRateSource (); // this device may be the heart rate's source
     updateSlotUi (s);
     refreshChrome (wallClockSeconds ());
 }
@@ -2171,15 +2190,35 @@ void MainWindow::updateStreamHealth (Slot &s, double now)
     s.pending = streaming && pending > 0;
 }
 
+const SignalChannel *MainWindow::heartRateChannel (const Slot &s) const
+{
+    for (const SignalChannel &ch : s.worker->channels ())
+        if (ch.spec.derived && (ch.spec.key == SignalKeys::CytonHeartRate || ch.spec.key == SignalKeys::EmotiHeartRate))
+            return &ch;
+    return nullptr;
+}
+
+// The heart-rate panel follows the rail's switch instead of plotForKey: both
+// devices compute a heart rate while they stream (the Cyton from the ECG's R
+// peaks, the EmotiBit from the PPG), and this picks the one on display.
+void MainWindow::applyHeartRateSource ()
+{
+    const bool ecg = hrSourceToggle_ && hrSourceToggle_->isChecked ();
+    const Slot &s = ecg ? cyton_ : emotibit_;
+    const SignalChannel *hr = heartRateChannel (s);
+    // ~1 sample per beat: the rate only sizes gaps and window margins
+    hrPlot_->setSource (0, hr ? hr->ring : nullptr, -1, 1.0, hr ? hr->spec.valueDecimals : 0);
+    hrPlot_->setNote (ecg ? QStringLiteral ("Heart rate from the R peaks of the Cyton ECG (display only, never recorded)")
+                          : QStringLiteral ("Heart rate from the EmotiBit PPG pulses (display only, never recorded)"));
+    updateHeartRate (wallClockSeconds ());
+}
+
 void MainWindow::updateHeartRate (double now)
 {
-    const Slot &s = emotibit_;
+    const Slot &s = hrSourceToggle_ && hrSourceToggle_->isChecked () ? cyton_ : emotibit_;
     const bool active = s.worker->isActive ();
     const bool streaming = s.worker->state () == DeviceWorker::Streaming && !s.stopRequested;
-    const SignalChannel *hr = nullptr;
-    for (const SignalChannel &ch : s.worker->channels ())
-        if (ch.spec.derived && ch.spec.key == SignalKeys::EmotiHeartRate)
-            hr = &ch;
+    const SignalChannel *hr = heartRateChannel (s);
     if (!streaming || !hr)
     {
         hrPlot_->setTone (PlotWidget::Tone::Off);

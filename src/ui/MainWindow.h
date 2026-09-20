@@ -26,6 +26,7 @@ class QTimer;
 class QWidget;
 class Banner;
 class DeviceWorker;
+struct SignalChannel;
 class MeterBar;
 class PlotWidget;
 class PortCombo;
@@ -59,6 +60,7 @@ struct LaunchOptions
     bool highPass = true; // 0.5 Hz
     bool notch = true;    // 60 Hz
     bool lowPass = true;  // 40 Hz
+    bool heartRateFromEcg = false; // heart rate from the Cyton ECG instead of the PPG
     // EmotiBit display filters (both on by default)
     bool ppgRemoveDc = true;      // PPG minus its 2 s trailing mean
     bool temperatureAverage = true; // temperature: 3 s trailing mean
@@ -77,6 +79,7 @@ struct LaunchOptions
     bool timeoutSet = false;
     bool windowSet = false;
     bool recordSet = false;
+    bool heartRateSet = false;
 
     // Test hooks (command line only; no UI): freeze EmotiBit polling after N s
     // of streaming, add a DC offset to the Cyton's raw display value, replace
@@ -84,6 +87,7 @@ struct LaunchOptions
     double testFreezeEmotibitSec = -1.0;
     double testRailOffsetUv = 0.0;
     double testPpgBpm = 0.0;
+    double testEcgBpm = 0.0;
     // --screenshot "connecting" only: hold the Cyton before prepare_session.
     int testCytonPrepareDelayMs = 0;
 };
@@ -201,6 +205,9 @@ private:
     void showErrorDialog (const Slot &s);
     void updateStreamHealth (Slot &s, double now);
     void updateHeartRate (double now);
+    // Binds the heart-rate panel to the selected device's derived HR ring.
+    void applyHeartRateSource ();
+    const SignalChannel *heartRateChannel (const Slot &s) const;
     void updateHeadroom (double now);
     double cytonRawPeak (double now); // max |raw ECG| over the last Readouts::kRailWindowSec
     void applyEcgChips ();
@@ -262,6 +269,7 @@ private:
     // rail: display
     Stepper *windowStepper_ = nullptr;
     ToggleSwitch *pauseToggle_ = nullptr;
+    ToggleSwitch *hrSourceToggle_ = nullptr;
     ToggleSwitch *synthToggle_ = nullptr;
     // rail: record
     RecordButton *recordBtn_ = nullptr;
