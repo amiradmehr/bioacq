@@ -4,7 +4,7 @@ A native C++ / Qt 6 app that streams an **OpenBCI Cyton** (one ECG channel) and 
 
 ## Get the app
 
-Download from the [releases](https://github.com/amiradmehr/bioacq/releases) (or check out the `mac` / `windows` branch, which holds the same build under `dist/`).
+Download from the [releases](https://github.com/amiradmehr/bioacq/releases) (or check out the `mac` / `windows` / `linux` branch, which holds the same build under `dist/`).
 
 * **macOS** (Apple silicon, macOS 26+): unzip `BioAcq-macos-arm64.zip`, move `BioAcq.app` to Applications and open it. The app is not notarised: if macOS refuses to open it, go to System Settings → Privacy & Security and click **Open Anyway**, or run `xattr -dr com.apple.quarantine BioAcq.app` first.
 * **Windows** (10/11 x64): unzip `BioAcq-windows-x64.zip`, keep the `BioAcq` folder together and run `BioAcq.exe`. If SmartScreen appears: More info → Run anyway.
@@ -97,7 +97,7 @@ For a Yocto image use the layer in [`yocto/`](yocto/README.md): Qt and BrainFlow
 
 * `src/`: `app` (entry point), `core` (buffers, readout rules), `dsp` (filters, heart rate), `devices` (BrainFlow worker, EmotiBit Bluetooth bridge and Wi-Fi discovery), `ui` (window, plots, theme), `tools` (selftest, probe), `platform` (sockets, serial ports, permissions).
 * `scripts/` builds, runs and packages; `resources/` holds fonts and icons; `third_party/` the BrainFlow patch, the EmotiBit firmware patch and the Qt licence texts; `yocto/` the `meta-bioacq` layer for embedded images; `design/` the visual spec.
-* Branches: `main` is the source; `mac` and `windows` are `main` plus the packaged app in `dist/`; features are developed on `feat/*` and merged into `main`.
+* Branches: `main` is the source; `mac`, `windows` and `linux` are the source plus the packaged app in `dist/`; features are developed on `feat/*` and merged into `main`.
 * CI builds, tests and packages on pushes to `main`, the platform branches and `feat/**`: `windows.yml` and `linux.yml`; `macos.yml` runs only on demand.
 
 ## Known limitations
