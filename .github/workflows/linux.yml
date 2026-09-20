@@ -1,0 +1,112 @@
+# Linux build: GCC + official Qt, patched BrainFlow (cached), the headless
+# selftest and screenshots on the PACKAGED folder, and the tarball as an
+# artifact. Linux minutes bill at 1x, so this is the cheap check of the shared
+# source; the Windows job is the expensive one.
+name: linux
+
+on:
+  push:
+    branches: [main, linux, 'feat/**']
+  workflow_dispatch:
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: build, selftest, package (Ubuntu 22.04 x86_64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      BRAINFLOW_ROOT: /home/runner/deps/brainflow-5.23.0
+      BIOACQ_BUILD_DIR: /home/runner/bioacq-build
+    steps:
+      - uses: actions/checkout@v4
+
+      # Qt's xcb platform plugin, the Bluetooth backend (D-Bus) and the serial
+      # backend (udev) need these at build and run time.
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build libgl1-mesa-dev libglu1-mesa-dev libudev-dev libdbus-1-dev \
+            libxkbcommon-dev libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
+            libxcb-xkb1 libxcb-xfixes0
+
+      - name: Qt 6.10 (gcc_64 + Serial Port + Connectivity)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.*'
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtserialport qtconnectivity
+          cache: true
+
+      - name: Tool versions
+        run: |
+          cmake --version | head -1
+          ninja --version
+          g++ --version | head -1
+          echo "Qt: $QT_ROOT_DIR"
+
+      - name: Restore BrainFlow
+        id: brainflow-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BRAINFLOW_ROOT }}
+          key: brainflow-5.23.0-linux-x86_64-${{ hashFiles('third_party/brainflow/emotibit-ancillary-upsample.patch', 'scripts/build_brainflow.sh') }}
+
+      - name: Build BrainFlow 5.23.0 (patched)
+        if: steps.brainflow-cache.outputs.cache-hit != 'true'
+        run: scripts/build_brainflow.sh "$BRAINFLOW_ROOT"
+
+      - name: Build and package BioAcq
+        env:
+          QT_PREFIX: ${{ env.QT_ROOT_DIR }}
+          BIOACQ_BUILD_DIR: /home/runner/bioacq-build-package
+        run: scripts/package_linux.sh
+
+      # package_linux.sh already runs --selftest and a --screenshot from inside
+      # the folder with Qt off the environment. This repeats the screenshot
+      # through the xcb plugin (the one a desktop session uses) on a virtual X
+      # server, which is what a double-click does on the board.
+      - name: Screenshot (xcb platform, Xvfb)
+        run: |
+          sudo apt-get install -y --no-install-recommends xvfb
+          mkdir -p ci-out
+          env -u QT_PLUGIN_PATH -u QML2_IMPORT_PATH LD_LIBRARY_PATH= \
+            xvfb-run -a --server-args="-screen 0 1600x1000x24" \
+            dist/linux/BioAcq/BioAcq --screenshot "$PWD/ci-out/bioacq-linux-idle.png" \
+              --state idle --size 1280x800
+          test -s ci-out/bioacq-linux-idle.png
+
+      - name: Screenshot (live, 1600x1000, offscreen)
+        run: |
+          env -u QT_PLUGIN_PATH -u QML2_IMPORT_PATH LD_LIBRARY_PATH= QT_QPA_PLATFORM=offscreen \
+            dist/linux/BioAcq/BioAcq --screenshot "$PWD/ci-out/bioacq-linux-live.png" \
+              --state live --size 1600x1000
+          test -s ci-out/bioacq-linux-live.png
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bioacq-linux-screenshot
+          path: ci-out/*.png
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: BioAcq-linux-x86_64
+          path: dist/BioAcq-linux-x86_64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

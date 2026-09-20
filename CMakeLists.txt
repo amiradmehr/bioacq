@@ -4,9 +4,12 @@ project(bioacq VERSION 1.0.0 LANGUAGES CXX)
 # ---------------------------------------------------------------------------
 # Native real-time streaming GUI: OpenBCI Cyton (serial) + EmotiBit (WiFi)
 # via BrainFlow, rendered with plain QPainter widgets (Qt6 Widgets).
-# Builds on macOS (Apple clang; Homebrew or official Qt) and Windows (MSVC
-# 2022; official Qt). See README.md "Building and packaging".
+# Builds on macOS (Apple clang; Homebrew or official Qt), Windows (MSVC 2022;
+# official Qt) and Linux, including cross-compiled Yocto images (GCC; Qt from
+# meta-qt6). See README.md "Building and packaging" and yocto/README.md.
 # ---------------------------------------------------------------------------
+
+include(GNUInstallDirs)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -16,6 +19,12 @@ endif()
 # record into <Documents>/BioAcq Recordings instead of the source tree, and on
 # macOS build BioAcq.app. Development builds keep the plain `bioacq` binary.
 option(BIOACQ_PACKAGED "Build for distribution (recordings in Documents, macOS app bundle)" OFF)
+# if(LINUX) needs CMake 3.25; the target system name works on 3.21 and is what
+# a Yocto toolchain file sets when cross-compiling for the board.
+set(BIOACQ_LINUX OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(BIOACQ_LINUX ON)
+endif()
 if(APPLE)
     # BioAcq.app exactly when packaged, decided on every configure: a separate
     # option() would take its default from BIOACQ_PACKAGED only in a new build
@@ -39,7 +48,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # located directly under BRAINFLOW_ROOT: the installed brainflowConfig.cmake
 # hard-codes the absolute prefix it was built for, which breaks relocated or
 # cached installs. Library names: libBoardController.dylib on macOS,
-# BoardController.lib + BoardController.dll on Windows.
+# libBoardController.so on Linux, BoardController.lib + BoardController.dll on
+# Windows. Upstream installs headers in inc/ and libraries in lib/; a packaged
+# BrainFlow (the Yocto recipe in yocto/meta-bioacq) uses the usual
+# include/brainflow + lib(64) layout, so both are searched.
 if(WIN32)
     set(_bf_default "$ENV{USERPROFILE}/brainflow")
 else()
@@ -60,19 +72,32 @@ endif()
 
 find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Widgets Network SerialPort Bluetooth)
 
-set(brainflow_INCLUDE_DIRS "${BRAINFLOW_ROOT}/inc")
-set(brainflow_LIBRARY_DIRS "${BRAINFLOW_ROOT}/lib")
-if(NOT EXISTS "${brainflow_INCLUDE_DIRS}/board_shim.h")
-    message(FATAL_ERROR "BrainFlow not found: no ${brainflow_INCLUDE_DIRS}/board_shim.h "
-        "(set BRAINFLOW_ROOT, or build it with scripts/build_brainflow.sh / scripts/build_brainflow.ps1)")
-endif()
-foreach(_bf_lib BoardController DataHandler MLModule Brainflow)
-    find_library(${_bf_lib}Path NAMES ${_bf_lib} lib${_bf_lib}
-        PATHS "${brainflow_LIBRARY_DIRS}" NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
-    if(NOT ${_bf_lib}Path)
-        message(FATAL_ERROR "BrainFlow library ${_bf_lib} not found under ${brainflow_LIBRARY_DIRS}")
+set(brainflow_INCLUDE_DIRS "")
+foreach(_bf_inc inc include/brainflow include)
+    if(EXISTS "${BRAINFLOW_ROOT}/${_bf_inc}/board_shim.h")
+        set(brainflow_INCLUDE_DIRS "${BRAINFLOW_ROOT}/${_bf_inc}")
+        break()
     endif()
 endforeach()
+if(NOT brainflow_INCLUDE_DIRS)
+    message(FATAL_ERROR "BrainFlow not found: no board_shim.h under ${BRAINFLOW_ROOT} (inc/, include/brainflow/) "
+        "(set BRAINFLOW_ROOT, or build it with scripts/build_brainflow.sh / scripts/build_brainflow.ps1)")
+endif()
+set(_bf_libdirs "")
+foreach(_bf_libdir lib "${CMAKE_INSTALL_LIBDIR}" lib64)
+    list(APPEND _bf_libdirs "${BRAINFLOW_ROOT}/${_bf_libdir}")
+endforeach()
+list(REMOVE_DUPLICATES _bf_libdirs)
+foreach(_bf_lib BoardController DataHandler MLModule Brainflow)
+    find_library(${_bf_lib}Path NAMES ${_bf_lib} lib${_bf_lib}
+        PATHS ${_bf_libdirs} NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+    if(NOT ${_bf_lib}Path)
+        message(FATAL_ERROR "BrainFlow library ${_bf_lib} not found under ${_bf_libdirs}")
+    endif()
+endforeach()
+# The folder the libraries really came from (lib/ upstream, ${libdir} packaged):
+# the Windows DLL copy and the macOS / Linux rpaths point at it.
+get_filename_component(brainflow_LIBRARY_DIRS "${BoardControllerPath}" DIRECTORY)
 message(STATUS "BrainFlow include: ${brainflow_INCLUDE_DIRS}")
 message(STATUS "BrainFlow libs:    ${brainflow_LIBRARY_DIRS}")
 
@@ -250,4 +275,50 @@ if(APPLE)
             set_source_files_properties("${_icns}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
         endif()
     endif()
+endif()
+
+# -------------------------------------------------------------------- Linux
+# Desktop Linux and cross-compiled Yocto images (yocto/meta-bioacq). Qt comes
+# from the distro / meta-qt6, BrainFlow from BRAINFLOW_ROOT.
+if(BIOACQ_LINUX)
+    find_package(Threads REQUIRED)
+    target_link_libraries(bioacq PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+
+    # The build tree runs as is (CMake adds the linked libraries' folders itself;
+    # this only spells out BrainFlow's).
+    #
+    # BIOACQ_LINUX_BUNDLE is what scripts/package_linux.sh installs with: the
+    # tree carries its own Qt and BrainFlow in lib/, so the binary in bin/ looks
+    # next door. A Yocto build leaves it off -- the image's own library path has
+    # everything, and an rpath into a standard directory only trips the
+    # packaging QA checks.
+    option(BIOACQ_LINUX_BUNDLE "Install a relocatable tree (rpath \$ORIGIN/../lib)" OFF)
+    set_target_properties(bioacq PROPERTIES BUILD_RPATH "${brainflow_LIBRARY_DIRS}")
+    if(BIOACQ_LINUX_BUNDLE)
+        set_target_properties(bioacq PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
+    else()
+        set_target_properties(bioacq PROPERTIES INSTALL_RPATH "")
+    endif()
+
+    # Freedesktop entry + hicolor icons, so an image with a desktop shell shows
+    # BioAcq in its launcher. The Linux target keeps the plain `bioacq` name.
+    set(BIOACQ_EXEC_NAME "bioacq")
+    configure_file(resources/linux/bioacq.desktop.in
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/bioacq.desktop" @ONLY)
+
+    install(TARGETS bioacq RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+    install(FILES "${CMAKE_CURRENT_BINARY_DIR}/generated/bioacq.desktop"
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
+    foreach(_px 32 128 256)
+        install(FILES "resources/linux/bioacq-${_px}.png"
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/${_px}x${_px}/apps"
+            RENAME bioacq.png)
+    endforeach()
+    install(FILES
+        resources/fonts/JetBrainsMono-OFL.txt
+        resources/fonts/Inter-OFL.txt
+        third_party/brainflow/LICENSE
+        third_party/qt/LGPL-3.0.txt
+        third_party/qt/GPL-3.0.txt
+        DESTINATION "${CMAKE_INSTALL_DOCDIR}/licenses")
 endif()

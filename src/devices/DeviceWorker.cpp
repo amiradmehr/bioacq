@@ -54,6 +54,18 @@ bool mayUseBluetooth (const DeviceConfig &cfg)
         (cfg.emotiLink == EmotiBitLink::Bluetooth || (cfg.emotiLink == EmotiBitLink::Auto && cfg.ownDiscovery));
 }
 
+// Appended to the serial-port error hints: what the OS needs to allow before a
+// port can be opened. Only Linux ties that to a group membership.
+QString serialPermissionHint ()
+{
+#ifdef __linux__
+    return QStringLiteral (" On Linux this user also needs access to the port: add it to the dialout "
+                           "group (sudo usermod -aG dialout $USER), then log in again.");
+#else
+    return QString ();
+#endif
+}
+
 QString cleanWhat (const BrainFlowException &e)
 {
     std::string w = e.what ();
@@ -359,7 +371,8 @@ QString DeviceWorker::describeError (int code, int boardId)
         case BrainFlowExitCodes::SET_PORT_ERROR:
             if (cyton)
                 hint = "Cannot open the serial port. Check the dongle is plugged in and that no "
-                       "other program (OpenBCI GUI, a serial monitor) has it open.";
+                       "other program (OpenBCI GUI, a serial monitor) has it open." +
+                    serialPermissionHint ();
             else if (emotibit)
                 hint = emotibitNetworkHint () + "\n" + verbose;
             else
@@ -407,10 +420,15 @@ namespace
 // What the OS needs to allow before UDP to the EmotiBit gets through.
 QString networkPermissionHint ()
 {
-#ifdef _WIN32
+#if defined(_WIN32)
     return QStringLiteral (
         "Windows Defender Firewall allows BioAcq on this network (accept the firewall prompt, or allow it "
         "under Windows Security > Firewall & network protection > Allow an app through firewall)");
+#elif defined(__linux__)
+    return QStringLiteral (
+        "the firewall passes the EmotiBit's UDP traffic (advertising on port 3131 and the data port it "
+        "answers with): check firewalld / ufw / iptables, and that the interface is up and on the "
+        "EmotiBit's subnet");
 #else
     return QStringLiteral (
         "macOS allows Local Network access for the app that launched this program (System Settings > "

@@ -41,4 +41,9 @@ void request (QObject *context, const std::function<void (Status)> &done);
 // event loop never drains, so this also runs the CoreFoundation run loop.
 Status requestAndWait (const std::function<bool ()> &stop);
 
+// Appended to Bluetooth failures the OS stack causes (an adapter that is off or
+// missing): empty where the OS keeps that out of the user's hands, a BlueZ note
+// on Linux. Starts with a space, so it appends to a sentence.
+QString stackHint ();
+
 } // namespace bluetooth_access

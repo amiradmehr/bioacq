@@ -1,0 +1,4 @@
+# The OpenBCI Cyton USB dongle (FTDI FT231X). BioAcq only enumerates ports
+# through udev and opens the one dongle it finds, so the rule just makes the
+# node readable without root and gives it a stable name.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", MODE="0660", GROUP="dialout", SYMLINK+="openbci-dongle"

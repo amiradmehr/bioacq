@@ -8,6 +8,7 @@ Download from the [releases](https://github.com/amiradmehr/bioacq/releases) (or 
 
 * **macOS** (Apple silicon, macOS 26+): unzip `BioAcq-macos-arm64.zip`, move `BioAcq.app` to Applications and open it. The app is not notarised: if macOS refuses to open it, go to System Settings → Privacy & Security and click **Open Anyway**, or run `xattr -dr com.apple.quarantine BioAcq.app` first.
 * **Windows** (10/11 x64): unzip `BioAcq-windows-x64.zip`, keep the `BioAcq` folder together and run `BioAcq.exe`. If SmartScreen appears: More info → Run anyway.
+* **Linux** (x86_64, glibc 2.35+): untar `BioAcq-linux-x86_64.tar.gz`, keep the `BioAcq` folder together and run `./BioAcq`. Add yourself to the `dialout` group for the Cyton dongle (`sudo usermod -aG dialout $USER`, then log in again). For an embedded image, build the Yocto layer instead ([yocto/README.md](yocto/README.md)).
 
 ## Connect
 
@@ -17,6 +18,7 @@ Close the OpenBCI GUI and EmotiBit Oscilloscope, then press **Connect** (⌘K / 
 
 **EmotiBit (Bluetooth).** The EmotiBit needs the bioacq Bluetooth firmware ([third_party/emotibit-firmware](third_party/emotibit-firmware/README.md)). Switch it on, keep it near the computer and press Connect.
 * macOS asks for Bluetooth access on the first Connect, and again after a new version is installed. Click Allow. If it was refused, turn BioAcq on under System Settings → Privacy & Security → Bluetooth.
+* Linux needs BlueZ: `bluetoothd` running and the adapter unblocked (`rfkill unblock bluetooth`).
 * If the link drops, the plots show `STALLED` and BioAcq reconnects on its own; a recording continues with a gap.
 * With several EmotiBits around, the one used last is preferred.
 
@@ -45,7 +47,7 @@ Close the OpenBCI GUI and EmotiBit Oscilloscope, then press **Connect** (⌘K / 
 
 ## Command line
 
-On macOS run the binary inside the app (`/Applications/BioAcq.app/Contents/MacOS/BioAcq`); for Bluetooth start it with `open -a BioAcq --args …`, since macOS only allows Bluetooth for the app itself. On Windows use `start /wait BioAcq.exe …` or `scripts\run_cli_windows.ps1` to see output and exit codes. `--help` lists everything.
+On macOS run the binary inside the app (`/Applications/BioAcq.app/Contents/MacOS/BioAcq`); for Bluetooth start it with `open -a BioAcq --args …`, since macOS only allows Bluetooth for the app itself. On Windows use `start /wait BioAcq.exe …` or `scripts\run_cli_windows.ps1` to see output and exit codes. On Linux run `bioacq` (or `./BioAcq` in the unpacked folder) like any other program. `--help` lists everything.
 
 | Command | What it does |
 |---|---|
@@ -77,6 +79,16 @@ scripts\build_brainflow.ps1
 scripts\package_windows.ps1 -QtPrefix C:\Qt\6.10.2\msvc2022_64    # dist\windows\BioAcq\BioAcq.exe
 ```
 
+Linux, with Qt 6 (Base, Serial Port, Connectivity), CMake 3.21+, Ninja and a C++17 compiler — on Debian/Ubuntu `qt6-base-dev qt6-serialport-dev qt6-connectivity-dev libgl1-mesa-dev libudev-dev`:
+
+```bash
+scripts/build_brainflow.sh      # same patched BrainFlow, into ~/.local/brainflow
+scripts/run.sh                  # build and start
+scripts/package_linux.sh        # dist/linux/BioAcq and dist/BioAcq-linux-x86_64.tar.gz
+```
+
+For a Yocto image use the layer in [`yocto/`](yocto/README.md): Qt and BrainFlow come from the image, so BioAcq is a normal package and nothing is bundled.
+
 * BrainFlow needs one local fix for the EmotiBit temperature ([third_party/brainflow](third_party/brainflow/README.md)); the scripts apply it.
 * The development binary started from a terminal can't use Bluetooth on macOS. Use `--synthetic`, `--emotibit-link wifi`, or package the app and `open` it.
 * The packages are self-contained: Qt, BrainFlow and their licences are inside. The macOS package is signed ad hoc and needs macOS 26 when built with Homebrew Qt.
@@ -84,9 +96,9 @@ scripts\package_windows.ps1 -QtPrefix C:\Qt\6.10.2\msvc2022_64    # dist\windows
 ## Repository
 
 * `src/`: `app` (entry point), `core` (buffers, readout rules), `dsp` (filters, heart rate), `devices` (BrainFlow worker, EmotiBit Bluetooth bridge and Wi-Fi discovery), `ui` (window, plots, theme), `tools` (selftest, probe), `platform` (sockets, serial ports, permissions).
-* `scripts/` builds, runs and packages; `resources/` holds fonts and icons; `third_party/` the BrainFlow patch, the EmotiBit firmware patch and the Qt licence texts; `design/` the visual spec.
+* `scripts/` builds, runs and packages; `resources/` holds fonts and icons; `third_party/` the BrainFlow patch, the EmotiBit firmware patch and the Qt licence texts; `yocto/` the `meta-bioacq` layer for embedded images; `design/` the visual spec.
 * Branches: `main` is the source; `mac` and `windows` are `main` plus the packaged app in `dist/`; features are developed on `feat/*` and merged into `main`.
-* CI (`.github/workflows/windows.yml`) builds, tests and packages the Windows app on pushes to `main`, `windows` and `feat/**`; `macos.yml` runs only on demand.
+* CI builds, tests and packages on pushes to `main`, the platform branches and `feat/**`: `windows.yml` and `linux.yml`; `macos.yml` runs only on demand.
 
 ## Known limitations
 
@@ -95,3 +107,4 @@ scripts\package_windows.ps1 -QtPrefix C:\Qt\6.10.2\msvc2022_64    # dist\windows
 * BrainFlow's nominal EmotiBit rates (25 / 25 / 15 Hz) are placeholders, and the temperature is sample-and-hold.
 * The heart rate is not validated against ECG on people; sustained movement reads `NO PULSE` or `IRREGULAR`.
 * Windows: a recording folder with non-ASCII characters gets a garbled name; use `--record-dir` with an ASCII path.
+* Linux is built and tested in CI (selftest and screenshots), but neither device has been tried on it with real hardware, and the Yocto recipes have not been run through a build yet.

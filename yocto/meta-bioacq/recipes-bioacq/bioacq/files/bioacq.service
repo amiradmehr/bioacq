@@ -1,0 +1,27 @@
+# BioAcq on an image with no desktop session: Qt draws straight to the display
+# through the EGLFS platform plugin. Override the platform (linuxfb on a plain
+# framebuffer, wayland under Weston) and the user with a drop-in:
+#   systemctl edit bioacq.service
+#
+# Not enabled by default; turn it on per image with
+# SYSTEMD_AUTO_ENABLE:pn-bioacq = "enable", or at runtime with
+# systemctl enable --now bioacq.
+[Unit]
+Description=BioAcq biosignal viewer
+After=bluetooth.target network.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+Environment=QT_QPA_PLATFORM=eglfs
+Environment=QT_QPA_EGLFS_ALWAYS_SET_MODE=1
+ExecStart=/usr/bin/bioacq
+Restart=on-failure
+RestartSec=5
+# The serial dongle and the recordings folder; root keeps this simple on a
+# single-purpose image. Run as a normal user in the dialout group otherwise.
+User=root
+WorkingDirectory=/home/root
+
+[Install]
+WantedBy=multi-user.target

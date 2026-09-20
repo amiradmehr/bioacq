@@ -990,7 +990,7 @@ void unitChecks (Checker &check)
 #ifdef _WIN32
         const QString missing = QStringLiteral ("COM250");
 #else
-        const QString missing = QStringLiteral ("/dev/cu.bioacq-selftest-missing");
+        const QString missing = QStringLiteral ("/dev/bioacq-selftest-missing");
 #endif
         check (donglesFirst && names && !serialPortExists (QString ()) && !serialPortExists (missing) &&
                 worstMs < 250.0,

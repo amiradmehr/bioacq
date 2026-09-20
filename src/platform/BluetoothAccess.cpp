@@ -100,6 +100,16 @@ void request (QObject *context, const std::function<void (Status)> &done)
 #endif
 }
 
+QString stackHint ()
+{
+#ifdef Q_OS_LINUX
+    return QStringLiteral (" (BlueZ: check that bluetoothd runs -- systemctl status bluetooth -- and that the "
+                           "adapter is not blocked -- rfkill unblock bluetooth)");
+#else
+    return QString ();
+#endif
+}
+
 Status requestAndWait (const std::function<bool ()> &stop)
 {
     Status out = check ();

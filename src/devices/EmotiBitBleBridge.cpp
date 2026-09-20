@@ -1,5 +1,7 @@
 #include "EmotiBitBleBridge.h"
 
+#include "BluetoothAccess.h"
+
 #include <QBluetoothDeviceDiscoveryAgent>
 #include <QBluetoothDeviceInfo>
 #include <QBluetoothUuid>
@@ -72,9 +74,10 @@ public:
                 if (e == QBluetoothDeviceDiscoveryAgent::MissingPermissionsError)
                     fail (QStringLiteral ("Bluetooth access is not allowed for this app"));
                 else if (e == QBluetoothDeviceDiscoveryAgent::PoweredOffError)
-                    fail (QStringLiteral ("Bluetooth is turned off"));
+                    fail (QStringLiteral ("Bluetooth is turned off") + bluetooth_access::stackHint ());
                 else
-                    fail (QStringLiteral ("Bluetooth scan failed: %1").arg (agent_->errorString ()));
+                    fail (QStringLiteral ("Bluetooth scan failed: %1").arg (agent_->errorString ()) +
+                        bluetooth_access::stackHint ());
             });
         connect (agent_, &QBluetoothDeviceDiscoveryAgent::finished, this, [this] {
             if (shared_->state.load () != Scanning)

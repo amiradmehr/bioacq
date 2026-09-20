@@ -4,20 +4,31 @@
 #   scripts/build.sh --clean    wipe the build dir first
 # Build dir: $BIOACQ_BUILD_DIR (legacy alias STREAM_GUI_BUILD_DIR), default ~/.local/build/bioacq
 # This is the development build (plain `bioacq` binary). For the double-clickable
-# BioAcq.app use scripts/package_macos.sh; on Windows scripts/package_windows.ps1.
+# BioAcq.app use scripts/package_macos.sh; on Windows scripts/package_windows.ps1;
+# for a relocatable Linux folder scripts/package_linux.sh.
+#
+# macOS takes Qt from Homebrew by default; Linux takes the distro's Qt 6 (set
+# QT_PREFIX for an official Qt install, e.g. ~/Qt/6.10.0/gcc_64).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BIOACQ_BUILD_DIR:-${STREAM_GUI_BUILD_DIR:-$HOME/.local/build/bioacq}}"
 BRAINFLOW_ROOT="${BRAINFLOW_ROOT:-$HOME/.local/brainflow}"
-QT_PREFIX="${QT_PREFIX:-/opt/homebrew/opt/qt}"
-export PATH="/opt/homebrew/bin:$PATH"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    QT_PREFIX="${QT_PREFIX:-/opt/homebrew/opt/qt}"
+else
+    QT_PREFIX="${QT_PREFIX:-}" # distro Qt: found through CMake's own search
+fi
+if [[ -d /opt/homebrew/bin ]]; then
+    export PATH="/opt/homebrew/bin:$PATH"
+fi
 
 if [[ "${1:-}" == "--clean" ]]; then
     rm -rf "$BUILD_DIR"
 fi
 
-if [[ ! -f "$BRAINFLOW_ROOT/inc/board_shim.h" ]]; then
+# inc/ is BrainFlow's own install layout; include/brainflow/ is a packaged one.
+if [[ ! -f "$BRAINFLOW_ROOT/inc/board_shim.h" && ! -f "$BRAINFLOW_ROOT/include/brainflow/board_shim.h" ]]; then
     echo "error: BrainFlow not found at $BRAINFLOW_ROOT (set BRAINFLOW_ROOT, or run scripts/build_brainflow.sh)" >&2
     exit 1
 fi
@@ -27,12 +38,16 @@ mkdir -p "$BUILD_DIR"
 # (BIOACQ_PACKAGED=ON builds BioAcq.app, not the bioacq binary run.sh starts).
 if [[ ! -f "$BUILD_DIR/CMakeCache.txt" || ! -f "$BUILD_DIR/build.ninja" ]] ||
     grep -q '^BIOACQ_PACKAGED:BOOL=ON$' "$BUILD_DIR/CMakeCache.txt"; then
+    prefix_path="$BRAINFLOW_ROOT"
+    if [[ -n "$QT_PREFIX" ]]; then
+        prefix_path="$QT_PREFIX;$BRAINFLOW_ROOT"
+    fi
     cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DBIOACQ_PACKAGED=OFF \
         -DBRAINFLOW_ROOT="$BRAINFLOW_ROOT" \
         -DQT_PREFIX="$QT_PREFIX" \
-        -DCMAKE_PREFIX_PATH="$QT_PREFIX;$BRAINFLOW_ROOT"
+        -DCMAKE_PREFIX_PATH="$prefix_path"
 fi
 
 cmake --build "$BUILD_DIR" --parallel
