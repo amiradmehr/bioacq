@@ -1,6 +1,6 @@
 # BioAcq
 
-A native C++ / Qt 6 app that streams an **OpenBCI Cyton** (one ECG channel) and an **EmotiBit** (PPG, temperature, IMU) through BrainFlow and plots them live, with ECG filters, a heart rate from the PPG, stream-health readouts and CSV recording. One Connect button opens both devices.
+A native C++ / Qt 6 app that streams an **OpenBCI Cyton** (one ECG channel) and an **EmotiBit** (PPG, temperature, IMU) through BrainFlow and plots them live, with ECG filters, a heart rate from either device, stream-health readouts and CSV recording. One Connect button opens both devices.
 
 ## Get the app
 
@@ -32,7 +32,7 @@ Close the OpenBCI GUI and EmotiBit Oscilloscope, then press **Connect** (⌘K / 
 * **EmotiBit filters** (display only, both on): *PPG DC removal* shows each PPG signal minus its 2 s moving average, so the pulses sit around 0 without the DC level or slow drift; *Temperature moving average* smooths the temperature over 3 s.
 * **Rail headroom** is how far the raw ECG of the last 2 s stays from the ±187.5 mV input range. Below 10 % it turns amber and the plot shows the raw signal; at full scale it reads `SATURATED` (check electrode contact).
 * **Stream health:** each plot header shows the measured / nominal rate. `STALLED` means no samples for over a second; `HELD` means the device waits while the other one connects (BrainFlow does one device setup at a time) and catches up afterwards. `DROPPED` in the status bar counts lost Cyton packets.
-* **Heart rate** comes from the PPG and is display-only (not recorded). It shows the rate, the PPG channel used and a quality score; otherwise `ACQUIRING`, `NO PULSE`, `IRREGULAR` or `NO DATA` says why there is no value. The first value takes about 5 s.
+* **Heart rate** is display-only (never recorded) and comes from the EmotiBit's PPG pulses or, with the rail's **Heart rate from ECG** switch, from the R peaks of the Cyton's ECG. Both devices compute it while they stream, so the switch takes effect at once; the `SOURCE` chip names what is shown (`GREEN` / `RED` / `IR` or `ECG`). Otherwise `ACQUIRING`, `NO PULSE`, `IRREGULAR` or `NO DATA` says why there is no value. The first value takes about 5 s.
 * **Simulate devices** (switch on the start screen) runs both slots on BrainFlow's synthetic board, without hardware.
 * Settings (port choice, filters, time window, record arm, last EmotiBit) are remembered between runs.
 
@@ -59,7 +59,7 @@ On macOS run the binary inside the app (`/Applications/BioAcq.app/Contents/MacOS
 | `--list-ports` | serial ports, OpenBCI dongles first |
 | `--emotibit-wifi-list` | the Wi-Fi networks saved on the EmotiBit, read over USB (restarts it) |
 
-Options: `--port <port>`, `--emotibit-link bluetooth|wifi|auto`, `--ip <address>`, `--timeout <s>`, `--record`, `--record-dir <dir>`, `--window <s>`, `--verbose`.
+Options: `--port <port>`, `--emotibit-link bluetooth|wifi|auto`, `--ip <address>`, `--timeout <s>`, `--heart-rate ppg|ecg`, `--record`, `--record-dir <dir>`, `--window <s>`, `--verbose`.
 
 ## Build from source
 
@@ -105,6 +105,6 @@ For a Yocto image use the layer in [`yocto/`](yocto/README.md): Qt and BrainFlow
 * The EmotiBit's Bluetooth link is not paired or encrypted: while no other computer is connected, anyone nearby running BioAcq can connect. Range is about 10 m. Bluetooth has not been tried with the EmotiBit on Windows, and neither device has been tried with real hardware on Windows.
 * BrainFlow sets up one device at a time, so the other device shows `HELD` for a few seconds during a connect.
 * BrainFlow's nominal EmotiBit rates (25 / 25 / 15 Hz) are placeholders, and the temperature is sample-and-hold.
-* The heart rate is not validated against ECG on people; sustained movement reads `NO PULSE` or `IRREGULAR`.
+* Neither heart rate is validated against a clinical monitor. The PPG one reads `NO PULSE` or `IRREGULAR` during sustained movement; the ECG one needs a clean single-lead signal (its beats sit a fixed ~30 ms after the R peak, which does not affect the rate).
 * Windows: a recording folder with non-ASCII characters gets a garbled name; use `--record-dir` with an ASCII path.
 * Linux is built and tested in CI (selftest and screenshots), but neither device has been tried on it with real hardware, and the Yocto recipes have not been run through a build yet.

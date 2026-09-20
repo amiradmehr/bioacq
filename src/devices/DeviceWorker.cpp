@@ -916,17 +916,24 @@ void DeviceWorker::pollLoop (
     ptrs.reserve (8);
     int lastPkg = -1;
 
-    // Heart rate from the PPG channels (display samples, after re-timing).
+    // Heart rate: from the PPG channels (display samples, after re-timing) or,
+    // on the Cyton, from the ECG's R peaks. Both devices compute it whenever
+    // they stream; the GUI picks which one the panel shows.
     SignalChannel *hrChannel = nullptr;
-    double ppgRate = 25.0;
+    double hrRate = 25.0;
+    HeartRate::Mode hrMode = HeartRate::Mode::Ppg;
     for (SignalChannel &ch : chans)
     {
-        if (ch.spec.derived && ch.spec.key == SignalKeys::EmotiHeartRate)
+        if (ch.spec.derived && (ch.spec.key == SignalKeys::EmotiHeartRate || ch.spec.key == SignalKeys::CytonHeartRate))
+        {
             hrChannel = &ch;
+            if (ch.spec.key == SignalKeys::CytonHeartRate)
+                hrMode = HeartRate::Mode::Ecg;
+        }
         if (ch.spec.heartRateInput >= 0 && ch.spec.nominalRate > 0.0)
-            ppgRate = ch.spec.nominalRate;
+            hrRate = ch.spec.nominalRate;
     }
-    HeartRate::Tracker hrTracker (ppgRate);
+    HeartRate::Tracker hrTracker (hrRate, hrMode);
     std::vector<HeartRate::Sample> hrOut;
     std::vector<double> ppgTest; // test hook: synthetic PPG values
 
@@ -1058,7 +1065,17 @@ void DeviceWorker::pollLoop (
 
                 if (ch.spec.heartRateInput >= 0 && hrChannel)
                 {
-                    if (cfg.testPpgBpm > 0.0)
+                    if (cfg.testEcgBpm > 0.0 && hrMode == HeartRate::Mode::Ecg)
+                    {
+                        // test hook: a synthetic ECG (P, QRS, T) with slow wander
+                        ppgTest.resize (static_cast<std::size_t> (m));
+                        for (int k = 0; k < m; ++k)
+                            ppgTest[static_cast<std::size_t> (k)] =
+                                HeartRate::syntheticEcg (ts[k], cfg.testEcgBpm, 800.0) +
+                                60.0 * std::sin (2.0 * M_PI * 0.25 * ts[k]);
+                        ptrs[0] = ppgTest.data ();
+                    }
+                    else if (cfg.testPpgBpm > 0.0 && hrMode == HeartRate::Mode::Ppg)
                     {
                         // test hook: a distinct synthetic waveform per PPG colour
                         static constexpr double dc[3] = {118000.0, 64000.0, 152000.0};

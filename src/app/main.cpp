@@ -76,6 +76,9 @@ struct Args
     double testStallSec = -1.0;
     double testRailOffsetUv = 0.0;
     double testPpgBpm = 0.0;
+    double testEcgBpm = 0.0;
+    bool heartRateFromEcg = false;
+    bool heartRateSet = false;
     bool testWifiRead = false; // --state wifi: press "read saved networks" (real EmotiBit over USB)
     QString error;
 };
@@ -197,6 +200,19 @@ Args parseArgs (int argc, char **argv)
             a.testWifiRead = true;
         else if (s == "--test-ppg-bpm")
             a.testPpgBpm = std::clamp (value ("--test-ppg-bpm").toDouble (), 0.0, 220.0);
+        else if (s == "--heart-rate")
+        {
+            const QString v = value ("--heart-rate").toLower ();
+            a.heartRateSet = true;
+            if (v == QLatin1String ("ecg"))
+                a.heartRateFromEcg = true;
+            else if (v == QLatin1String ("ppg"))
+                a.heartRateFromEcg = false;
+            else
+                a.error = QStringLiteral ("unknown --heart-rate '%1' (ppg|ecg)").arg (v);
+        }
+        else if (s == "--test-ecg-bpm")
+            a.testEcgBpm = std::clamp (value ("--test-ecg-bpm").toDouble (), 0.0, 220.0);
         else if (s == "--no-cyton")
             a.noCyton = true;
         else if (s == "--no-emotibit")
@@ -259,6 +275,8 @@ void usage ()
         "  --record                  arm recording: each device records from its first sample\n"
         "  --record-dir <dir>        recording folder (default %s)\n"
         "  --window <s>              plot window length, 1-60 (default 10)\n"
+        "  --heart-rate ppg|ecg      where the heart-rate panel takes its beats from (default ppg: the\n"
+        "                            EmotiBit's pulses; ecg: the R peaks of the Cyton's ECG)\n"
         "  --no-cyton / --no-emotibit   probe only one device\n"
         "  --verbose                 BrainFlow log level INFO (stderr)\n\n"
         "test hooks (display only, never in the UI):\n"
@@ -267,7 +285,9 @@ void usage ()
         "  --test-wifi-read          with --screenshot --state wifi: press \"read saved networks\" and capture\n"
         "                            the result (talks to the real EmotiBit over USB and restarts it)\n"
         "  --test-ppg-bpm <bpm>      replace the EmotiBit PPG display values with a synthetic pulse\n"
-        "                            (drives the heart-rate panel)\n",
+        "                            (drives the heart-rate panel from the PPG)\n"
+        "  --test-ecg-bpm <bpm>      replace the Cyton ECG display values with a synthetic ECG\n"
+        "                            (drives the heart-rate panel from the ECG's R peaks)\n",
         BIOACQ_VERSION, kMaxDiscoveryTimeoutSec, qPrintable (QDir::toNativeSeparators (defaultRecordDir ())));
 }
 
@@ -377,9 +397,12 @@ int main (int argc, char **argv)
     lo.timeoutSet = a.timeoutSet;
     lo.windowSet = a.window > 0;
     lo.recordSet = a.record;
+    lo.heartRateSet = a.heartRateSet;
     lo.testFreezeEmotibitSec = a.testStallSec;
     lo.testRailOffsetUv = a.testRailOffsetUv;
     lo.testPpgBpm = a.testPpgBpm;
+    lo.testEcgBpm = a.testEcgBpm;
+    lo.heartRateFromEcg = a.heartRateFromEcg;
 
     // --screenshot states: set up the real code paths that produce each state.
     std::unique_ptr<QTemporaryDir> tmpRecord;
@@ -395,6 +418,8 @@ int main (int argc, char **argv)
             lo.testCytonPrepareDelayMs = 8000; // both devices still connecting at the capture
         if ((a.state == QLatin1String ("live") || a.state == QLatin1String ("recording")) && lo.testPpgBpm <= 0.0)
             lo.testPpgBpm = 72.0; // the synthetic board's PPG is noise: no heart rate without it
+        if ((a.state == QLatin1String ("live") || a.state == QLatin1String ("recording")) && lo.testEcgBpm <= 0.0)
+            lo.testEcgBpm = 72.0; // ... and its ECG is a 5 Hz sine: no R peaks without it
         if (a.state == QLatin1String ("warning"))
         {
             if (lo.testFreezeEmotibitSec < 0.0)
@@ -408,7 +433,7 @@ int main (int argc, char **argv)
             lo.recordDir = tmpRecord->path ();
         }
     }
-    if (lo.testFreezeEmotibitSec >= 0.0 || lo.testRailOffsetUv != 0.0 || lo.testPpgBpm > 0.0)
+    if (lo.testFreezeEmotibitSec >= 0.0 || lo.testRailOffsetUv != 0.0 || lo.testPpgBpm > 0.0 || lo.testEcgBpm > 0.0)
     {
         QStringList hooks;
         if (lo.testFreezeEmotibitSec >= 0.0)
@@ -417,6 +442,8 @@ int main (int argc, char **argv)
             hooks << QStringLiteral ("Cyton raw offset");
         if (lo.testPpgBpm > 0.0)
             hooks << QStringLiteral ("synthetic PPG pulse at %1 bpm").arg (lo.testPpgBpm);
+        if (lo.testEcgBpm > 0.0)
+            hooks << QStringLiteral ("synthetic ECG at %1 bpm").arg (lo.testEcgBpm);
         std::fprintf (stderr, "bioacq: TEST HOOK ACTIVE (%s) -- display data is modified\n",
             qPrintable (hooks.join (QStringLiteral (", "))));
     }

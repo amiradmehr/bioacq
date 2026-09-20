@@ -448,8 +448,87 @@ HrSimResult simulateHeartRate (const PpgChannelSim ch[HeartRate::kSources], doub
     return r;
 }
 
+// Synthetic ECG through the Cyton's rate into a Mode::Ecg tracker: R amplitude
+// in uV (negative = reversed electrodes), mains-ish noise and baseline wander.
+HrSimResult simulateEcgHeartRate (double bpm, double seconds, double rAmplitude, unsigned seed, double noiseUv = 25.0)
+{
+    const double fs = 250.0, t0 = kHrSimT0;
+    std::mt19937 rng (seed);
+    std::normal_distribution<double> noise (0.0, 1.0);
+    HeartRate::Tracker tracker (fs, HeartRate::Mode::Ecg);
+    HrSimResult r;
+    double t[10], x[10];
+    int k = 0;
+    const int n = static_cast<int> (seconds * fs);
+    for (int i = 0; i < n; ++i)
+    {
+        const double ti = i / fs;
+        t[k] = t0 + ti;
+        double v = bpm > 0.0 ? HeartRate::syntheticEcg (ti, bpm, rAmplitude) : 0.0;
+        v += 0.25 * std::fabs (rAmplitude) * std::sin (2.0 * M_PI * 0.3 * ti); // baseline wander
+        v += 50.0 * std::sin (2.0 * M_PI * 60.0 * ti);                         // mains
+        v += noiseUv * noise (rng);
+        x[k] = v;
+        if (++k < 10)
+            continue;
+        k = 0;
+        tracker.process (0, t, x, 10);
+        tracker.update (t[9], r.samples);
+    }
+    return r;
+}
+
 void heartRateChecks (Checker &check)
 {
+    // Heart rate from the ECG (Mode::Ecg): the Cyton's 250 Hz R peaks.
+    for (double bpm : {48.0, 72.0, 150.0})
+    {
+        const HrSimResult r = simulateEcgHeartRate (bpm, 20.0, 1000.0, static_cast<unsigned> (bpm));
+        const HeartRate::Sample *s = r.lastValid ();
+        check (s && std::fabs (s->bpm - bpm) <= 1.0 && s->source == HeartRate::SourceEcg &&
+                std::isfinite (r.samples.back ().bpm),
+            fmt ("heart rate from ECG: %.0f bpm synthetic ECG at 250 Hz (wander, 60 Hz mains, noise) -> %.2f bpm, "
+                 "quality %.0f %%",
+                bpm, s ? s->bpm : std::numeric_limits<double>::quiet_NaN (), s ? 100.0 * s->quality : 0.0));
+    }
+    {
+        // reversed electrodes (R points down) and a flat / noise-only input
+        const HrSimResult inv = simulateEcgHeartRate (72.0, 20.0, -1000.0, 7);
+        const HeartRate::Sample *si = inv.lastValid ();
+        const HrSimResult none = simulateEcgHeartRate (0.0, 20.0, 1000.0, 9);
+        check (si && std::fabs (si->bpm - 72.0) <= 1.0 && none.validCount () == 0,
+            fmt ("heart rate from ECG: a reversed R peak still reads %.2f bpm (rectified QRS band); "
+                 "noise and wander alone give no rate",
+                si ? si->bpm : std::numeric_limits<double>::quiet_NaN ()));
+    }
+    {
+        // the beats sit on the R peaks, not on T waves half a beat away
+        HeartRate::BeatDetector d (250.0, HeartRate::Mode::Ecg);
+        std::vector<double> t, x;
+        for (int i = 0; i < 2500; ++i) // 10 s at 72 bpm
+        {
+            t.push_back (kHrSimT0 + i / 250.0);
+            x.push_back (HeartRate::syntheticEcg (i / 250.0, 72.0, 1000.0));
+        }
+        d.process (t.data (), x.data (), t.size ());
+        // The rectified QRS band has several lobes, so a beat sits a fixed
+        // offset from the R peak; only the spread would disturb the intervals.
+        double lo = 1e9, hi = -1e9;
+        int n = 0;
+        for (double b : d.beats ())
+        {
+            const double rel = b - kHrSimT0;
+            if (rel < 2.0)
+                continue; // filters settling
+            ++n;
+            const double off = rel - HeartRate::ecgRTime (rel + 0.3, 72.0);
+            lo = std::min (lo, off);
+            hi = std::max (hi, off);
+        }
+        check (n >= 8 && std::fabs (hi) < 0.06 && hi - lo < 0.006,
+            fmt ("heart rate from ECG: %.0f beats sit %.0f ms after the R peak (spread %.1f ms), never on the T wave",
+                double (n), 1000.0 * hi, 1000.0 * (hi - lo)));
+    }
     // A clean-ish green channel at each rate; red noisier, IR noise only.
     for (double bpm : {60.0, 72.0, 120.0, 180.0})
     {
@@ -801,16 +880,17 @@ void unitChecks (Checker &check)
         std::vector<std::string> problems;
         const auto cy = resolveSignals (realBoardIdFor (DeviceKind::Cyton), signalDefsFor (DeviceKind::Cyton), &problems);
         const auto em = resolveSignals (realBoardIdFor (DeviceKind::EmotiBit), signalDefsFor (DeviceKind::EmotiBit), &problems);
-        bool ok = problems.empty () && cy.size () == 1 && em.size () == 8 && cy.front ().key == SignalKeys::CytonEcg &&
-            cy.front ().filterable;
+        bool ok = problems.empty () && cy.size () == 2 && em.size () == 8 && cy.front ().key == SignalKeys::CytonEcg &&
+            cy.front ().filterable && cy.front ().heartRateInput == 0 && cy.back ().key == SignalKeys::CytonHeartRate &&
+            cy.back ().derived;
         std::string detail;
-        for (const auto &s : cy)
-            detail += s.key + "=" + presetName (s.preset) + rowsStr (s.rows) + " ";
-        for (const auto &s : em)
-        {
-            detail += s.key + "=" + (s.derived ? std::string ("derived") : presetName (s.preset) + rowsStr (s.rows)) + " ";
-            ok = ok && !s.substituted;
-        }
+        for (const auto &list : {cy, em})
+            for (const auto &s : list)
+            {
+                detail +=
+                    s.key + "=" + (s.derived ? std::string ("derived") : presetName (s.preset) + rowsStr (s.rows)) + " ";
+                ok = ok && !s.substituted;
+            }
         check (ok, "real board mapping: " + detail);
         // BrainFlow's emotibit.cpp writes PPG_INFRARED to ppg_channels[0], PPG_RED to [1], PPG_GREEN to [2].
         const int board = realBoardIdFor (DeviceKind::EmotiBit);
@@ -1599,7 +1679,8 @@ int runSelftest (double seconds)
                 finiteBpm = std::numeric_limits<double>::quiet_NaN ();
                 double ts = 0.0;
                 for (const SignalChannel &ch : r.worker->channels ())
-                    if (ch.spec.derived && ch.spec.key == SignalKeys::EmotiHeartRate)
+                    if (ch.spec.derived &&
+                        (ch.spec.key == SignalKeys::EmotiHeartRate || ch.spec.key == SignalKeys::CytonHeartRate))
                     {
                         count = ch.ring->totalWritten ();
                         std::vector<double> t;
@@ -1621,6 +1702,18 @@ int runSelftest (double seconds)
             const bool hHave = hrLatest (hr, hv, hn, hBpm);
             check (eHave && en > 0 && !std::isfinite (eBpm),
                 fmt ("heart rate on the synthetic board's noise PPG: %.0f status samples, no HR value", double (en)));
+            // The Cyton worker runs the ECG detector (Mode::Ecg) on its own
+            // derived ring, so switching the panel's source needs no reconnect.
+            {
+                std::vector<double> cv;
+                std::uint64_t cn = 0;
+                double cBpm = 0.0;
+                const bool cHave = hrLatest (cy, cv, cn, cBpm);
+                const std::string rate = std::isfinite (cBpm) ? fmt ("%.1f bpm", cBpm) : std::string ("no rate");
+                check (cHave && cn > 0 && cv.size () >= HeartRateRing::Count,
+                    "heart rate from the Cyton ECG runs in its worker: " + fmt ("%.0f", double (cn)) +
+                        " samples on cyton.hr (the synthetic board's 5 Hz sine: " + rate + ")");
+            }
             const double bpm = hHave ? hv[HeartRateRing::Bpm] : std::numeric_limits<double>::quiet_NaN ();
             check (hHave && std::fabs (bpm - 72.0) <= 2.0 && hv[HeartRateRing::Source] >= 0.0 &&
                     hv[HeartRateRing::Quality] >= HeartRate::kMinQuality,
